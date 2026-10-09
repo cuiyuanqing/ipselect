@@ -124,10 +124,15 @@ $$\text{Final Score} = S_{\text{稳定度}} + S_{\text{真实测速}} + S_{\text
 2. **软路由网络环境 100% 兼容**：
    * 保留 `init_network_bypass` 中的 `os.setgid(65534)` 机制（Linux nogroup 免除 OpenClash 劫持）与 `--interface` 网卡绑定功能；
    * 坚持使用 Python 3 标准库（`socket`, `ssl`, `urllib`, `concurrent.futures`, `ipaddress`），无需在嵌入式 iStoreOS 路由器上安装任何第三方轮子。
-3. **输出契约无缝兼容**：
-   * 输出格式保持：
+3. **输出契约无缝兼容与网络环境自动识别 (Auto Environment Detection)**：
+   * **环境自动感知**：
+     * 若本地 IP 属于 `192.168.0.x`（家庭网段）：自动识别为 **家庭**，默认输出到 `home_us_best_node.txt`，命名后缀为 `-家庭`；
+     * 若本地 IP 属于 `10.10.18.x`（公司网段）：自动识别为 **公司**，默认输出到 `best_us.txt`，命名后缀为 `-公司`；
+     * 若指定了 CLI 参数 `--tag` 或 `--output`，则允许显式覆盖。
+   * **输出命名保持一致**：
      ```text
      104.17.147.243:8443#US-DaTree-9.4-01-公司 5.82MB/s
+     198.41.206.45:443#US-DaTree-8.9-01-家庭 2.85MB/s
      ```
    * 与下游 `WorkerVless2sub` 和 OpenClash 的解析器保持 100% 兼容。
 
