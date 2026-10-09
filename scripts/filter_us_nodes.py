@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-自动从多个测速与优选数据源获取候选节点，并通过真实 TLS 握手及 HTTP 探测
-100% 验证节点的可用性与延迟，优先选用 Cloudflare 官方 Anycast 线路，
-精选出 15 个最优质且真实可用的美国 (US) 节点。
+自动从多个测速与优选数据源获取候选节点，并通过多轮真实 TLS 握手及 HTTP 探测
+综合评估节点质量（丢包率、延迟平稳度、延迟均值、吞吐带宽），计算 1.0~10.0 分制质量评分，
+精选出 Top 15 个最稳定、最低延迟、最高分的美国 (US) 优质节点。
 """
 
 import csv
@@ -18,7 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 SNI_HOST = "proxy.19940407.xyz"
 OUTPUT_FILE = "best_us.txt"
 TOP_COUNT = 15
-PROBE_TIMEOUT = 3.0
+PROBE_TIMEOUT = 2.5
+ROUNDS_PER_NODE = 4
 THREAD_WORKERS = 20
 
 # Cloudflare 官方 IPv4 网段清单
@@ -171,12 +172,8 @@ def fetch_candidates():
     return unique_candidates
 
 
-def probe_node_liveness(candidate):
-    """
-    对单个节点进行真实 TCP + TLS 握手与 HTTP 探测
-    验证其是否能成功代理并返回 SNI_HOST 的 HTTP 响应
-    """
-    ip, port, original_speed = candidate
+def single_handshake_probe(ip, port):
+    """单次 TCP + TLS 握手及 HTTP 探测，返回往返时延 RTT (ms)"""
     t0 = time.time()
     try:
         s = socket.create_connection((ip, port), timeout=PROBE_TIMEOUT)
@@ -192,57 +189,126 @@ def probe_node_liveness(candidate):
         ss.close()
 
         if b"HTTP/1." in res:
-            is_cf = is_official_cloudflare_ip(ip)
-            # 优先使用官方 CF IP，非官方 IP 权重略微降低
-            if not is_cf:
-                rtt_ms += 300.0
-
-            # 速度评分：优先参考有效原始测速数据，否则按实测 RTT 进行拟合换算
-            if original_speed >= 1.0:
-                calc_speed = original_speed
-            else:
-                calc_speed = round(min(12.5, max(1.8, 3800.0 / rtt_ms)), 2)
-            return {
-                'ip': ip,
-                'port': port,
-                'rtt': rtt_ms,
-                'speed': calc_speed,
-                'is_cf': is_cf
-            }
+            return rtt_ms
     except Exception:
         pass
     return None
 
 
+def probe_node_multidimensional(candidate):
+    """
+    对候选节点执行多维度综合评估：
+    1. 连通性与丢包率 (4 轮探测)
+    2. 延迟与抖动 (Avg RTT, Jitter)
+    3. 综合质量评分计算 (1.0 ~ 10.0 分制)
+    """
+    ip, port, original_speed = candidate
+    rtts = []
+
+    # 连续执行 4 轮握手探测
+    for _ in range(ROUNDS_PER_NODE):
+        rtt = single_handshake_probe(ip, port)
+        if rtt is not None:
+            rtts.append(rtt)
+
+    success_count = len(rtts)
+    loss_rate = (ROUNDS_PER_NODE - success_count) / ROUNDS_PER_NODE
+
+    # 丢包率 >= 50% 的不稳定节点直接丢弃
+    if success_count < 2:
+        return None
+
+    avg_rtt = sum(rtts) / success_count
+    jitter = (max(rtts) - min(rtts)) if success_count > 1 else 100.0
+
+    # 速度评分与换算
+    if original_speed >= 1.0:
+        calc_speed = original_speed
+    else:
+        calc_speed = round(min(12.5, max(1.8, 3800.0 / avg_rtt)), 2)
+
+    is_cf = is_official_cloudflare_ip(ip)
+
+    # 综合质量评分 (1.0 ~ 10.0 分制) 计算模型
+    # 1. 稳定性基础分 (最高 6.0 分)
+    if loss_rate == 0.0:
+        base_score = 6.0
+    elif loss_rate == 0.25:
+        base_score = 4.0
+    else:
+        base_score = 2.0
+
+    # 2. 延迟表现分 (最高 2.5 分): 自适应机房环境与跨洋网络
+    if avg_rtt < 500.0:
+        lat_score = 2.5
+    else:
+        lat_score = max(0.0, min(2.5, (2600.0 - avg_rtt) / 400.0))
+
+    # 3. 抖动平稳度分 (最高 1.0 分): Jitter <= 250ms 拿满分，> 800ms 为 0 分
+    if jitter < 250.0:
+        jit_score = 1.0
+    else:
+        jit_score = max(0.0, min(1.0, (800.0 - jitter) / 550.0))
+
+    # 4. 吞吐速度加成 (最高 0.5 分)
+    spd_score = max(0.1, min(0.5, (calc_speed / 4.0) * 0.5))
+
+    total_score = base_score + lat_score + jit_score + spd_score
+
+    # 非 Cloudflare 官方 Anycast 网段扣除 1.0 分
+    if not is_cf:
+        total_score -= 1.0
+
+    final_score = round(min(10.0, max(1.0, total_score)), 1)
+
+    return {
+        'ip': ip,
+        'port': port,
+        'score': final_score,
+        'loss_rate': loss_rate,
+        'avg_rtt': avg_rtt,
+        'jitter': jitter,
+        'speed': calc_speed,
+        'is_cf': is_cf,
+        'success_rounds': success_count
+    }
+
+
 def run_filter_and_export():
     candidates = fetch_candidates()
-    print(f"[*] 开始进行并发 TLS 与连通性真实探测 (并发度: {THREAD_WORKERS})...")
+    print(f"[*] 开始进行并发多维度质量综合评估 (每节点 {ROUNDS_PER_NODE} 轮连续连测, 并发度: {THREAD_WORKERS})...")
 
     alive_nodes = []
     with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as executor:
-        future_map = {executor.submit(probe_node_liveness, c): c for c in candidates}
+        future_map = {executor.submit(probe_node_multidimensional, c): c for c in candidates}
         for future in as_completed(future_map):
             result = future.result()
             if result:
                 alive_nodes.append(result)
 
-    print(f"[+] 真实连通性探测完毕，通过握手校验的可用节点总数: {len(alive_nodes)}")
+    print(f"[+] 多维度探测完毕，通过严格稳定性考核的可用节点总数: {len(alive_nodes)}")
 
     if len(alive_nodes) < TOP_COUNT:
         print(f"[!] 警告: 可用节点数 ({len(alive_nodes)}) 少于目标数 ({TOP_COUNT})，将导出全部可用节点。")
         selected_nodes = alive_nodes
     else:
-        # 按延迟 (RTT) 升序排序，优先选取响应最灵敏且为 Cloudflare 官方 Anycast 的节点
-        alive_nodes.sort(key=lambda x: (not x['is_cf'], x['rtt']))
+        # 排序策略：
+        # 1. 综合质量评分 (score) 从高到低降序（评分最高排最前）
+        # 2. 丢包率 (loss_rate) 从低到高升序（0% 丢包排最前）
+        # 3. 平均延迟 (avg_rtt) 从低到高升序
+        alive_nodes.sort(key=lambda x: (-x['score'], x['loss_rate'], x['avg_rtt']))
         selected_nodes = alive_nodes[:TOP_COUNT]
 
-    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个 100% 可用美国优选节点:")
+    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质美国优选节点 (质量/延迟/速度多维加权):")
     output_lines = []
     for idx, node in enumerate(selected_nodes, 1):
-        line = f"{node['ip']}:{node['port']}#US-DaTree-{idx:02d} {node['speed']:.2f}MB/s"
+        # 规范命名格式：US-DaTree-{评分}-{序号} {速度}
+        node_name = f"US-DaTree-{node['score']:.1f}-{idx:02d}"
+        line = f"{node['ip']}:{node['port']}#{node_name} {node['speed']:.2f}MB/s"
         output_lines.append(line)
         cf_flag = "CF官方" if node['is_cf'] else "第三方"
-        print(f"  [{idx:02d}] {line} (RTT: {node['rtt']:.0f}ms, {cf_flag})")
+        loss_pct = int(node['loss_rate'] * 100)
+        print(f"  [{idx:02d}] {line} | 评分: {node['score']:.1f} | 丢包: {loss_pct}% | 延迟: {node['avg_rtt']:.0f}ms | 抖动: {node['jitter']:.0f}ms ({cf_flag})")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_dir = os.path.dirname(script_dir)
