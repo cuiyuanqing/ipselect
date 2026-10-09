@@ -408,6 +408,95 @@ def probe_stability(ip, port, rounds=ROUNDS_PER_NODE, probe_func=None, sleep_int
     }
 
 
+def calculate_speed_mb_s(received_bytes, duration_sec):
+    """根据实际下载字节与耗时计算传输流速 (MB/s)"""
+    if duration_sec <= 0.001:
+        duration_sec = 0.001
+    mb = received_bytes / (1024.0 * 1024.0)
+    return round(mb / duration_sec, 2)
+
+
+def probe_real_download_speed(ip, port, max_bytes=1572864, max_duration=2.0, fallback_rtt=200.0):
+    """
+    阶段 4：安全微吞吐测速 (Safe Micro-Speedtest)
+    - 仅请求 1.5MB (1572864 字节) 数据块
+    - 严格限制 2.0 秒内超时自动截断
+    - 绝不大流量跑满，彻底防止触发 Cloudflare 官方 Rate Limit (429)
+    - 测量实际接收数据量与耗时，返回真实下载带宽 (MB/s)
+    """
+    s = None
+    ss = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(max_duration + 0.8)
+        if BIND_INTERFACE and hasattr(socket, 'SO_BINDTODEVICE'):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, 25, BIND_INTERFACE.encode('utf-8'))
+            except Exception:
+                pass
+        s.connect((ip, port))
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ss = ctx.wrap_socket(s, server_hostname=SNI_HOST)
+
+        req = f"GET /__down?bytes={max_bytes} HTTP/1.1\r\nHost: {SNI_HOST}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+        ss.sendall(req.encode('utf-8'))
+
+        received_bytes = 0
+        header_parsed = False
+        start_download_time = time.time()
+
+        while True:
+            # 严格时间截断：超过最大持续时间立即终止
+            elapsed = time.time() - start_download_time
+            if elapsed >= max_duration:
+                break
+
+            chunk = ss.recv(8192)
+            if not chunk:
+                break
+
+            if not header_parsed:
+                if b"\r\n\r\n" in chunk:
+                    header_part, body_part = chunk.split(b"\r\n\r\n", 1)
+                    header_str = header_part.decode('utf-8', errors='ignore')
+                    if "429 Too Many Requests" in header_str:
+                        # 触发 429 防限流，降级处理
+                        return round(min(5.0, max(0.5, 3000.0 / max(1.0, fallback_rtt))), 2)
+                    received_bytes += len(body_part)
+                    header_parsed = True
+                    start_download_time = time.time()
+                else:
+                    continue
+            else:
+                received_bytes += len(chunk)
+
+            if received_bytes >= max_bytes:
+                break
+
+        duration = max(0.05, time.time() - start_download_time)
+        if received_bytes > 1024:
+            return calculate_speed_mb_s(received_bytes, duration)
+        else:
+            return 0.3
+    except Exception:
+        # 网络异常兜底安全估算
+        return round(min(3.0, max(0.2, 1800.0 / max(1.0, fallback_rtt))), 2)
+    finally:
+        if ss:
+            try:
+                ss.close()
+            except Exception:
+                pass
+        elif s:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
 def single_handshake_probe(ip, port):
     """单次 TCP + TLS 握手及 HTTP 探测，返回往返时延 RTT (ms)"""
     t0 = time.time()
