@@ -4,6 +4,11 @@
 自动从多个测速与优选数据源获取候选节点，并通过多轮真实 TLS 握手及 HTTP 探测
 综合评估节点质量（丢包率、延迟平稳度、延迟均值、吞吐带宽），计算 1.0~10.0 分制质量评分，
 精选出 Top 15 个最稳定、最低延迟、最高分的美国 (US) 优质节点。
+
+支持参数：
+  --tag <名称>       节点位置/环境标识（如 公司、家庭，默认: 公司）
+  --output <文件名>  输出文件名（如 best_us.txt、home_us_best_node.txt，默认: best_us.txt）
+  --interface <网卡> 本地出口网卡（如 br-lan、eth0，在路由上实现强行绕过代理直连）
 """
 
 import csv
@@ -12,11 +17,12 @@ import socket
 import ssl
 import time
 import os
+import sys
+import argparse
 import ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SNI_HOST = "proxy.19940407.xyz"
-OUTPUT_FILE = "best_us.txt"
 TOP_COUNT = 15
 PROBE_TIMEOUT = 2.5
 ROUNDS_PER_NODE = 4
@@ -73,6 +79,26 @@ BACKUP_CF_IPS = [
     "172.64.229.7", "172.67.66.79", "172.67.171.1", "198.41.206.45",
     "198.41.209.82"
 ]
+
+BIND_INTERFACE = None
+
+
+def init_network_bypass(interface=None):
+    """
+    初始化网络直连环境：
+    在 Linux / OpenWrt / iStoreOS 环境下通过设置 GID=65534 与绑定网卡，
+    100% 绕过 OpenClash / Clash 的透明代理与防火墙劫持，保证用纯粹本地真实出口测速。
+    """
+    global BIND_INTERFACE
+    BIND_INTERFACE = interface
+
+    if os.name != 'nt' and hasattr(os, 'getuid') and os.getuid() == 0:
+        try:
+            # 65534 为 nogroup，OpenClash 对该 GID 的进程全链放行直连
+            os.setgid(65534)
+            print("[*] 已启用 Linux GID=65534 规则，成功绕过 OpenClash 本地代理劫持")
+        except Exception as e:
+            print(f"[!] 设置 GID 失败 (可忽略): {e}")
 
 
 def is_official_cloudflare_ip(ip_str):
@@ -176,7 +202,18 @@ def single_handshake_probe(ip, port):
     """单次 TCP + TLS 握手及 HTTP 探测，返回往返时延 RTT (ms)"""
     t0 = time.time()
     try:
-        s = socket.create_connection((ip, port), timeout=PROBE_TIMEOUT)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(PROBE_TIMEOUT)
+
+        # 若指定了物理网卡，则强行绑定物理网卡出口直连
+        if BIND_INTERFACE and hasattr(socket, 'SO_BINDTODEVICE'):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, 25, BIND_INTERFACE.encode('utf-8'))
+            except Exception:
+                pass
+
+        s.connect((ip, port))
+
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -274,9 +311,11 @@ def probe_node_multidimensional(candidate):
     }
 
 
-def run_filter_and_export():
+def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=None):
+    init_network_bypass(interface)
+
     candidates = fetch_candidates()
-    print(f"[*] 开始进行并发多维度质量综合评估 (每节点 {ROUNDS_PER_NODE} 轮连续连测, 并发度: {THREAD_WORKERS})...")
+    print(f"[*] 开始进行并发多维度质量综合评估 (标识: {tag}, 每节点 {ROUNDS_PER_NODE} 轮连测, 并发度: {THREAD_WORKERS})...")
 
     alive_nodes = []
     with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as executor:
@@ -299,11 +338,11 @@ def run_filter_and_export():
         alive_nodes.sort(key=lambda x: (-x['score'], x['loss_rate'], x['avg_rtt']))
         selected_nodes = alive_nodes[:TOP_COUNT]
 
-    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质美国优选节点 (质量/延迟/速度多维加权):")
+    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质美国优选节点 ({tag}专属 / 质量/延迟/速度多维加权):")
     output_lines = []
     for idx, node in enumerate(selected_nodes, 1):
-        # 规范命名格式：US-DaTree-{评分}-{序号} {速度}
-        node_name = f"US-DaTree-{node['score']:.1f}-{idx:02d}"
+        # 规范命名格式：US-DaTree-{评分}-{序号}-{tag} {速度}
+        node_name = f"US-DaTree-{node['score']:.1f}-{idx:02d}-{tag}"
         line = f"{node['ip']}:{node['port']}#{node_name} {node['speed']:.2f}MB/s"
         output_lines.append(line)
         cf_flag = "CF官方" if node['is_cf'] else "第三方"
@@ -312,7 +351,7 @@ def run_filter_and_export():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_dir = os.path.dirname(script_dir)
-    target_path = os.path.join(project_dir, OUTPUT_FILE)
+    target_path = os.path.join(project_dir, output_file)
 
     with open(target_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(output_lines) + '\n')
@@ -320,5 +359,15 @@ def run_filter_and_export():
     print(f"\n[+] 优选结果已写入: {target_path}")
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Cloudflare 节点多维质量评估与优选生成器")
+    parser.add_argument("--tag", default=os.environ.get("LOCATION_TAG", "公司"), help="节点标识 (如: 公司, 家庭)")
+    parser.add_argument("--output", default=os.environ.get("OUTPUT_FILE", "best_us.txt"), help="输出文件名 (如: best_us.txt, home_us_best_node.txt)")
+    parser.add_argument("--interface", default=os.environ.get("BIND_INTERFACE", None), help="绑定的出口网卡 (如: br-lan, eth0)")
+
+    args = parser.parse_args()
+    run_filter_and_export(tag=args.tag, output_file=args.output, interface=args.interface)
+
+
 if __name__ == '__main__':
-    run_filter_and_export()
+    main()

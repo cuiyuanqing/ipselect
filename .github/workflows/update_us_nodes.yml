@@ -1,10 +1,10 @@
 name: 自动筛选并更新美区优选节点
 
 on:
-  schedule:
-    # 每天北京时间 04:00 (UTC 20:00) 自动执行
-    - cron: '0 20 * * *'
-  workflow_dispatch: # 支持在 GitHub 网页 Actions 选项卡中随时手动一键运行
+  # schedule:
+  #   # 已停用云端定时任务：改由本地 iStoreOS 路由器通过真实宽带网络直连测速与推仓
+  #   - cron: '0 20 * * *'
+  workflow_dispatch: # 仅保留 GitHub 网页手动一键触发备用
 
 permissions:
   contents: write
