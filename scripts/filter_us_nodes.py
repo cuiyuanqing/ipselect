@@ -101,6 +101,58 @@ def init_network_bypass(interface=None):
             print(f"[!] 设置 GID 失败 (可忽略): {e}")
 
 
+def infer_environment_from_ips(ip_list):
+    """
+    根据给定的本地 IP 列表智能推断网络环境与输出文件名：
+    - 192.168.0.x -> 家庭 / home_us_best_node.txt
+    - 10.10.18.x  -> 公司 / best_us.txt
+    - 缺省回退 -> 公司 / best_us.txt
+    """
+    for ip in ip_list:
+        if ip.startswith("192.168.0."):
+            return "家庭", "home_us_best_node.txt"
+    for ip in ip_list:
+        if ip.startswith("10.10.18."):
+            return "公司", "best_us.txt"
+    return "公司", "best_us.txt"
+
+
+def get_all_local_ips():
+    """收集本地所有网卡及出口 IP"""
+    ips = set()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None):
+            ip = info[4][0]
+            if ':' not in ip:  # IPv4
+                ips.add(ip)
+    except Exception:
+        pass
+
+    return list(ips)
+
+
+def detect_network_environment(cli_tag=None, cli_output=None):
+    """
+    自动感知本地网络环境并确定 tag 与输出文件名。
+    若提供 cli_tag 或 cli_output 则优先使用。
+    """
+    local_ips = get_all_local_ips()
+    inferred_tag, inferred_output = infer_environment_from_ips(local_ips)
+
+    final_tag = cli_tag if cli_tag is not None else inferred_tag
+    final_output = cli_output if cli_output is not None else inferred_output
+    return final_tag, final_output
+
+
 def is_official_cloudflare_ip(ip_str):
     """判断是否为 Cloudflare 官方 Anycast 节点"""
     try:
