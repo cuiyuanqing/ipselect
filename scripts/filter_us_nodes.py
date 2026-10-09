@@ -302,14 +302,16 @@ def fast_tcp_ping(ip, port, timeout=0.8):
                 pass
 
 
+SPEED_TEST_HOST = "speed.cloudflare.com"
+
+
 def probe_tls_colo(ip, port, timeout=2.5):
     """
     阶段 2：TLS 握手与 cf-ray 机房质检
-    返回 (is_valid_us, colo_code, rtt_ms)
+    返回 (is_valid_us, colo_code, tcp_rtt_ms)
     """
     s = None
     ss = None
-    t0 = time.time()
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -318,7 +320,9 @@ def probe_tls_colo(ip, port, timeout=2.5):
                 s.setsockopt(socket.SOL_SOCKET, 25, BIND_INTERFACE.encode('utf-8'))
             except Exception:
                 pass
+        t0 = time.time()
         s.connect((ip, port))
+        tcp_rtt_ms = (time.time() - t0) * 1000
 
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -328,12 +332,11 @@ def probe_tls_colo(ip, port, timeout=2.5):
         req = f"HEAD / HTTP/1.1\r\nHost: {SNI_HOST}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
         ss.sendall(req.encode('utf-8'))
         res = ss.recv(2048)
-        rtt_ms = (time.time() - t0) * 1000
 
         res_text = res.decode('utf-8', errors='ignore')
         colo = parse_colo_from_headers(res_text)
         is_us = is_us_colo(colo)
-        return is_us, colo, rtt_ms
+        return is_us, colo, tcp_rtt_ms
     except Exception:
         return False, None, None
     finally:
@@ -439,9 +442,9 @@ def probe_real_download_speed(ip, port, max_bytes=1572864, max_duration=2.0, fal
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        ss = ctx.wrap_socket(s, server_hostname=SNI_HOST)
+        ss = ctx.wrap_socket(s, server_hostname=SPEED_TEST_HOST)
 
-        req = f"GET /__down?bytes={max_bytes} HTTP/1.1\r\nHost: {SNI_HOST}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+        req = f"GET /__down?bytes={max_bytes} HTTP/1.1\r\nHost: {SPEED_TEST_HOST}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
         ss.sendall(req.encode('utf-8'))
 
         received_bytes = 0
