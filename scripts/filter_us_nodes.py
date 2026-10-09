@@ -20,13 +20,15 @@ import os
 import sys
 import argparse
 import ipaddress
+import statistics
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SNI_HOST = "proxy.19940407.xyz"
 TOP_COUNT = 15
 PROBE_TIMEOUT = 2.5
-ROUNDS_PER_NODE = 4
-THREAD_WORKERS = 20
+ROUNDS_PER_NODE = 6
+THREAD_WORKERS = 25
 
 # Cloudflare 官方 IPv4 网段清单
 CLOUDFLARE_CIDRS = [
@@ -345,6 +347,65 @@ def probe_tls_colo(ip, port, timeout=2.5):
                 s.close()
             except Exception:
                 pass
+
+
+def probe_stability(ip, port, rounds=ROUNDS_PER_NODE, probe_func=None, sleep_interval=None):
+    """
+    阶段 3：多轮打散稳定性测试
+    - 连续 6 轮探测
+    - 轮次之间做打散微休眠
+    - 严格 0 丢包准入门槛（丢包 >= 2 轮直接淘汰）
+    - 计算中位数 RTT (median_rtt)、平均 RTT (avg_rtt) 与抖动 (jitter)
+    """
+    rtts = []
+    colos = []
+
+    for idx in range(rounds):
+        if idx > 0:
+            if sleep_interval is not None:
+                if sleep_interval > 0:
+                    time.sleep(sleep_interval)
+            else:
+                time.sleep(random.uniform(0.04, 0.09))
+
+        if probe_func:
+            rtt, colo = probe_func(ip, port)
+        else:
+            is_valid, colo, rtt = probe_tls_colo(ip, port, timeout=PROBE_TIMEOUT)
+            if not is_valid:
+                rtt = None
+
+        if rtt is not None:
+            rtts.append(rtt)
+            if colo:
+                colos.append(colo)
+
+    success_count = len(rtts)
+    loss_rate = (rounds - success_count) / rounds
+
+    # 准入门槛：丢包 >= 2 轮（成功轮数 < rounds - 1）直接淘汰
+    if success_count < (rounds - 1):
+        return None
+
+    median_rtt = statistics.median(rtts)
+    avg_rtt = sum(rtts) / success_count
+    jitter = (max(rtts) - min(rtts)) if success_count > 1 else 0.0
+
+    final_colo = colos[-1] if colos else None
+    is_us_west = is_us_west_colo(final_colo)
+
+    return {
+        'ip': ip,
+        'port': port,
+        'loss_rate': loss_rate,
+        'median_rtt': median_rtt,
+        'avg_rtt': avg_rtt,
+        'jitter': jitter,
+        'colo': final_colo,
+        'is_us_west': is_us_west,
+        'success_rounds': success_count,
+        'total_rounds': rounds
+    }
 
 
 def single_handshake_probe(ip, port):
