@@ -57,14 +57,41 @@ TXT_SOURCES = [
     "https://raw.githubusercontent.com/ymyuuu/IPDB/main/BestCF/bestcfv4.txt",
 ]
 
-US_DATA_CENTERS = {
-    'SJC', 'LAX', 'SFO', 'SEA', 'DFW', 'ORD', 'IAD',
-    'ATL', 'MIA', 'EWR', 'JFK', 'PHX', 'DEN', 'IAH',
-    'BOS', 'PDX', 'MSP', 'DTW', 'CLT', 'LAS', 'SLC'
-}
+US_WEST_DCS = {'SJC', 'LAX', 'SFO', 'SEA', 'PDX', 'SLC', 'PHX', 'LAS'}
+US_OTHER_DCS = {'DFW', 'ORD', 'IAD', 'ATL', 'MIA', 'EWR', 'JFK', 'DEN', 'IAH', 'BOS', 'MSP', 'DTW', 'CLT'}
+ALL_US_DCS = US_WEST_DCS | US_OTHER_DCS
+US_DATA_CENTERS = ALL_US_DCS
 
 EXCLUDE_CITIES = {'Toronto', 'Montreal', 'Vancouver', 'Calgary', 'Ottawa'}
 EXCLUDE_DCS = {'YYZ', 'YVR', 'YUL', 'YYC'}
+
+
+def parse_colo_from_headers(raw_headers_str):
+    """从 HTTP 响应头中解析 cf-ray 字段提取机房代码 (例如 8d29b12e3f4a-SJC -> SJC)"""
+    if not raw_headers_str:
+        return None
+    for line in raw_headers_str.splitlines():
+        if line.lower().startswith("cf-ray:"):
+            val = line.split(":", 1)[1].strip()
+            if "-" in val:
+                colo = val.split("-")[-1].strip().upper()
+                if colo.isalpha() and 3 <= len(colo) <= 4:
+                    return colo
+    return None
+
+
+def is_us_colo(colo):
+    """判断机房代码是否属于美国境内核心机房"""
+    if not colo:
+        return False
+    return colo in ALL_US_DCS
+
+
+def is_us_west_colo(colo):
+    """判断机房代码是否属于美西极速直连机房 (SJC, LAX 等)"""
+    if not colo:
+        return False
+    return colo in US_WEST_DCS
 
 # 内置高可用 Cloudflare 美国 Anycast 备选池
 BACKUP_CF_IPS = [
@@ -248,6 +275,76 @@ def fetch_candidates():
 
     print(f"[+] 累计汇总待测候选节点数: {len(unique_candidates)}")
     return unique_candidates
+
+
+def fast_tcp_ping(ip, port, timeout=0.8):
+    """阶段 1：超轻量快速 TCP 握手探针，毫秒级快速淘汰死节点"""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        if BIND_INTERFACE and hasattr(socket, 'SO_BINDTODEVICE'):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, 25, BIND_INTERFACE.encode('utf-8'))
+            except Exception:
+                pass
+        s.connect((ip, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        if s:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def probe_tls_colo(ip, port, timeout=2.5):
+    """
+    阶段 2：TLS 握手与 cf-ray 机房质检
+    返回 (is_valid_us, colo_code, rtt_ms)
+    """
+    s = None
+    ss = None
+    t0 = time.time()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        if BIND_INTERFACE and hasattr(socket, 'SO_BINDTODEVICE'):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, 25, BIND_INTERFACE.encode('utf-8'))
+            except Exception:
+                pass
+        s.connect((ip, port))
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ss = ctx.wrap_socket(s, server_hostname=SNI_HOST)
+
+        req = f"HEAD / HTTP/1.1\r\nHost: {SNI_HOST}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+        ss.sendall(req.encode('utf-8'))
+        res = ss.recv(2048)
+        rtt_ms = (time.time() - t0) * 1000
+
+        res_text = res.decode('utf-8', errors='ignore')
+        colo = parse_colo_from_headers(res_text)
+        is_us = is_us_colo(colo)
+        return is_us, colo, rtt_ms
+    except Exception:
+        return False, None, None
+    finally:
+        if ss:
+            try:
+                ss.close()
+            except Exception:
+                pass
+        elif s:
+            try:
+                s.close()
+            except Exception:
+                pass
 
 
 def single_handshake_probe(ip, port):
