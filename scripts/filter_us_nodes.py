@@ -531,122 +531,178 @@ def single_handshake_probe(ip, port):
     return None
 
 
-def probe_node_multidimensional(candidate):
+def calculate_rigorous_score(node_data):
     """
-    对候选节点执行多维度综合评估：
-    1. 连通性与丢包率 (4 轮探测)
-    2. 延迟与抖动 (Avg RTT, Jitter)
-    3. 综合质量评分计算 (1.0 ~ 10.0 分制)
+    严苛多维质量评分 (1.0 ~ 10.0 分制) 核心模型：
+    - 稳定度 (最高 3.0 分): 0 丢包满分，偶发丢包重扣
+    - 真实测速 (最高 3.5 分): 基于真实 MB/s 陡峭分阶
+    - 真实延迟 (最高 2.5 分): 基于中美骨干网实际瓶颈分阶 (185ms 满分，>350ms 零分)
+    - 抖动平稳 (最高 1.0 分): Jitter <= 40ms 满分
+    - 机房加成: 美西核心机房 +0.5 分，非 CF 官方扣 2.0 分
     """
-    ip, port, original_speed = candidate
-    rtts = []
+    loss_rate = node_data.get('loss_rate', 0.0)
+    speed = node_data.get('speed', 0.0)
+    rtt = node_data.get('median_rtt', 300.0)
+    jitter = node_data.get('jitter', 100.0)
+    is_us_west = node_data.get('is_us_west', False)
+    is_cf = node_data.get('is_cf', True)
 
-    # 连续执行 4 轮握手探测
-    for _ in range(ROUNDS_PER_NODE):
-        rtt = single_handshake_probe(ip, port)
-        if rtt is not None:
-            rtts.append(rtt)
-
-    success_count = len(rtts)
-    loss_rate = (ROUNDS_PER_NODE - success_count) / ROUNDS_PER_NODE
-
-    # 丢包率 >= 50% 的不稳定节点直接丢弃
-    if success_count < 2:
-        return None
-
-    avg_rtt = sum(rtts) / success_count
-    jitter = (max(rtts) - min(rtts)) if success_count > 1 else 100.0
-
-    # 速度评分与换算
-    if original_speed >= 1.0:
-        calc_speed = original_speed
-    else:
-        calc_speed = round(min(12.5, max(1.8, 3800.0 / avg_rtt)), 2)
-
-    is_cf = is_official_cloudflare_ip(ip)
-
-    # 综合质量评分 (1.0 ~ 10.0 分制) 计算模型
-    # 1. 稳定性基础分 (最高 6.0 分)
+    # 1. 稳定性基础分 (最高 3.0 分)
     if loss_rate == 0.0:
-        base_score = 6.0
-    elif loss_rate == 0.25:
-        base_score = 4.0
+        base_score = 3.0
+    elif loss_rate <= 0.2:
+        base_score = 1.0
     else:
-        base_score = 2.0
+        base_score = 0.0
 
-    # 2. 延迟表现分 (最高 2.5 分): 自适应机房环境与跨洋网络
-    if avg_rtt < 500.0:
+    # 2. 真实微吞吐测速分 (最高 3.5 分)
+    if speed >= 8.0:
+        spd_score = 3.5
+    elif speed >= 4.0:
+        spd_score = 2.5 + ((speed - 4.0) / 4.0) * 1.0
+    elif speed >= 1.5:
+        spd_score = 1.5 + ((speed - 1.5) / 2.5) * 1.0
+    elif speed >= 0.5:
+        spd_score = 0.5 + ((speed - 0.5) / 1.0) * 1.0
+    else:
+        spd_score = max(0.1, min(0.5, speed))
+
+    # 3. 真实延迟分 (最高 2.5 分)
+    if rtt <= 185.0:
         lat_score = 2.5
+    elif rtt <= 230.0:
+        lat_score = 2.5 - ((rtt - 185.0) / 45.0) * 0.7
+    elif rtt <= 280.0:
+        lat_score = 1.8 - ((rtt - 230.0) / 50.0) * 0.8
+    elif rtt <= 350.0:
+        lat_score = 1.0 - ((rtt - 280.0) / 70.0) * 0.8
     else:
-        lat_score = max(0.0, min(2.5, (2600.0 - avg_rtt) / 400.0))
+        lat_score = 0.0
 
-    # 3. 抖动平稳度分 (最高 1.0 分): Jitter <= 250ms 拿满分，> 800ms 为 0 分
-    if jitter < 250.0:
+    # 4. 抖动平稳分 (最高 1.0 分)
+    if jitter <= 40.0:
         jit_score = 1.0
+    elif jitter <= 120.0:
+        jit_score = 1.0 - ((jitter - 40.0) / 80.0) * 0.6
     else:
-        jit_score = max(0.0, min(1.0, (800.0 - jitter) / 550.0))
+        jit_score = max(0.1, 0.4 - ((jitter - 120.0) / 200.0) * 0.3)
 
-    # 4. 吞吐速度加成 (最高 0.5 分)
-    spd_score = max(0.1, min(0.5, (calc_speed / 4.0) * 0.5))
+    # 5. 机房与官方加成
+    colo_bonus = 0.5 if is_us_west else 0.0
+    cf_penalty = 0.0 if is_cf else -2.0
 
-    total_score = base_score + lat_score + jit_score + spd_score
+    total_score = base_score + spd_score + lat_score + jit_score + colo_bonus + cf_penalty
+    return round(min(10.0, max(1.0, total_score)), 1)
 
-    # 非 Cloudflare 官方 Anycast 网段扣除 1.0 分
-    if not is_cf:
-        total_score -= 1.0
 
-    final_score = round(min(10.0, max(1.0, total_score)), 1)
-
-    return {
-        'ip': ip,
-        'port': port,
-        'score': final_score,
-        'loss_rate': loss_rate,
-        'avg_rtt': avg_rtt,
-        'jitter': jitter,
-        'speed': calc_speed,
-        'is_cf': is_cf,
-        'success_rounds': success_count
-    }
+def probe_node_multidimensional(candidate):
+    """单节点探测兼容垫片"""
+    ip, port, original_speed = candidate
+    stab = probe_stability(ip, port, rounds=4)
+    if not stab:
+        return None
+    speed = probe_real_download_speed(ip, port, fallback_rtt=stab['median_rtt'])
+    stab['speed'] = speed
+    stab['is_cf'] = is_official_cloudflare_ip(ip)
+    stab['score'] = calculate_rigorous_score(stab)
+    return stab
 
 
 def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=None):
+    """
+    四阶漏斗执行流水线：
+    1. 阶段 1：快速 TCP 探针 (淘汰 80% 死节点)
+    2. 阶段 2：TLS 握手与 cf-ray 机房质检 (仅放行美区核心机房)
+    3. 阶段 3：多轮打散稳定性与抖动深测 (0 丢包严选)
+    4. 阶段 4：真实微吞吐测速 (防限流微测速)
+    5. 五维严苛评分与降序导出
+    """
     init_network_bypass(interface)
 
     candidates = fetch_candidates()
-    print(f"[*] 开始进行并发多维度质量综合评估 (标识: {tag}, 每节点 {ROUNDS_PER_NODE} 轮连测, 并发度: {THREAD_WORKERS})...")
+    print(f"[*] 启动四阶漏斗严选引擎 (环境标识: {tag}, 导出目标: {output_file})...")
 
-    alive_nodes = []
-    with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as executor:
-        future_map = {executor.submit(probe_node_multidimensional, c): c for c in candidates}
+    # ================= 阶段 1：快速 TCP 并发探针 =================
+    print(f"\n[+] [阶段 1/4] 启动快速 TCP 连通性并发扫描 (总数: {len(candidates)}, 并发度: 30)...")
+    stage1_survivors = []
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        future_map = {executor.submit(fast_tcp_ping, c[0], c[1]): c for c in candidates}
         for future in as_completed(future_map):
-            result = future.result()
-            if result:
-                alive_nodes.append(result)
+            c = future_map[future]
+            if future.result():
+                stage1_survivors.append(c)
 
-    print(f"[+] 多维度探测完毕，通过严格稳定性考核的可用节点总数: {len(alive_nodes)}")
+    print(f"[+] [阶段 1/4] 快速 TCP 扫描完成，存活可通节点数: {len(stage1_survivors)} / {len(candidates)}")
 
-    if len(alive_nodes) < TOP_COUNT:
-        print(f"[!] 警告: 可用节点数 ({len(alive_nodes)}) 少于目标数 ({TOP_COUNT})，将导出全部可用节点。")
-        selected_nodes = alive_nodes
-    else:
-        # 排序策略：
-        # 1. 综合质量评分 (score) 从高到低降序（评分最高排最前）
-        # 2. 丢包率 (loss_rate) 从低到高升序（0% 丢包排最前）
-        # 3. 平均延迟 (avg_rtt) 从低到高升序
-        alive_nodes.sort(key=lambda x: (-x['score'], x['loss_rate'], x['avg_rtt']))
-        selected_nodes = alive_nodes[:TOP_COUNT]
+    if not stage1_survivors:
+        print("[-] 错误: 所有候选节点均无法建立 TCP 连接，请检查本地物理网络。")
+        return
 
-    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质美国优选节点 ({tag}专属 / 质量/延迟/速度多维加权):")
+    # ================= 阶段 2：TLS 握手与 cf-ray 机房质检 =================
+    print(f"\n[+] [阶段 2/4] 启动 TLS 握手与 cf-ray 边缘机房代码质检 (待测数: {len(stage1_survivors)})...")
+    stage2_survivors = []
+    with ThreadPoolExecutor(max_workers=25) as executor:
+        future_map = {executor.submit(probe_tls_colo, c[0], c[1]): c for c in stage1_survivors}
+        for future in as_completed(future_map):
+            c = future_map[future]
+            is_valid_us, colo, rtt = future.result()
+            if is_valid_us:
+                stage2_survivors.append((c[0], c[1], c[2], colo, rtt))
+
+    print(f"[+] [阶段 2/4] 机房质检完毕，落地美区核心机房节点数: {len(stage2_survivors)}")
+
+    # 兜底保护：若美区机房节点极少，平滑降级包含阶段 1 存活节点
+    if len(stage2_survivors) < 5:
+        print("[!] 提示: 美区机房严选节点较少，启动平滑容灾降级模式。")
+        for c in stage1_survivors:
+            if not any(s[0] == c[0] and s[1] == c[1] for s in stage2_survivors):
+                stage2_survivors.append((c[0], c[1], c[2], "US", 250.0))
+
+    # ================= 阶段 3：多轮打散稳定性测试 =================
+    print(f"\n[+] [阶段 3/4] 启动 {ROUNDS_PER_NODE} 轮打散稳定性与抖动深度测试 (待测数: {len(stage2_survivors)})...")
+    stage3_survivors = []
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        future_map = {executor.submit(probe_stability, c[0], c[1]): c for c in stage2_survivors}
+        for future in as_completed(future_map):
+            res = future.result()
+            if res:
+                res['is_cf'] = is_official_cloudflare_ip(res['ip'])
+                stage3_survivors.append(res)
+
+    print(f"[+] [阶段 3/4] 稳定性深测完毕，通过 0 丢包严格考核的优质节点数: {len(stage3_survivors)}")
+
+    if not stage3_survivors:
+        print("[-] 错误: 无任何节点通过稳定性考核。")
+        return
+
+    # 按初筛稳定性中位数延迟排序，取前 20 名进入阶段 4 微吞吐测速
+    stage3_survivors.sort(key=lambda x: (x['loss_rate'], x['median_rtt'], x['jitter']))
+    top_candidates_for_speed = stage3_survivors[:20]
+
+    # ================= 阶段 4：安全微吞吐测速 (防限流微测速) =================
+    print(f"\n[+] [阶段 4/4] 启动 1.5MB 安全微吞吐测速 (入围节点数: {len(top_candidates_for_speed)}, 小并发防限流)...")
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_map = {executor.submit(probe_real_download_speed, n['ip'], n['port'], 1572864, 2.0, n['median_rtt']): n for n in top_candidates_for_speed}
+        for future in as_completed(future_map):
+            node = future_map[future]
+            real_speed = future.result()
+            node['speed'] = real_speed
+            node['score'] = calculate_rigorous_score(node)
+
+    # 排序选拔 Top 15：评分降序 -> 丢包升序 -> 延迟中位数升序 -> 速度降序
+    top_candidates_for_speed.sort(key=lambda x: (-x['score'], x['loss_rate'], x['median_rtt'], -x['speed']))
+    selected_nodes = top_candidates_for_speed[:TOP_COUNT]
+
+    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质美国优选节点 ({tag}专属 / 四阶漏斗严选):")
     output_lines = []
     for idx, node in enumerate(selected_nodes, 1):
-        # 规范命名格式：US-DaTree-{评分}-{序号}-{tag} {速度}
         node_name = f"US-DaTree-{node['score']:.1f}-{idx:02d}-{tag}"
         line = f"{node['ip']}:{node['port']}#{node_name} {node['speed']:.2f}MB/s"
         output_lines.append(line)
         cf_flag = "CF官方" if node['is_cf'] else "第三方"
         loss_pct = int(node['loss_rate'] * 100)
-        print(f"  [{idx:02d}] {line} | 评分: {node['score']:.1f} | 丢包: {loss_pct}% | 延迟: {node['avg_rtt']:.0f}ms | 抖动: {node['jitter']:.0f}ms ({cf_flag})")
+        colo_str = node.get('colo') or 'US'
+        print(f"  [{idx:02d}] {line} | 评分: {node['score']:.1f} | 机房: {colo_str} | 丢包: {loss_pct}% | 延迟: {node['median_rtt']:.0f}ms | 抖动: {node['jitter']:.0f}ms ({cf_flag})")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_dir = os.path.dirname(script_dir)
@@ -659,13 +715,15 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Cloudflare 节点多维质量评估与优选生成器")
-    parser.add_argument("--tag", default=os.environ.get("LOCATION_TAG", "公司"), help="节点标识 (如: 公司, 家庭)")
-    parser.add_argument("--output", default=os.environ.get("OUTPUT_FILE", "best_us.txt"), help="输出文件名 (如: best_us.txt, home_us_best_node.txt)")
+    parser = argparse.ArgumentParser(description="Cloudflare 节点四阶漏斗严选引擎与多维评估器")
+    parser.add_argument("--tag", default=os.environ.get("LOCATION_TAG", None), help="节点标识 (如: 公司, 家庭，缺省自动识别)")
+    parser.add_argument("--output", default=os.environ.get("OUTPUT_FILE", None), help="输出文件名 (如: best_us.txt, home_us_best_node.txt，缺省自动识别)")
     parser.add_argument("--interface", default=os.environ.get("BIND_INTERFACE", None), help="绑定的出口网卡 (如: br-lan, eth0)")
 
     args = parser.parse_args()
-    run_filter_and_export(tag=args.tag, output_file=args.output, interface=args.interface)
+    tag, output_file = detect_network_environment(cli_tag=args.tag, cli_output=args.output)
+    print(f"[*] 环境自动感知检测结果: 位置=[{tag}], 输出文件=[{output_file}]")
+    run_filter_and_export(tag=tag, output_file=output_file, interface=args.interface)
 
 
 if __name__ == '__main__':
