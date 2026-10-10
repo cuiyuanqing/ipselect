@@ -182,7 +182,7 @@ def reload_router_services(ssh_client, dry_run: bool = False) -> bool:
     """
     print("\n[deploy] === Purging LuCI cache and restarting services ===")
     reload_cmds = [
-        ("rm -f /tmp/luci-indexcache /tmp/luci-modulecache", "Clear LuCI index/module cache"),
+        ("rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* /var/luci-indexcache* 2>/dev/null || true", "Clear LuCI index/module cache"),
         ("/etc/init.d/rpcd restart", "Restart rpcd service"),
         ("/etc/init.d/uhttpd restart", "Restart uhttpd web server"),
         ("/etc/init.d/ipselect restart", "Restart ipselect service"),
