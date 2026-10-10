@@ -1,0 +1,132 @@
+#!/bin/sh /etc/rc.common
+# /etc/init.d/ipselect - iStoreOS 节点优选服务管理与定时任务同步
+
+START=95
+STOP=10
+
+EXTRA_COMMANDS="sync_cron"
+EXTRA_HELP="	sync_cron	Synchronize crontab entry according to UCI config"
+
+CRON_FILE="/etc/crontabs/root"
+RUNNER="/usr/bin/ipselect-runner"
+
+# 支持测试环境注入
+if [ -n "$TEST_CRON_FILE" ]; then
+    CRON_FILE="$TEST_CRON_FILE"
+fi
+
+if [ -n "$TEST_RUNNER" ]; then
+    RUNNER="$TEST_RUNNER"
+fi
+
+UCI_CMD="uci"
+if [ -n "$TEST_UCI_CMD" ]; then
+    UCI_CMD="$TEST_UCI_CMD"
+fi
+
+[ -f /lib/functions.sh ] && . /lib/functions.sh
+
+if ! type config_load >/dev/null 2>&1; then
+    config_load() { :; }
+fi
+
+if ! type config_get_bool >/dev/null 2>&1; then
+    config_get_bool() {
+        local _var="$1" _sec="$2" _opt="$3" _def="${4:-0}"
+        local _val=""
+        if type "$UCI_CMD" >/dev/null 2>&1; then
+            _val=$($UCI_CMD get "ipselect.${_sec}.${_opt}" 2>/dev/null)
+        fi
+        [ -z "$_val" ] && _val="$_def"
+        case "$_val" in
+            1|on|true|yes|enabled) eval "$_var=1" ;;
+            0|off|false|no|disabled) eval "$_var=0" ;;
+            *) eval "$_var=$_def" ;;
+        esac
+    }
+fi
+
+if ! type config_get >/dev/null 2>&1; then
+    config_get() {
+        local _var="$1" _sec="$2" _opt="$3" _def="$4"
+        local _val=""
+        if type "$UCI_CMD" >/dev/null 2>&1; then
+            _val=$($UCI_CMD get "ipselect.${_sec}.${_opt}" 2>/dev/null)
+        fi
+        [ -z "$_val" ] && _val="$_def"
+        eval "$_var=\"\$_val\""
+    }
+fi
+
+sync_cron() {
+    config_load ipselect 2>/dev/null || true
+    local enabled cron_enabled cron_hour cron_minute cron_expression
+    config_get_bool enabled config enabled 1
+    config_get_bool cron_enabled config cron_enabled 1
+    config_get cron_expression config cron_expression ""
+
+    local cron_schedule
+    if [ -n "$cron_expression" ]; then
+        cron_schedule="$cron_expression"
+    else
+        config_get cron_hour config cron_hour "4"
+        config_get cron_minute config cron_minute "30"
+        [ -z "$cron_hour" ] && cron_hour="4"
+        [ -z "$cron_minute" ] && cron_minute="30"
+        cron_schedule="${cron_minute} ${cron_hour} * * *"
+    fi
+
+    # 清理已有的 ipselect cron 标记
+    if [ -f "$CRON_FILE" ]; then
+        sed -i '/#ipselect-cron-task/d' "$CRON_FILE"
+    fi
+
+    # 如果启用且开启了定时
+    if [ "$enabled" -eq 1 ] && [ "$cron_enabled" -eq 1 ]; then
+        mkdir -p "$(dirname "$CRON_FILE")"
+        echo "${cron_schedule} ${RUNNER} start cron >/dev/null 2>&1 #ipselect-cron-task" >> "$CRON_FILE"
+    fi
+
+
+    if [ -n "$TEST_CRON_RELOAD_CMD" ]; then
+        $TEST_CRON_RELOAD_CMD 2>/dev/null || true
+    else
+        /etc/init.d/cron reload 2>/dev/null || true
+    fi
+}
+
+start() {
+    sync_cron
+}
+
+stop() {
+    if [ -f "$CRON_FILE" ]; then
+        sed -i '/#ipselect-cron-task/d' "$CRON_FILE"
+        if [ -n "$TEST_CRON_RELOAD_CMD" ]; then
+            $TEST_CRON_RELOAD_CMD 2>/dev/null || true
+        else
+            /etc/init.d/cron reload 2>/dev/null || true
+        fi
+    fi
+    $RUNNER stop >/dev/null 2>&1 || true
+}
+
+reload() {
+    sync_cron
+}
+
+# 支持非 rc.common 包装环境（如直接以 sh 执行脚本）
+if [ -z "$initscript" ]; then
+    case "$1" in
+        start) start ;;
+        stop) stop ;;
+        restart) stop; start ;;
+        reload) reload ;;
+        sync_cron) sync_cron ;;
+        "") ;;
+        *)
+            echo "用法: $0 {start|stop|restart|reload|sync_cron}"
+            exit 1
+            ;;
+    esac
+fi
