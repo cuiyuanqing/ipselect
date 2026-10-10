@@ -211,6 +211,24 @@ def is_official_cloudflare_ip(ip_str):
         return False
 
 
+def download_url_lines(url, timeout=12):
+    """带镜像多重加速容灾拉取文本行列表"""
+    urls_to_try = [url]
+    if "raw.githubusercontent.com" in url:
+        rel_path = url.replace("https://raw.githubusercontent.com/", "")
+        urls_to_try.append(f"https://raw.gitmirror.com/{rel_path}")
+        urls_to_try.append(f"https://ghfast.top/{url}")
+
+    for target_url in urls_to_try:
+        try:
+            req = urllib.request.Request(target_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=timeout) as res:
+                return [l.decode('utf-8', errors='ignore') for l in res.readlines()]
+        except Exception:
+            continue
+    return []
+
+
 def fetch_candidates():
     """从多个渠道获取候选节点列表"""
     candidates = []
@@ -219,62 +237,65 @@ def fetch_candidates():
     for url in CSV_SOURCES:
         print(f"[*] 正在拉取 CSV 数据源: {url}")
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=15) as res:
-                lines = [l.decode('utf-8', errors='ignore') for l in res.readlines()]
-                reader = csv.reader(lines)
-                header = next(reader, None)
-                for row in reader:
-                    if len(row) <= 8:
-                        continue
-                    tls = row[3].strip().upper()
-                    if tls != 'TRUE':
-                        continue
-                    dc = row[4].strip().upper()
-                    # 方案 A 全网极速优选模式：放开国家限制，保留异常黑名单机房过滤
-                    if dc in EXCLUDE_DCS:
-                        continue
-                    try:
-                        sp = float(row[8].strip())
-                    except ValueError:
-                        sp = 0.0
-                    ip = row[0].strip()
-                    try:
-                        port = int(row[1].strip())
-                    except ValueError:
-                        continue
-                    candidates.append((ip, port, sp))
+            lines = download_url_lines(url, timeout=12)
+            if not lines:
+                print(f"[-] CSV 获取失败 (已尝试多重镜像源): {url}")
+                continue
+            reader = csv.reader(lines)
+            header = next(reader, None)
+            for row in reader:
+                if len(row) <= 8:
+                    continue
+                tls = row[3].strip().upper()
+                if tls != 'TRUE':
+                    continue
+                dc = row[4].strip().upper()
+                # 方案 A 全网极速优选模式：放开国家限制，保留异常黑名单机房过滤
+                if dc in EXCLUDE_DCS:
+                    continue
+                try:
+                    sp = float(row[8].strip())
+                except ValueError:
+                    sp = 0.0
+                ip = row[0].strip()
+                try:
+                    port = int(row[1].strip())
+                except ValueError:
+                    continue
+                candidates.append((ip, port, sp))
         except Exception as e:
-            print(f"[-] CSV 获取失败 ({url}): {e}")
+            print(f"[-] CSV 解析异常 ({url}): {e}")
 
     # 2. 解析 TXT 数据源 (例如 mocl1220/ip, BestCF)
     for url in TXT_SOURCES:
         print(f"[*] 正在拉取 TXT 数据源: {url}")
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=15) as res:
-                for l in res.readlines():
-                    line = l.decode('utf-8', errors='ignore').strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    # 方案 A 全网极速优选模式：提取 IP/端口，不局限于 #US 标识
-                    if '#' in line:
-                        addr, tag = line.split('#', 1)
-                        addr = addr.strip()
-                    else:
-                        addr = line.strip()
+            lines = download_url_lines(url, timeout=12)
+            if not lines:
+                print(f"[-] TXT 获取失败 (已尝试多重镜像源): {url}")
+                continue
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                # 方案 A 全网极速优选模式：提取 IP/端口，不局限于 #US 标识
+                if '#' in line:
+                    addr, tag = line.split('#', 1)
+                    addr = addr.strip()
+                else:
+                    addr = line.strip()
 
-                    if ':' in addr:
-                        parts = addr.split(':')
-                        try:
-                            candidates.append((parts[0].strip(), int(parts[1].strip()), 0.0))
-                        except ValueError:
-                            continue
-                    else:
-                        candidates.append((addr, 443, 0.0))
-                        candidates.append((addr, 8443, 0.0))
+                if ':' in addr:
+                    parts = addr.split(':')
+                    try:
+                        candidates.append((parts[0].strip(), int(parts[1].strip()), 0.0))
+                    except ValueError:
+                        continue
+                else:
+                    candidates.append((addr, 443, 0.0))
+                    candidates.append((addr, 8443, 0.0))
         except Exception as e:
-            print(f"[-] TXT 获取失败 ({url}): {e}")
+            print(f"[-] TXT 解析异常 ({url}): {e}")
 
     # 3. 补充备用高可用 Anycast IP 池
     for ip in BACKUP_CF_IPS:
@@ -644,10 +665,18 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     4. 阶段 4：真实微吞吐测速 (防限流微测速)
     5. 五维严苛评分与降序导出
     """
-    init_network_bypass(interface)
+    try:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
+    # 优先拉取候选数据源（支持代理或国内镜像加速拉取，防止未降权前因网络受阻）
     candidates = fetch_candidates()
     print(f"[*] 启动四阶漏斗严选引擎 (环境标识: {tag}, 导出目标: {output_file})...")
+
+    # 数据源拉取就绪后，启动底层直连网络绕过（设置 GID=65534 绕过代理，直接测速真实延迟）
+    init_network_bypass(interface)
 
     # ================= 阶段 1：快速 TCP 并发探针 =================
     print(f"\n[+] [阶段 1/4] 启动快速 TCP 连通性并发扫描 (总数: {len(candidates)}, 并发度: 30)...")
