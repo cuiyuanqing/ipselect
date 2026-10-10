@@ -72,6 +72,8 @@ class TestPackaging(unittest.TestCase):
         control_content = None
         postinst_content = None
         postinst_mode = None
+        postrm_content = None
+        postrm_mode = None
 
         with tarfile.open(fileobj=io.BytesIO(control_tgz_bytes), mode="r:gz") as tar:
             for member in tar.getmembers():
@@ -83,9 +85,14 @@ class TestPackaging(unittest.TestCase):
                     postinst_mode = member.mode
                     f = tar.extractfile(member)
                     postinst_content = f.read().decode("utf-8")
+                elif clean_name == "postrm":
+                    postrm_mode = member.mode
+                    f = tar.extractfile(member)
+                    postrm_content = f.read().decode("utf-8")
 
         self.assertIsNotNone(control_content, "Missing control file in control.tar.gz")
         self.assertIsNotNone(postinst_content, "Missing postinst in control.tar.gz")
+        self.assertIsNotNone(postrm_content, "Missing postrm in control.tar.gz")
 
         # Verify control metadata fields
         control_lines = {
@@ -105,12 +112,19 @@ class TestPackaging(unittest.TestCase):
         self.assertIn("/usr/bin/ipselect-runner", postinst_content)
         self.assertIn("/etc/init.d/ipselect", postinst_content)
         self.assertIn("/etc/init.d/ipselect enable", postinst_content)
-        # Check executable bit on postinst
+        self.assertIn("rm -rf /tmp/luci-indexcache*", postinst_content)
+        self.assertIn("/etc/init.d/rpcd reload", postinst_content)
+        # Check executable bit on postinst and postrm
         self.assertTrue(
             bool(postinst_mode & 0o111),
             f"postinst should be executable, got mode {oct(postinst_mode)}",
         )
-        print("[OK] Verified control metadata and postinst permissions")
+        self.assertTrue(
+            bool(postrm_mode & 0o111),
+            f"postrm should be executable, got mode {oct(postrm_mode)}",
+        )
+        self.assertIn("rm -rf /tmp/luci-indexcache*", postrm_content)
+        print("[OK] Verified control metadata, postinst, and postrm permissions")
 
     def test_04_data_payload_components_and_permissions(self):
         """Verify data.tar.gz contains all 7 core components with correct paths and permissions."""

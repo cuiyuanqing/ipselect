@@ -49,10 +49,28 @@ POSTINST_SCRIPT = """#!/bin/sh
 	chmod 755 /usr/bin/ipselect-runner
 	chmod 755 /etc/init.d/ipselect
 	/etc/init.d/ipselect enable
+	/etc/init.d/ipselect restart
+	[ -s /lib/functions.sh ] && {
+		. /lib/functions.sh
+		default_postinst $0 $@
+	}
+	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* 2>/dev/null || true
+	/etc/init.d/rpcd reload 2>/dev/null || true
+	/etc/init.d/uhttpd restart 2>/dev/null || true
 	exit 0
 }
 chmod 755 ${IPKG_INSTROOT}/usr/bin/ipselect-runner 2>/dev/null || true
 chmod 755 ${IPKG_INSTROOT}/etc/init.d/ipselect 2>/dev/null || true
+exit 0
+"""
+
+POSTRM_SCRIPT = """#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] || {
+	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* 2>/dev/null || true
+	/etc/init.d/rpcd reload 2>/dev/null || true
+	/etc/init.d/uhttpd restart 2>/dev/null || true
+	exit 0
+}
 exit 0
 """
 
@@ -121,11 +139,13 @@ def build_control_tar_gz(
     )
     control_bytes = _normalize_text_bytes(control_content.encode("utf-8"))
     postinst_bytes = _normalize_text_bytes(POSTINST_SCRIPT.encode("utf-8"))
+    postrm_bytes = _normalize_text_bytes(POSTRM_SCRIPT.encode("utf-8"))
 
     entries = [
         {"name": "./", "data": None, "mode": 0o755, "is_dir": True},
         {"name": "./control", "data": control_bytes, "mode": 0o644, "is_dir": False},
         {"name": "./postinst", "data": postinst_bytes, "mode": 0o755, "is_dir": False},
+        {"name": "./postrm", "data": postrm_bytes, "mode": 0o755, "is_dir": False},
     ]
     return create_tar_gz_bytes(entries, base_time=base_time)
 

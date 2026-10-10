@@ -61,10 +61,29 @@ define Package/luci-app-ipselect/postinst
 	chmod 755 /usr/bin/ipselect-runner
 	chmod 755 /etc/init.d/ipselect
 	/etc/init.d/ipselect enable
+	/etc/init.d/ipselect restart
+	[ -s /lib/functions.sh ] && {
+		. /lib/functions.sh
+		default_postinst $$0 $$@
+	}
+	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* 2>/dev/null || true
+	/etc/init.d/rpcd reload 2>/dev/null || true
+	/etc/init.d/uhttpd restart 2>/dev/null || true
 	exit 0
 }
 chmod 755 $${IPKG_INSTROOT}/usr/bin/ipselect-runner 2>/dev/null || true
 chmod 755 $${IPKG_INSTROOT}/etc/init.d/ipselect 2>/dev/null || true
+exit 0
+endef
+
+define Package/luci-app-ipselect/postrm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] || {
+	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* 2>/dev/null || true
+	/etc/init.d/rpcd reload 2>/dev/null || true
+	/etc/init.d/uhttpd restart 2>/dev/null || true
+	exit 0
+}
 exit 0
 endef
 
