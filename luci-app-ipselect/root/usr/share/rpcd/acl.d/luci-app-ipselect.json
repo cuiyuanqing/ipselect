@@ -1,0 +1,18 @@
+{
+	"luci-app-ipselect": {
+		"description": "Grant access for luci-app-ipselect",
+		"read": {
+			"uci": [ "ipselect" ],
+			"file": {
+				"/var/log/ipselect.log": [ "read" ],
+				"/etc/ipselect/history.json": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "ipselect" ],
+			"file": {
+				"/etc/init.d/ipselect restart": [ "exec" ]
+			}
+		}
+	}
+}

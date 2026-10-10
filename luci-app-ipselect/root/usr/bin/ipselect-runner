@@ -1,0 +1,412 @@
+#!/bin/sh
+# /usr/bin/ipselect-runner - iStoreOS 节点优选执行引擎
+BASE_ROOT="${TEST_ROOT:-}"
+PID_FILE="${BASE_ROOT}/var/run/ipselect.pid"
+INFO_FILE="${BASE_ROOT}/var/run/ipselect.info"
+LOG_FILE="${BASE_ROOT}/var/log/ipselect.log"
+DATA_DIR="${BASE_ROOT}/etc/ipselect"
+HISTORY_FILE="${DATA_DIR}/history.json"
+HISTORY_LOG_DIR="${DATA_DIR}/logs"
+
+mkdir -p "${BASE_ROOT}/var/run" "${BASE_ROOT}/var/log" "${DATA_DIR}" "${HISTORY_LOG_DIR}"
+
+UCI_CMD="uci"
+if [ -n "$TEST_ROOT" ] && [ -x "$TEST_ROOT/mock_uci.sh" ]; then
+    UCI_CMD="$TEST_ROOT/mock_uci.sh"
+fi
+
+get_config() {
+    val=$($UCI_CMD get "ipselect.config.$1" 2>/dev/null)
+    if [ -n "$val" ]; then
+        echo "$val"
+    else
+        echo "$2"
+    fi
+}
+
+run_git_masked() {
+    # 执行 git 命令，捕获输出与退出码，将 GITHUB_TOKEN 脱敏后追加到 LOG_FILE
+    local tmp_out
+    tmp_out=$(git "$@" 2>&1)
+    local ret=$?
+    if [ -n "$GITHUB_TOKEN" ]; then
+        echo "$tmp_out" | sed "s#${GITHUB_TOKEN}#********#g" >> "$LOG_FILE"
+    else
+        echo "$tmp_out" >> "$LOG_FILE"
+    fi
+    return $ret
+}
+
+is_running() {
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat "$PID_FILE" 2>/dev/null | tr -d ' \r\n')
+        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$PID_FILE" "$INFO_FILE"
+    fi
+    return 1
+}
+
+record_history() {
+    REC_ID="$1"
+    REC_TIME="$2"
+    REC_TRIG="$3"
+    REC_DUR="$4"
+    REC_STAT="$5"
+    REC_NODES="$6"
+    REC_GIT="$7"
+    REC_OC="$8"
+    REC_LOG="$9"
+
+    python3 -c "
+import json, os
+hist_file = '$HISTORY_FILE'
+log_dir = '$HISTORY_LOG_DIR'
+new_record = {
+    'id': '$REC_ID',
+    'timestamp': '$REC_TIME',
+    'trigger': '$REC_TRIG',
+    'duration': int('$REC_DUR'),
+    'status': '$REC_STAT',
+    'nodeCount': int('$REC_NODES'),
+    'gitStatus': '$REC_GIT',
+    'openclashStatus': '$REC_OC',
+    'logFile': '$REC_LOG'
+}
+data = []
+if os.path.exists(hist_file):
+    try:
+        with open(hist_file, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            if content:
+                data = json.loads(content)
+                if not isinstance(data, list):
+                    data = []
+    except Exception:
+        data = []
+data.insert(0, new_record)
+kept = data[:10]
+with open(hist_file, 'w', encoding='utf-8') as f:
+    json.dump(kept, f, ensure_ascii=False, indent=2)
+
+kept_logs = set(os.path.basename(r.get('logFile', '')) for r in kept if r.get('logFile'))
+if os.path.isdir(log_dir):
+    for fname in os.listdir(log_dir):
+        if fname.startswith('history_') and fname.endswith('.log'):
+            if fname not in kept_logs:
+                try:
+                    os.remove(os.path.join(log_dir, fname))
+                except Exception:
+                    pass
+" 2>/dev/null || true
+}
+
+case "$1" in
+    status)
+        if is_running; then
+            PID=$(cat "$PID_FILE" 2>/dev/null | tr -d ' \r\n')
+            RUNNING=true
+        else
+            PID=0
+            RUNNING=false
+        fi
+        LAST_RUN="从未运行"
+        if [ -f "$HISTORY_FILE" ]; then
+            LAST_RUN=$(grep -o '"timestamp": "[^"]*"' "$HISTORY_FILE" 2>/dev/null | head -n 1 | cut -d'"' -f4)
+        fi
+        [ -z "$LAST_RUN" ] && LAST_RUN="从未运行"
+        echo "{\"running\": $RUNNING, \"pid\": $PID, \"last_run\": \"$LAST_RUN\"}"
+        ;;
+
+    start)
+        if is_running; then
+            CURR_PID=$(cat "$PID_FILE" 2>/dev/null | tr -d ' \r\n')
+            echo "{\"success\": false, \"message\": \"任务正在运行中 (PID: $CURR_PID)\"}"
+            exit 1
+        fi
+        TRIGGER="${2:-manual}"
+        START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+        TASK_ID=$(date '+%Y%m%d-%H%M%S')
+        T_START=$(date +%s)
+        
+        WORKDIR=$(get_config "workdir" "/root/ipselect")
+        ENV_TAG=$(get_config "env_tag" "公司")
+        OUTPUT_FILE=$(get_config "output_file" "best_us.txt")
+        INTERFACE=$(get_config "interface" "br-lan")
+        AUTO_PUSH=$(get_config "auto_push" "1")
+        OPENCLASH_SYNC=$(get_config "openclash_sync" "1")
+        PROVIDER_NAME=$(get_config "openclash_provider" "datree")
+        GITHUB_REPO=$(get_config "github_repo" "")
+        GITHUB_TOKEN=$(get_config "github_token" "")
+        GITHUB_BRANCH=$(get_config "github_branch" "main")
+        GITHUB_USER=$(get_config "github_user" "")
+        GITHUB_EMAIL=$(get_config "github_email" "")
+        AUTO_CLONE=$(get_config "auto_clone" "1")
+        [ -z "$GITHUB_BRANCH" ] && GITHUB_BRANCH="main"
+
+        # 保存当前任务上下文供 stop 中断时获取
+        cat << EOF > "$INFO_FILE"
+TASK_ID='$TASK_ID'
+START_TIME='$START_TIME'
+TRIGGER='$TRIGGER'
+T_START='$T_START'
+EOF
+
+        # 后台异步启动执行
+        (
+            echo "========== [${START_TIME}] 任务开始执行 (触发源: ${TRIGGER}) ==========" > "$LOG_FILE"
+            STATUS="success"
+            GIT_STATUS="skipped"
+            OC_STATUS="skipped"
+            NODE_COUNT=0
+
+            # 自动克隆检查
+            if [ ! -d "$WORKDIR/.git" ] && [ "$AUTO_CLONE" = "1" ] && [ -n "$GITHUB_REPO" ] && [ -n "$GITHUB_TOKEN" ]; then
+                mkdir -p "$(dirname "$WORKDIR")"
+                if [ ! -d "$WORKDIR" ] || [ -z "$(ls -A "$WORKDIR" 2>/dev/null)" ]; then
+                    echo "[*] 工作目录不存在或为空，正在自动从 GitHub 克隆远程仓库..." >> "$LOG_FILE"
+                    CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+                    if run_git_masked clone -b "$GITHUB_BRANCH" "$CLONE_URL" "$WORKDIR"; then
+                        echo "[+] 仓库自动克隆成功！" >> "$LOG_FILE"
+                    else
+                        echo "[!] 自动克隆失败，请检查 Token 权限与网络连接！" >> "$LOG_FILE"
+                    fi
+                fi
+            fi
+
+            if [ -d "$WORKDIR" ]; then
+                cd "$WORKDIR"
+                echo "[*] 进入工作目录: $WORKDIR" >> "$LOG_FILE"
+                if [ -d ".git" ]; then
+                    if [ -n "$GITHUB_REPO" ] && [ -n "$GITHUB_TOKEN" ]; then
+                        AUTH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+                        git remote set-url origin "$AUTH_URL" 2>/dev/null || git remote add origin "$AUTH_URL" 2>/dev/null || true
+                    fi
+                    echo "[*] 同步远程最新代码 (git pull origin ${GITHUB_BRANCH})..." >> "$LOG_FILE"
+                    run_git_masked pull origin "$GITHUB_BRANCH" || true
+                fi
+                
+                echo "[*] 开始执行节点筛选测速: --tag ${ENV_TAG} --output ${OUTPUT_FILE} --interface ${INTERFACE}..." >> "$LOG_FILE"
+                if python3 scripts/filter_us_nodes.py --tag "$ENV_TAG" --output "$OUTPUT_FILE" --interface "$INTERFACE" >> "$LOG_FILE" 2>&1; then
+                    echo "[+] 节点筛选测速完成！" >> "$LOG_FILE"
+                    if [ -f "$OUTPUT_FILE" ]; then
+                        NODE_COUNT=$(grep -v '^#' "$OUTPUT_FILE" 2>/dev/null | grep -c ':' 2>/dev/null || true)
+                        [ -z "$NODE_COUNT" ] && NODE_COUNT=0
+                    fi
+                else
+                    echo "[!] 节点筛选测速发生异常！" >> "$LOG_FILE"
+                    STATUS="failed"
+                fi
+
+                if [ "$STATUS" = "success" ] && [ "$AUTO_PUSH" = "1" ] && [ -d ".git" ]; then
+                    echo "[*] 检测 Git 变更并提交..." >> "$LOG_FILE"
+                    if [ -n "$GITHUB_USER" ]; then
+                        git config user.name "$GITHUB_USER" || true
+                    elif [ -z "$(git config user.name 2>/dev/null)" ]; then
+                        git config user.name "iStoreOS-IPSelect" || true
+                    fi
+                    if [ -n "$GITHUB_EMAIL" ]; then
+                        git config user.email "$GITHUB_EMAIL" || true
+                    elif [ -z "$(git config user.email 2>/dev/null)" ]; then
+                        git config user.email "ipselect@local" || true
+                    fi
+                    git add "$OUTPUT_FILE"
+                    if ! git diff --staged --quiet; then
+                        git commit -m "auto: iStoreOS 节点优选更新 [$(date '+%Y-%m-%d %H:%M:%S')]" >> "$LOG_FILE" 2>&1
+                        if run_git_masked push origin "$GITHUB_BRANCH"; then
+                            echo "[+] 成功推送到 GitHub 远程仓库！" >> "$LOG_FILE"
+                            GIT_STATUS="pushed"
+                        else
+                            echo "[!] 推送到 GitHub 失败！" >> "$LOG_FILE"
+                            GIT_STATUS="error"
+                        fi
+                    else
+                        echo "[*] 节点未发生变动，无需推送" >> "$LOG_FILE"
+                        GIT_STATUS="unchanged"
+                    fi
+                fi
+            else
+                echo "[!] 错误: 工作目录 $WORKDIR 不存在！" >> "$LOG_FILE"
+                STATUS="failed"
+            fi
+
+            if [ "$STATUS" = "success" ] && [ "$OPENCLASH_SYNC" = "1" ]; then
+                echo "[*] 联动触发 OpenClash 订阅更新..." >> "$LOG_FILE"
+                OC_HOOK="${BASE_ROOT}/usr/bin/update_openclash_sub.sh"
+                [ ! -x "$OC_HOOK" ] && OC_HOOK="/usr/bin/update_openclash_sub.sh"
+                if [ -x "$OC_HOOK" ]; then
+                    "$OC_HOOK" >> "$LOG_FILE" 2>&1 || true
+                    OC_STATUS="success"
+                else
+                    echo "[*] $OC_HOOK 不存在，跳过联动" >> "$LOG_FILE"
+                    OC_STATUS="skipped"
+                fi
+            fi
+
+            T_END=$(date +%s)
+            DURATION=$((T_END - T_START))
+            echo "========== [$(date '+%Y-%m-%d %H:%M:%S')] 任务执行完毕 (耗时: ${DURATION}s, 状态: ${STATUS}) ==========" >> "$LOG_FILE"
+
+            # 归档日志快照
+            ARCHIVE_LOG="${HISTORY_LOG_DIR}/history_${TASK_ID}.log"
+            cp "$LOG_FILE" "$ARCHIVE_LOG"
+
+            # 更新历史记录 JSON 并淘汰旧日志
+            record_history "$TASK_ID" "$START_TIME" "$TRIGGER" "$DURATION" "$STATUS" "$NODE_COUNT" "$GIT_STATUS" "$OC_STATUS" "$ARCHIVE_LOG"
+
+            rm -f "$INFO_FILE" "$PID_FILE"
+        ) >/dev/null 2>&1 &
+        BG_PID=$!
+        echo "$BG_PID" > "$PID_FILE"
+        echo "{\"success\": true, \"message\": \"任务已启动\"}"
+        ;;
+
+    stop)
+        if is_running; then
+            PID=$(cat "$PID_FILE" 2>/dev/null | tr -d ' \r\n')
+            # 读取当前任务元数据
+            TASK_ID=""
+            START_TIME=""
+            TRIGGER="manual"
+            T_START=""
+            if [ -f "$INFO_FILE" ]; then
+                . "$INFO_FILE"
+            fi
+            [ -z "$TASK_ID" ] && TASK_ID=$(date '+%Y%m%d-%H%M%S')
+            [ -z "$START_TIME" ] && START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+            [ -z "$T_START" ] && T_START=$(date +%s)
+
+            # 递归杀掉子进程
+            pkill -P "$PID" 2>/dev/null || true
+            if [ -d "/proc" ]; then
+                for child in $(grep -l "^PPid:[[:space:]]*${PID}$" /proc/[0-9]*/status 2>/dev/null | cut -d/ -f3); do
+                    kill -TERM "$child" 2>/dev/null || true
+                    kill -9 "$child" 2>/dev/null || true
+                done
+            fi
+            kill -TERM "$PID" 2>/dev/null || true
+            sleep 1
+            kill -9 "$PID" 2>/dev/null || true
+            rm -f "$PID_FILE" "$INFO_FILE"
+
+            echo "========== [$(date '+%Y-%m-%d %H:%M:%S')] 任务被手动中止 ==========" >> "$LOG_FILE"
+
+            T_NOW=$(date +%s)
+            DURATION=$((T_NOW - T_START))
+            [ "$DURATION" -lt 0 ] && DURATION=0
+
+            # 归档中止日志快照并写入 terminated 历史记录
+            ARCHIVE_LOG="${HISTORY_LOG_DIR}/history_${TASK_ID}.log"
+            cp "$LOG_FILE" "$ARCHIVE_LOG"
+            record_history "$TASK_ID" "$START_TIME" "$TRIGGER" "$DURATION" "terminated" 0 "skipped" "skipped" "$ARCHIVE_LOG"
+
+            echo "{\"success\": true, \"message\": \"任务已成功终止\"}"
+        else
+            echo "{\"success\": false, \"message\": \"当前没有运行中的任务\"}"
+        fi
+        ;;
+
+    log)
+        OFFSET="${2:-0}"
+        if [ -f "$LOG_FILE" ]; then
+            TOTAL_SIZE=$(wc -c < "$LOG_FILE" | tr -d ' ')
+            if [ "$OFFSET" -gt 0 ] && [ "$OFFSET" -lt "$TOTAL_SIZE" ]; then
+                tail -c "+$((OFFSET + 1))" "$LOG_FILE"
+            elif [ "$OFFSET" -eq "$TOTAL_SIZE" ] && [ "$TOTAL_SIZE" -gt 0 ]; then
+                :
+            else
+                cat "$LOG_FILE"
+            fi
+        else
+            echo ""
+        fi
+        ;;
+
+    clear-log)
+        > "$LOG_FILE"
+        echo "{\"success\": true}"
+        ;;
+
+    results)
+        WORKDIR=$(get_config "workdir" "/root/ipselect")
+        OUTPUT_FILE=$(get_config "output_file" "best_us.txt")
+        TARGET_PATH="${WORKDIR}/${OUTPUT_FILE}"
+        if [ -f "$TARGET_PATH" ]; then
+            python3 -c "
+import json, os, time
+path = '$TARGET_PATH'
+mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(path)))
+nodes = []
+with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+    idx = 1
+    for line in f:
+        line = line.strip()
+        if not line or line.startswith('#'): continue
+        parts = line.split('#')
+        addr = parts[0].strip()
+        remark = parts[1].strip() if len(parts) > 1 else '未命名'
+        if ':' in addr:
+            ip, port = addr.split(':', 1)
+        else:
+            ip, port = addr, '443'
+        nodes.append({'index': idx, 'ip': ip.strip(), 'port': port.strip(), 'remark': remark})
+        idx += 1
+print(json.dumps({'file': '$OUTPUT_FILE', 'update_time': mtime, 'count': len(nodes), 'nodes': nodes}, ensure_ascii=False))
+"
+        else
+            echo "{\"file\": \"$OUTPUT_FILE\", \"update_time\": \"从未生成\", \"count\": 0, \"nodes\": []}"
+        fi
+        ;;
+
+    history)
+        if [ -f "$HISTORY_FILE" ]; then
+            cat "$HISTORY_FILE"
+        else
+            echo "[]"
+        fi
+        ;;
+
+    history-log)
+        REQ_ID="$2"
+        TARGET_LOG="${HISTORY_LOG_DIR}/history_${REQ_ID}.log"
+        if [ -n "$REQ_ID" ] && [ -f "$TARGET_LOG" ]; then
+            cat "$TARGET_LOG"
+        else
+            echo "日志不存在或已被清除"
+        fi
+        ;;
+
+    test-github)
+        GITHUB_REPO="${2:-$(get_config "github_repo" "")}"
+        GITHUB_TOKEN="${3:-$(get_config "github_token" "")}"
+        GITHUB_BRANCH="${4:-$(get_config "github_branch" "main")}"
+        [ -z "$GITHUB_BRANCH" ] && GITHUB_BRANCH="main"
+
+        if [ -z "$GITHUB_REPO" ] || [ -z "$GITHUB_TOKEN" ]; then
+            echo '{"success": false, "message": "未配置 GitHub 仓库名或访问令牌 (Token)"}'
+            exit 0
+        fi
+
+        REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+        TMP_OUT=$(git ls-remote --heads "$REMOTE_URL" "$GITHUB_BRANCH" 2>&1)
+        RET=$?
+
+        SAFE_OUT=$(echo "$TMP_OUT" | sed "s#${GITHUB_TOKEN}#********#g" | tr '\r\n' ' ' | sed 's/"/\\"/g' | sed 's/^[ \t]*//;s/[ \t]*$//')
+
+        if [ "$RET" -eq 0 ]; then
+            if echo "$TMP_OUT" | grep -q "refs/heads/${GITHUB_BRANCH}"; then
+                echo "{\"success\": true, \"message\": \"GitHub 连通性测试成功！远程分支 '${GITHUB_BRANCH}' 鉴权正常。\"}"
+            else
+                echo "{\"success\": true, \"message\": \"GitHub 鉴权成功！但远端尚未发现分支 '${GITHUB_BRANCH}' (推仓时将自动创建)。\"}"
+            fi
+        else
+            echo "{\"success\": false, \"message\": \"GitHub 连接失败: ${SAFE_OUT}\"}"
+        fi
+        ;;
+
+    *)
+        echo "用法: $0 {start|stop|status|log|clear-log|results|history|history-log|test-github}"
+        exit 1
+        ;;
+esac

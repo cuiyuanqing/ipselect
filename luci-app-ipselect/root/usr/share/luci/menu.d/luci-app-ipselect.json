@@ -1,0 +1,13 @@
+{
+	"admin/services/ipselect": {
+		"title": "节点优选",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "ipselect/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-ipselect" ]
+		}
+	}
+}

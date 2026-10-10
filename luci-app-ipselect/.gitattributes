@@ -1,0 +1,10 @@
+# 强制 OpenWrt 插件核心脚本与配置保持 Unix LF 换行符
+* text=auto eol=lf
+*.sh text eol=lf
+*.lua text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+ipselect text eol=lf
+ipselect-runner text eol=lf
+Makefile text eol=lf
+*.ipk binary
