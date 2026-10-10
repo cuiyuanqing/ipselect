@@ -3,10 +3,10 @@
 适用于 OpenWrt 24.10、23.05、22.03 及更早版本的标准 `opkg` IPK 安装包。
 
 ### 命令行安装
-上传 `luci-app-ipselect_1.0.0-1_all.ipk` 到路由器的 `/tmp/` 目录，执行：
+上传 `luci-app-ipselect_1.1.0-1_all.ipk` 到路由器的 `/tmp/` 目录，执行：
 ```bash
 opkg update
-opkg install /tmp/luci-app-ipselect_1.0.0-1_all.ipk
+opkg install /tmp/luci-app-ipselect_1.1.0-1_all.ipk
 ```
 
 ### Web 界面一键安装
