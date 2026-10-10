@@ -1,6 +1,6 @@
 # iStoreOS 节点优选控制台插件 (luci-app-ipselect) 实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 构建并部署 iStoreOS / OpenWrt 官方技术规范的 Web UI 插件 `luci-app-ipselect`，提供一键优选触发、实时终端日志滚屏、优选结果表格化呈现、历史记录追溯以及 OpenClash 订阅自动联动能力。
 
@@ -31,7 +31,7 @@
   - Command: `/usr/bin/ipselect-runner {start|stop|status|log|clear-log|results|history|history-log}`
   - Files: `/var/run/ipselect.pid`, `/var/log/ipselect.log`, `/etc/ipselect/history.json`, `/etc/ipselect/logs/history_<id>.log`
 
-- [ ] **Step 1: 编写 Runner 功能测试脚本 `tests/test_runner.sh`**
+- [x] **Step 1: 编写 Runner 功能测试脚本 `tests/test_runner.sh`**
 
 ```bash
 #!/bin/sh
@@ -71,7 +71,7 @@ EOF
 echo "✅ 测试环境准备完毕"
 ```
 
-- [ ] **Step 2: 编写 `root/usr/bin/ipselect-runner` 核心调度脚本**
+- [x] **Step 2: 编写 `root/usr/bin/ipselect-runner` 核心调度脚本**
 
 实现支持 `start`, `stop`, `status`, `log`, `clear-log`, `results`, `history`, `history-log` 等完整子命令。
 
@@ -321,12 +321,12 @@ print(json.dumps({'file': '$OUTPUT_FILE', 'update_time': mtime, 'count': len(nod
 esac
 ```
 
-- [ ] **Step 3: 运行本地 Runner 逻辑测试**
+- [x] **Step 3: 运行本地 Runner 逻辑测试**
 
 运行：`sh tests/test_runner.sh`
 预期：输出测试通过且各类返回 JSON 合法。
 
-- [ ] **Step 4: 提交 Task 1 成果**
+- [x] **Step 4: 提交 Task 1 成果**
 
 ```bash
 git add root/usr/bin/ipselect-runner tests/test_runner.sh
@@ -346,7 +346,7 @@ git commit -m "feat: 实现 ipselect-runner 后端执行引擎与历史记录管
   - UCI 存储结构：`ipselect.config` (enabled, workdir, env_tag, output_file, interface, auto_push, openclash_sync, openclash_provider, cron_enabled, cron_hour, cron_minute)
   - `/etc/init.d/ipselect {start|stop|restart|reload|sync_cron}`
 
-- [ ] **Step 1: 编写 `/etc/config/ipselect` 默认配置文件**
+- [x] **Step 1: 编写 `/etc/config/ipselect` 默认配置文件**
 
 ```uci
 config ipselect 'config'
@@ -363,7 +363,7 @@ config ipselect 'config'
 	option cron_minute '30'
 ```
 
-- [ ] **Step 2: 编写 `/etc/init.d/ipselect` 服务控制脚本（纳管 Crontab）**
+- [x] **Step 2: 编写 `/etc/init.d/ipselect` 服务控制脚本（纳管 Crontab）**
 
 ```bash
 #!/bin/sh /etc/rc.common
@@ -412,12 +412,12 @@ reload() {
 }
 ```
 
-- [ ] **Step 3: 语法检查与文件权限**
+- [x] **Step 3: 语法检查与文件权限**
 
 运行：`sh -n root/etc/init.d/ipselect`
 预期：语法正确退出码 0。
 
-- [ ] **Step 4: 提交 Task 2 成果**
+- [x] **Step 4: 提交 Task 2 成果**
 
 ```bash
 git add root/etc/config/ipselect root/etc/init.d/ipselect
@@ -438,7 +438,7 @@ git commit -m "feat: 定义 ipselect UCI 配置项与 init.d 定时任务自动�
   - Menu Entry: `admin/services/ipselect`
   - Controller Endpoints: `get_status`, `start`, `stop`, `get_log`, `clear_log`, `get_results`, `get_history`, `get_history_log`
 
-- [ ] **Step 1: 编写 `luasrc/controller/ipselect.lua` 后端控制器**
+- [x] **Step 1: 编写 `luasrc/controller/ipselect.lua` 后端控制器**
 
 ```lua
 module("luci.controller.ipselect", package.seeall)
@@ -513,7 +513,7 @@ function action_get_history_log()
 end
 ```
 
-- [ ] **Step 2: 编写 LuCI 菜单注册 JSON `root/usr/share/luci/menu.d/luci-app-ipselect.json`**
+- [x] **Step 2: 编写 LuCI 菜单注册 JSON `root/usr/share/luci/menu.d/luci-app-ipselect.json`**
 
 ```json
 {
@@ -531,7 +531,7 @@ end
 }
 ```
 
-- [ ] **Step 3: 编写 RPCD ACL 权限声明 `root/usr/share/rpcd/acl.d/luci-app-ipselect.json`**
+- [x] **Step 3: 编写 RPCD ACL 权限声明 `root/usr/share/rpcd/acl.d/luci-app-ipselect.json`**
 
 ```json
 {
@@ -551,7 +551,7 @@ end
 }
 ```
 
-- [ ] **Step 4: 提交 Task 3 成果**
+- [x] **Step 4: 提交 Task 3 成果**
 
 ```bash
 git add luasrc/controller/ipselect.lua root/usr/share/luci/menu.d/luci-app-ipselect.json root/usr/share/rpcd/acl.d/luci-app-ipselect.json
@@ -569,7 +569,7 @@ git commit -m "feat: 实现 LuCI Controller RPC 端点与菜单/ACL 授权定义
 - Consumes: LuCI RPC (`/cgi-bin/luci/admin/services/ipselect/*`), UCI (`uci.load('ipselect')`)
 - Produces: 选项卡式现代化用户交互界面（Dashboard + Tabs 1-4）。
 
-- [ ] **Step 1: 编写 `overview.js` 视图主逻辑**
+- [x] **Step 1: 编写 `overview.js` 视图主逻辑**
 
 实现包含：
 1. 顶部状态仪表盘（状态灯、运行状态、上次运行、Git 状态）；
@@ -578,12 +578,12 @@ git commit -m "feat: 实现 LuCI Controller RPC 端点与菜单/ACL 授权定义
 4. Tab 3：历史执行记录表格（展示最近 10 次记录，点击模态框弹窗查看日志快照）；
 5. Tab 4：基础设置表单（绑定 UCI 配置，支持工作目录、环境标签、网卡、OpenClash 联动、Cron 定时）。
 
-- [ ] **Step 2: 本地语法校验**
+- [x] **Step 2: 本地语法校验**
 
 运行：`node -c htdocs/luci-static/resources/view/ipselect/overview.js`
 预期：语法校验退出码 0。
 
-- [ ] **Step 3: 提交 Task 4 成果**
+- [x] **Step 3: 提交 Task 4 成果**
 
 ```bash
 git add htdocs/luci-static/resources/view/ipselect/overview.js
@@ -604,24 +604,24 @@ git commit -m "feat: 实现现代 LuCI JS 视图全功能面板与 4 大选项�
   - `dist/luci-app-ipselect_1.0.0-1_all.ipk`
   - 一键部署脚本：直连 `10.10.18.2` 并安装生效。
 
-- [ ] **Step 1: 编写 OpenWrt 标准 `Makefile`**
+- [x] **Step 1: 编写 OpenWrt 标准 `Makefile`**
 
 符合 OpenWrt 官方 package 编译规范。
 
-- [ ] **Step 2: 编写免交叉编译环境的独立 IPK 打包工具 `scripts/build_ipk.py`**
+- [x] **Step 2: 编写免交叉编译环境的独立 IPK 打包工具 `scripts/build_ipk.py`**
 
 生成包含 `control.tar.gz`, `data.tar.gz`, `debian-binary` 的标准 `ar` 格式 `.ipk` 文件。
 
-- [ ] **Step 3: 编写软路由一键安装与重载工具 `scripts/deploy_to_router.py`**
+- [x] **Step 3: 编写软路由一键安装与重载工具 `scripts/deploy_to_router.py`**
 
 通过 Paramiko 或 SCP 将文件推送至 `/` 目录并调用 `luci-reload` 重启 LuCI 缓存。
 
-- [ ] **Step 4: 运行本地构建与包合法性校验**
+- [x] **Step 4: 运行本地构建与包合法性校验**
 
 运行：`python scripts/build_ipk.py`
 预期：在 `dist/` 目录下成功生成 `luci-app-ipselect_1.0.0-1_all.ipk`。
 
-- [ ] **Step 5: 提交 Task 5 成果**
+- [x] **Step 5: 提交 Task 5 成果**
 
 ```bash
 git add Makefile scripts/build_ipk.py scripts/deploy_to_router.py
@@ -636,18 +636,18 @@ git commit -m "feat: 增加标准 Makefile、IPK 本地打包器与软路由一�
 - Remote host: `10.10.18.2` (root / Xg@2020+)
 - Verification script: `tests/verify_router_live.py`
 
-- [ ] **Step 1: 执行现场部署**
+- [x] **Step 1: 执行现场部署**
 
 运行：`python scripts/deploy_to_router.py --host 10.10.18.2 --password Xg@2020+`
 预期：文件全部部署至软路由相应系统目录，权限设置正确 (`chmod 755 /usr/bin/ipselect-runner`)，LuCI 缓存刷新成功。
 
-- [ ] **Step 2: 验证 LuCI 菜单与接口响应**
+- [x] **Step 2: 验证 LuCI 菜单与接口响应**
 
 通过 SSH 执行 curl 本地接口：
 - `curl -s http://127.0.0.1/cgi-bin/luci/admin/services/ipselect/get_status` 返回当前运行状态；
 - `curl -s http://127.0.0.1/cgi-bin/luci/admin/services/ipselect/get_results` 成功返回当前 `best_us.txt` 中的节点表格数据。
 
-- [ ] **Step 3: 真机端到端全链路触发实测**
+- [x] **Step 3: 真机端到端全链路触发实测**
 
 1. 触发 `start`，观察 PID 文件生成与 `/var/log/ipselect.log` 增量写入；
 2. 校验 `stop` 指令能即时中止任务并清理锁；
@@ -655,6 +655,6 @@ git commit -m "feat: 增加标准 Makefile、IPK 本地打包器与软路由一�
 4. 验证 OpenClash 订阅联动刷新（若开启）日志记录正常；
 5. 检查系统 Crontab 中是否正确托管 `#ipselect-cron-task` 定时规则。
 
-- [ ] **Step 4: 归档与总结**
+- [x] **Step 4: 归档与总结**
 
 记录实测日志与交付产物，并在计划中全部打钩完成。
