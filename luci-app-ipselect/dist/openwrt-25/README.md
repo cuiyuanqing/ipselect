@@ -12,9 +12,9 @@ OpenWrt 25.12+ 起包管理器全面由 `opkg` 升级为 `apk` (Alpine apk-tools
 3. 脚本会自动将 7 大核心文件释放到系统目录、修正 0755/0644 权限、配置开机自启、刷新 LuCI 菜单缓存并重载服务。
 
 ### 备用方案：tar.gz 压缩包
-1. 上传 `luci-app-ipselect_1.0.0-1_openwrt25.tar.gz` 到路由器的 `/tmp/` 目录；
+1. 上传 `luci-app-ipselect_1.1.0-1_openwrt25.tar.gz` 到路由器的 `/tmp/` 目录；
 2. 在终端解压并执行安装：
    ```bash
-   tar -xzf /tmp/luci-app-ipselect_1.0.0-1_openwrt25.tar.gz -C /tmp/
+   tar -xzf /tmp/luci-app-ipselect_1.1.0-1_openwrt25.tar.gz -C /tmp/
    sh /tmp/install.sh
    ```

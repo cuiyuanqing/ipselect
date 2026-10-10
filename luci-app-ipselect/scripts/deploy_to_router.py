@@ -125,12 +125,11 @@ def deploy_ipk_mode(
     """
     print("\n[deploy] === Mode B: IPK installation ===")
     if ipk_path is None or not ipk_path.exists():
-        default_ipk = repo_root / "dist" / "luci-app-ipselect_1.0.0-1_all.ipk"
+        from scripts.build_ipk import PKG_NAME, PKG_FULL_VERSION, PKG_ARCH, build_ipk
+        default_ipk = repo_root / "dist" / f"{PKG_NAME}_{PKG_FULL_VERSION}_{PKG_ARCH}.ipk"
         if not default_ipk.exists():
             print(f"[deploy] IPK file not found at {default_ipk}. Building now...")
             if not dry_run:
-                from scripts.build_ipk import build_ipk
-
                 build_ipk(repo_root, default_ipk)
         ipk_path = default_ipk
 

@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 PKG_NAME = "luci-app-ipselect"
-PKG_VERSION = "1.0.0"
+PKG_VERSION = "1.1.0"
 PKG_RELEASE = "1"
 PKG_FULL_VERSION = f"{PKG_VERSION}-{PKG_RELEASE}"
 PKG_ARCH = "all"
@@ -342,7 +342,7 @@ echo "[3/4] 注册系统服务开机自启并启动 /etc/init.d/ipselect ..."
 
 # 4. 清除 LuCI 缓存并重启 Web 服务器
 echo "[4/4] 刷新 LuCI 菜单缓存并重载 rpcd 与 uhttpd ..."
-rm -f /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null || true
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* /var/luci-indexcache* 2>/dev/null || true
 /etc/init.d/rpcd restart 2>/dev/null || true
 /etc/init.d/uhttpd restart 2>/dev/null || true
 
@@ -373,7 +373,7 @@ rm -f /usr/lib/lua/luci/controller/ipselect.lua
 rm -f /www/luci-static/resources/view/ipselect/overview.js
 rm -rf /www/luci-static/resources/view/ipselect
 
-rm -f /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null || true
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* /var/luci-indexcache* 2>/dev/null || true
 /etc/init.d/rpcd restart 2>/dev/null || true
 /etc/init.d/uhttpd restart 2>/dev/null || true
 
@@ -412,7 +412,7 @@ def build_openwrt25_packages(
         """tar -xzf "$DIR/data.tar.gz" -C /\n"""
         """chmod 755 /usr/bin/ipselect-runner /etc/init.d/ipselect\n"""
         """/etc/init.d/ipselect enable\n/etc/init.d/ipselect restart\n"""
-        """rm -f /tmp/luci-indexcache /tmp/luci-modulecache\n"""
+        """rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* /var/luci-indexcache* 2>/dev/null || true\n"""
         """/etc/init.d/rpcd restart 2>/dev/null || true\n"""
         """/etc/init.d/uhttpd restart 2>/dev/null || true\necho "安装完成！"\n"""
     ).encode("utf-8")
