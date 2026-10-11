@@ -172,10 +172,27 @@ EOF
             git config pull.rebase true 2>/dev/null || true
             git config rebase.autoStash true 2>/dev/null || true
             git rebase --abort 2>/dev/null || true
+            git merge --abort 2>/dev/null || true
+
+            # 检测并自动修复残留冲突或未合并状态
+            if git status --porcelain 2>/dev/null | grep -q '^[UADRM ][UADRM ]'; then
+                echo "[!] 检测到工作区存在未合并冲突文件，正在自动重置恢复纯净环境..." >> "$LOG_FILE"
+                git reset --hard HEAD 2>/dev/null || true
+            fi
+
             echo "[*] 同步远程最新代码 (git pull --rebase --autostash origin ${GITHUB_BRANCH})..." >> "$LOG_FILE"
             if ! run_git_masked pull --rebase --autostash origin "$GITHUB_BRANCH"; then
-                echo "[!] 变基拉取遇到冲突或异常，自动清理未决状态..." >> "$LOG_FILE"
+                echo "[!] 变基拉取遇到冲突或异常，自动清理并强制同步核心代码..." >> "$LOG_FILE"
                 git rebase --abort 2>/dev/null || true
+                git merge --abort 2>/dev/null || true
+                run_git_masked fetch origin "$GITHUB_BRANCH" 2>/dev/null || true
+                git checkout "origin/${GITHUB_BRANCH}" -- scripts/ 2>/dev/null || true
+            fi
+
+            # 最终安全屏障：杜绝任何包含冲突标记的代码文件
+            if grep -q "^<<<<<<< " "scripts/filter_us_nodes.py" 2>/dev/null; then
+                echo "[!] 发现 scripts/filter_us_nodes.py 存在冲突标记，重置为远程纯净代码..." >> "$LOG_FILE"
+                git checkout "origin/${GITHUB_BRANCH}" -- "scripts/filter_us_nodes.py" 2>/dev/null || git reset --hard "origin/${GITHUB_BRANCH}" 2>/dev/null || true
             fi
         fi
         
