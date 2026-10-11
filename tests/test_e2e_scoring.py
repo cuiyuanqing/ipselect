@@ -40,7 +40,7 @@ class TestE2EScoring(unittest.TestCase):
             speed_mb_s=1.80,
             colo="LAX"
         )
-        self.assertEqual(line, "104.16.222.118:8443#US-DaTree-8.8-01-家庭 1.80MB/s")
+        self.assertEqual(line, "104.16.222.118:8443#US-家庭-01-1.80MB/s")
 
     def test_probe_e2e_download_speed_mock(self):
         speed = probe_e2e_download_speed(mock_speed=1.75)

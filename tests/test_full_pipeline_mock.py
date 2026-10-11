@@ -35,7 +35,7 @@ class TestFullPipelineMock(unittest.TestCase):
         with open(out_file, "r", encoding="utf-8") as f:
             lines = [line.strip() for line in f if line.strip()]
         self.assertGreaterEqual(len(lines), 1)
-        self.assertIn("#US-DaTree-", lines[0])
+        self.assertIn("#US-测试-", lines[0])
         self.assertIn("-测试", lines[0])
 
 

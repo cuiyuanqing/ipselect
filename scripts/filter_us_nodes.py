@@ -12,6 +12,7 @@
 """
 
 import csv
+import re
 import urllib.request
 import urllib.parse
 import socket
@@ -32,6 +33,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 SNI_HOST = "proxy.19940407.xyz"
 TOP_COUNT = 15
 PROBE_TIMEOUT = 2.5
+# 阶段2 → 沙箱入围上限（放大入围数，让更多候选进入全链路实测，稳出 Top 15）
+STAGE2_ENTRY_LIMIT = int(os.environ.get("STAGE2_ENTRY_LIMIT", "75"))
+# 阶段4 真实微吞吐测速入围上限
+STAGE4_SPEED_LIMIT = int(os.environ.get("STAGE4_SPEED_LIMIT", "30"))
+# 随机采样 Cloudflare Anycast 候选数（edgetunnel 在线优选同机制，用于扩充到数千候选）
+RANDOM_CF_COUNT = int(os.environ.get("RANDOM_CF_COUNT", "1500"))
 ROUNDS_PER_NODE = 6
 THREAD_WORKERS = 25
 
@@ -62,6 +69,20 @@ CSV_SOURCES = [
 TXT_SOURCES = [
     "https://raw.githubusercontent.com/mocl1220/ip/main/ip.txt",
     "https://raw.githubusercontent.com/ymyuuu/IPDB/main/BestCF/bestcfv4.txt",
+    "https://raw.githubusercontent.com/ymyuuu/IPDB/main/BestEDG/ipv4.csv",
+    "https://ipdb.api.030101.xyz/?type=bestcf&country=true",
+    "https://addressesapi.090227.xyz/CloudFlareYes",
+    "https://api.uouin.com/cloudflare.html",
+    "https://ip.164746.xyz",
+    "https://www.wetest.vip/page/cloudflare/address_v4.html",
+]
+
+# edgetunnel 在线优选同源：Cloudflare 运营商优化网段（官方 + 电信/联通/移动）
+CF_CIDR_URLS = [
+    "https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR.txt",
+    "https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR/ct.txt",
+    "https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR/cu.txt",
+    "https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR/cmcc.txt",
 ]
 
 US_WEST_DCS = {'SJC', 'LAX', 'SFO', 'SEA', 'PDX', 'SLC', 'PHX', 'LAS'}
@@ -602,9 +623,9 @@ def calculate_e2e_score(e2e_rtt: float, jitter: float, speed_mb_s: float, colo: 
 def format_node_line(ip: str, port: int, score: float, rank: int, tag: str, speed_mb_s: float, colo: str = "") -> str:
     """
     格式化为标准 OpenClash 订阅优选节点配置行：
-    <ip>:<port>#US-DaTree-<score>-<rank>-<tag> <speed>MB/s
+    <ip>:<port>#US-<tag>-<rank>-<speed>MB/s
     """
-    return f"{ip}:{port}#US-DaTree-{score:.1f}-{rank:02d}-{tag} {speed_mb_s:.2f}MB/s"
+    return f"{ip}:{port}#US-{tag}-{rank:02d}-{speed_mb_s:.2f}MB/s"
 
 
 def infer_environment_from_ips(ip_list):
@@ -686,6 +707,25 @@ def download_url_lines(url, timeout=12):
     return []
 
 
+def generate_random_cf_candidates(count, cidrs):
+    """
+    edgetunnel 在线优选同机制：从 Cloudflare Anycast 网段随机撒点生成候选 (IP, 端口, 速度)。
+    每个随机 IP 附带 443 与 8443 两个常用边缘端口，交由后续阶段实测过滤。
+    """
+    out = []
+    if not cidrs or count <= 0:
+        return out
+    for _ in range(count):
+        net = random.choice(cidrs)
+        # 避开网络号/广播地址
+        host_count = max(1, net.num_addresses - 2)
+        ip_int = net.network_address + random.randrange(host_count)
+        ip_str = str(ip_int)
+        out.append((ip_str, 443, 0.0))
+        out.append((ip_str, 8443, 0.0))
+    return out
+
+
 def fetch_candidates():
     """从多个渠道获取候选节点列表"""
     candidates = []
@@ -723,7 +763,8 @@ def fetch_candidates():
         except Exception as e:
             print(f"[-] CSV 解析异常 ({url}): {e}")
 
-    # 2. 解析 TXT 数据源 (例如 mocl1220/ip, BestCF)
+    # 2. 解析 TXT/聚合数据源 (mocl1220/ip、BestCF、BestEDG、优选聚合 API、HTML 页面等异构格式统一 IPv4 提取)
+    ip_port_re = re.compile(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d{1,5}))?')
     for url in TXT_SOURCES:
         print(f"[*] 正在拉取 TXT 数据源: {url}")
         try:
@@ -732,29 +773,50 @@ def fetch_candidates():
                 print(f"[-] TXT 获取失败 (已尝试多重镜像源): {url}")
                 continue
             for line in lines:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                # 方案 A 全网极速优选模式：提取 IP/端口，不局限于 #US 标识
-                if '#' in line:
-                    addr, tag = line.split('#', 1)
-                    addr = addr.strip()
-                else:
-                    addr = line.strip()
-
-                if ':' in addr:
-                    parts = addr.split(':')
-                    try:
-                        candidates.append((parts[0].strip(), int(parts[1].strip()), 0.0))
-                    except ValueError:
-                        continue
-                else:
-                    candidates.append((addr, 443, 0.0))
-                    candidates.append((addr, 8443, 0.0))
+                # 统一从任意行提取 IPv4（及可选端口），兼容 ip:port#备注、裸 IP、CSV、HTML 页面
+                for m in ip_port_re.finditer(line):
+                    ip = m.group(1)
+                    port_s = m.group(2)
+                    if port_s:
+                        try:
+                            candidates.append((ip, int(port_s), 0.0))
+                        except ValueError:
+                            continue
+                    else:
+                        candidates.append((ip, 443, 0.0))
+                        candidates.append((ip, 8443, 0.0))
         except Exception as e:
             print(f"[-] TXT 解析异常 ({url}): {e}")
 
-    # 3. 补充备用高可用 Anycast IP 池
+    # 3. edgetunnel 在线优选同机制：从 Cloudflare Anycast 网段随机撒点，把候选池扩充到数千
+    if RANDOM_CF_COUNT > 0:
+        print(f"[*] 随机采样 Cloudflare Anycast IP 池 (目标 {RANDOM_CF_COUNT} 个，端口 443/8443)...")
+        cf_cidrs = list(CLOUDFLARE_CIDRS)
+        for cidr_url in CF_CIDR_URLS:
+            try:
+                cidr_lines = download_url_lines(cidr_url, timeout=10)
+                for cl in cidr_lines:
+                    cl = cl.strip()
+                    if not cl or cl.startswith('#'):
+                        continue
+                    try:
+                        net = ipaddress.ip_network(cl, strict=False)
+                        if net.version == 4:
+                            cf_cidrs.append(net)
+                    except ValueError:
+                        continue
+            except Exception:
+                continue
+        seen_cidr = set()
+        uniq_cidrs = []
+        for net in cf_cidrs:
+            key = str(net)
+            if key not in seen_cidr:
+                seen_cidr.add(key)
+                uniq_cidrs.append(net)
+        candidates.extend(generate_random_cf_candidates(RANDOM_CF_COUNT, uniq_cidrs))
+
+    # 4. 补充备用高可用 Anycast IP 池
     for ip in BACKUP_CF_IPS:
         candidates.append((ip, 443, 0.0))
         candidates.append((ip, 8443, 0.0))
@@ -1192,23 +1254,30 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     apac_candidates.sort(key=lambda x: (x[4] if x[4] else 999.0))
     other_candidates.sort(key=lambda x: (x[4] if x[4] else 999.0))
 
-    chosen = []
-    chosen.extend(us_candidates[:12])
-    chosen.extend(apac_candidates[:10])
-    chosen.extend(other_candidates[:3])
+    # 放大入围上限：美西 50% / 亚太 33% / 其他 17% 分层 + 按 RTT 补齐
+    limit = STAGE2_ENTRY_LIMIT
+    us_budget = int(limit * 0.5)
+    apac_budget = int(limit * 0.33)
+    other_budget = limit - us_budget - apac_budget
 
-    if len(chosen) < 25:
+    chosen = []
+    chosen.extend(us_candidates[:us_budget])
+    chosen.extend(apac_candidates[:apac_budget])
+    chosen.extend(other_candidates[:other_budget])
+
+    if len(chosen) < limit:
         stage2_survivors.sort(key=lambda x: (x[4] if x[4] else 999.0))
         for c in stage2_survivors:
             if c not in chosen:
                 chosen.append(c)
-            if len(chosen) >= 25:
+            if len(chosen) >= limit:
                 break
 
-    top25_candidates = chosen
+    topN_candidates = chosen
+    print(f"[+] [阶段 2/5] 分层入围结果: 美西 {len(us_candidates)} / 亚太 {len(apac_candidates)} / 其他 {len(other_candidates)}，进入沙箱 {len(topN_candidates)} 个")
 
     # ================= 阶段 3：沙箱全链路真机实测 (Google + YouTube + ip.sb) =================
-    print(f"\n[+] [阶段 3/5] 启动沙箱全链路真实代理实测 (入围节点数: {len(top25_candidates)}, 穿透 edgetunnel 测 Google/YouTube/ip.sb)...")
+    print(f"\n[+] [阶段 3/5] 启动沙箱全链路真实代理实测 (入围节点数: {len(topN_candidates)}, 穿透 edgetunnel 测 Google/YouTube/ip.sb)...")
     sandbox = None
     e2e_results = []
     use_sandbox = bool(sandbox_enable) and (mock_mode or (find_clash_core() is not None))
@@ -1217,7 +1286,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     if use_sandbox:
         print(f"[*] 加载 VLESS 代理模板: SNI={vless_tpl['sni']}, UUID={vless_tpl['uuid'][:8]}..., PATH={vless_tpl['path']}, 目标国家={target_country}")
         sandbox = MihomoSandbox(
-            candidates=top25_candidates,
+            candidates=topN_candidates,
             vless_template=vless_tpl,
             work_dir="/tmp/ipselect_sandbox" if not mock_mode else tempfile.mkdtemp(prefix="mock_sb_"),
             api_port=19098,
@@ -1250,7 +1319,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                     return eval_res
 
                 with ThreadPoolExecutor(max_workers=10) as executor:
-                    future_map = {executor.submit(probe_single, idx, item): item for idx, item in enumerate(top25_candidates, 1)}
+                    future_map = {executor.submit(probe_single, idx, item): item for idx, item in enumerate(topN_candidates, 1)}
                     for future in as_completed(future_map):
                         res = future.result()
                         if res:
@@ -1269,7 +1338,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     if not e2e_results:
         print("[!] 启动直连稳定性深测回退兜底模式...")
         with ThreadPoolExecutor(max_workers=10) as executor:
-            future_map = {executor.submit(probe_stability, c[0], c[1]): c for c in top25_candidates}
+            future_map = {executor.submit(probe_stability, c[0], c[1]): c for c in topN_candidates}
             for future in as_completed(future_map):
                 res = future.result()
                 if res:
@@ -1284,14 +1353,14 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                         'exit_ip': 'Anycast'
                     })
 
-    print(f"[+] [阶段 3/5] 全链路真实可用性检测完毕，通过严格质检节点数: {len(e2e_results)} / {len(top25_candidates)}")
+    print(f"[+] [阶段 3/5] 全链路真实可用性检测完毕，通过严格质检节点数: {len(e2e_results)} / {len(topN_candidates)}")
     if not e2e_results:
         print("[-] 错误: 无任何节点通过全链路真实代理考核。")
         return
 
-    # 按全链路 RTT 排序，取前 18 名进行真实微吞吐测速
+    # 按全链路 RTT 排序，取前 N 名进行真实微吞吐测速（放大入围数，确保测速后仍足量凑满 Top 15）
     e2e_results.sort(key=lambda x: (x['e2e_avg_rtt'], x['e2e_jitter']))
-    candidates_for_speed = e2e_results[:18]
+    candidates_for_speed = e2e_results[:STAGE4_SPEED_LIMIT]
 
     # ================= 阶段 4：真实微吞吐测速 =================
     print(f"\n[+] [阶段 4/5] 启动 1.0MB 安全微吞吐测速 (入围节点数: {len(candidates_for_speed)})...")
@@ -1327,7 +1396,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         cf_flag = "CF官方" if node.get('is_cf', True) else "第三方"
         print(f"  [{idx:02d}] {line} | 评分: {node['score']:.1f} | 机房: {colo_str} | 端到端RTT: {node['e2e_avg_rtt']:.0f}ms | 抖动: {node['e2e_jitter']:.0f}ms ({cf_flag})")
 
-        remark_str = line.split('#', 1)[1] if '#' in line else f"US-DaTree-{node['score']:.1f}-{idx:02d}-{tag}"
+        remark_str = line.split('#', 1)[1] if '#' in line else f"US-{tag}-{idx:02d}-{node['speed']:.2f}MB/s"
         detail_nodes.append({
             'index': idx,
             'ip': node['ip'],
