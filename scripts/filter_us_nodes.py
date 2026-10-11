@@ -595,15 +595,19 @@ def calculate_e2e_score(e2e_rtt: float, jitter: float, speed_mb_s: float, colo: 
     else:
         s_jit = max(1.0, 5.0 - (jitter - 60.0) / 30.0)
 
-    # 3. 真实吞吐速度分 (权重 30%)
-    if speed_mb_s >= 2.0:
+    # 3. 真实吞吐速度分 (权重 30%) — 不封顶，25MB/s 满分
+    if speed_mb_s >= 25.0:
         s_spd = 10.0
-    elif speed_mb_s >= 1.2:
-        s_spd = 8.0 + (speed_mb_s - 1.2) / 0.8 * 2.0
-    elif speed_mb_s >= 0.6:
-        s_spd = 5.5 + (speed_mb_s - 0.6) / 0.6 * 2.5
+    elif speed_mb_s >= 10.0:
+        s_spd = 7.5 + (speed_mb_s - 10.0) / 15.0 * 2.5
+    elif speed_mb_s >= 4.0:
+        s_spd = 5.0 + (speed_mb_s - 4.0) / 6.0 * 2.5
+    elif speed_mb_s >= 2.0:
+        s_spd = 3.0 + (speed_mb_s - 2.0) / 2.0 * 2.0
+    elif speed_mb_s >= 0.5:
+        s_spd = 1.0 + (speed_mb_s - 0.5) / 1.5 * 2.0
     else:
-        s_spd = max(1.0, (speed_mb_s / 0.6) * 5.5)
+        s_spd = max(0.5, speed_mb_s * 2.0)
 
     # 4. 核心机房加权 (权重 10%)
     colo_upper = (colo or "").upper()
