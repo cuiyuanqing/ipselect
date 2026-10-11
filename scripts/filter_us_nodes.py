@@ -13,6 +13,7 @@
 
 import csv
 import urllib.request
+import urllib.parse
 import socket
 import ssl
 import time
@@ -307,6 +308,122 @@ class MihomoSandbox:
                 shutil.rmtree(self.work_dir, ignore_errors=True)
             except Exception:
                 pass
+
+
+GOOGLE_204_URL = "http://www.gstatic.com/generate_204"
+YOUTUBE_204_URL = "https://www.youtube.com/generate_204"
+IP_SB_GEOIP_URL = "https://api.ip.sb/geoip"
+
+
+def probe_e2e_delay(proxy_name: str, target_url: str, api_port: int = 19098, timeout_ms: int = 2500, mock_delay: int = None):
+    """
+    通过 Mihomo External Controller REST API 测试指定代理节点的单次真实端到端延迟。
+    返回延迟 (ms)，若超时或失败返回 None。
+    """
+    if mock_delay is not None:
+        return mock_delay if mock_delay > 0 else None
+
+    encoded_url = urllib.parse.quote(target_url, safe='')
+    req_url = f"http://127.0.0.1:{api_port}/proxies/{urllib.parse.quote(proxy_name)}/delay?url={encoded_url}&timeout={timeout_ms}"
+    try:
+        req = urllib.request.Request(req_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=(timeout_ms / 1000.0) + 0.5) as res:
+            if res.status == 200:
+                body = json.loads(res.read().decode('utf-8'))
+                delay = body.get('delay')
+                if delay and int(delay) > 0:
+                    return int(delay)
+    except Exception:
+        pass
+    return None
+
+
+def probe_ip_sb_exit(proxy_port: int = 19998, timeout: float = 3.5, mock_exit: dict = None):
+    """
+    通过本地沙箱的代理端口探测真实出口 IP 与落地国家归属。
+    返回 (is_us, country_code, exit_ip)
+    """
+    if mock_exit is not None:
+        cc = mock_exit.get('country_code', '').upper()
+        ip = mock_exit.get('ip', '')
+        return (cc == 'US'), cc, ip
+
+    proxy_url = f"http://127.0.0.1:{proxy_port}"
+    proxy_handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
+    opener = urllib.request.build_opener(proxy_handler)
+
+    urls = [IP_SB_GEOIP_URL, "http://ip-api.com/json"]
+    for target in urls:
+        try:
+            req = urllib.request.Request(target, headers={'User-Agent': 'Mozilla/5.0'})
+            with opener.open(req, timeout=timeout) as res:
+                if res.status == 200:
+                    data = json.loads(res.read().decode('utf-8'))
+                    country = (data.get('country_code') or data.get('countryCode') or '').upper()
+                    exit_ip = data.get('ip') or data.get('query') or ''
+                    is_us = (country == 'US')
+                    return is_us, country, exit_ip
+        except Exception:
+            continue
+
+    return False, "", ""
+
+
+def evaluate_e2e_candidate(proxy_name: str, ip: str, port: int, colo: str, api_port: int = 19098, proxy_port: int = 19998, mock_data: dict = None):
+    """
+    对单个入围候选节点执行端到端全链路多维评估：
+    1. Google 204 多轮 RTT 与抖动测试 (一票淘汰：丢包率 >= 30%)
+    2. YouTube 204 连通性测试 (一票淘汰：连接失败)
+    3. ip.sb 出口落地国家与纯净度质检 (一票淘汰：非 US 出口)
+    若任意环节触犯红线，返回 None；否则返回评测指标字典。
+    """
+    google_delays = []
+    if mock_data and "google_delays" in mock_data:
+        raw_delays = mock_data["google_delays"]
+        google_delays = [d for d in raw_delays if d is not None and d > 0]
+        total_rounds = len(raw_delays)
+    else:
+        total_rounds = 3
+        for idx in range(total_rounds):
+            if idx > 0:
+                time.sleep(random.uniform(0.03, 0.06))
+            d = probe_e2e_delay(proxy_name, GOOGLE_204_URL, api_port=api_port)
+            if d is not None:
+                google_delays.append(d)
+
+    # 1. Google 连通性一票否决：成功轮次 < 2 (丢包率 >= 30%)
+    if len(google_delays) < (total_rounds - 1):
+        return None
+
+    e2e_avg_rtt = sum(google_delays) / len(google_delays)
+    e2e_jitter = (max(google_delays) - min(google_delays)) if len(google_delays) > 1 else 0.0
+
+    # 2. YouTube 连通性一票否决
+    if mock_data and "youtube_delay" in mock_data:
+        yt_delay = mock_data["youtube_delay"]
+    else:
+        yt_delay = probe_e2e_delay(proxy_name, YOUTUBE_204_URL, api_port=api_port, timeout_ms=3000)
+
+    if yt_delay is None or yt_delay <= 0:
+        return None
+
+    # 3. ip.sb 出口归属一票否决
+    mock_exit = mock_data.get("ip_sb_exit") if mock_data else None
+    is_us, exit_country, exit_ip = probe_ip_sb_exit(proxy_port=proxy_port, mock_exit=mock_exit)
+    if not is_us:
+        return None
+
+    return {
+        'proxy_name': proxy_name,
+        'ip': ip,
+        'port': port,
+        'colo': colo,
+        'e2e_avg_rtt': e2e_avg_rtt,
+        'e2e_jitter': e2e_jitter,
+        'youtube_rtt': yt_delay,
+        'exit_ip': exit_ip,
+        'exit_country': exit_country
+    }
 
 
 def infer_environment_from_ips(ip_list):
