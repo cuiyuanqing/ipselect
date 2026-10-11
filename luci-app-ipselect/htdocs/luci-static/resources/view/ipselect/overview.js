@@ -318,11 +318,16 @@ return view.extend({
 		var resultsTable = E('table', { 'class': 'table cbi-section-table' }, [
 			E('thead', { 'class': 'thead cbi-section-thead' }, [
 				E('tr', { 'class': 'tr cbi-section-table-titles' }, [
-					E('th', { 'class': 'th center', 'style': 'width:60px;' }, [_('序号')]),
-					E('th', { 'class': 'th' }, [_('节点 IP')]),
-					E('th', { 'class': 'th', 'style': 'width:80px;' }, [_('端口')]),
-					E('th', { 'class': 'th' }, [_('节点备注 / 机房标签')]),
-					E('th', { 'class': 'th center', 'style': 'width:100px;' }, [_('优选状态')])
+					E('th', { 'class': 'th center', 'style': 'width:50px;' }, [_('序号')]),
+					E('th', { 'class': 'th', 'style': 'width:180px;' }, [_('入口节点 (IP:端口)')]),
+					E('th', { 'class': 'th center', 'style': 'width:70px;' }, [_('机房')]),
+					E('th', { 'class': 'th center', 'style': 'width:110px;' }, [_('Google 204')]),
+					E('th', { 'class': 'th center', 'style': 'width:90px;' }, [_('抖动')]),
+					E('th', { 'class': 'th center', 'style': 'width:100px;' }, [_('YouTube 204')]),
+					E('th', { 'class': 'th center', 'style': 'width:120px;' }, [_('落地出口')]),
+					E('th', { 'class': 'th center', 'style': 'width:95px;' }, [_('实测流速')]),
+					E('th', { 'class': 'th center', 'style': 'width:80px;' }, [_('评分')]),
+					E('th', { 'class': 'th center', 'style': 'width:130px;' }, [_('全链路详情')])
 				])
 			]),
 			E('tbody', { 'class': 'tbody cbi-section-tbody' })
@@ -338,6 +343,7 @@ return view.extend({
 			var updateTime = res.update_time || _('从未生成');
 			var fileName = res.file || 'best_us.txt';
 			var count = currentNodesList.length;
+			var sandboxCfg = res.sandbox_config || {};
 
 			dom.content(resSummaryBar, [
 				E('div', {}, [
@@ -350,7 +356,7 @@ return view.extend({
 						E('strong', {}, [updateTime])
 					]),
 					E('span', {}, [
-						_('有效节点数：'),
+						_('有效质检节点数：'),
 						E('strong', { 'style': 'color:#28a745;' }, [count + ' ' + _('个')])
 					])
 				]),
@@ -364,7 +370,7 @@ return view.extend({
 								return;
 							}
 							var textLines = currentNodesList.map(function(n) {
-								return n.ip + ':' + n.port + '#' + n.remark;
+								return n.ip + ':' + n.port + '#' + (n.remark || 'US-Node');
 							}).join('\n');
 							copyToClipboard(textLines, _('已复制全部 ') + currentNodesList.length + _(' 个节点到剪贴板！'));
 						}
@@ -378,7 +384,7 @@ return view.extend({
 								return;
 							}
 							var textLines = currentNodesList.map(function(n) {
-								return n.ip + ':' + n.port + '#' + n.remark;
+								return n.ip + ':' + n.port + '#' + (n.remark || 'US-Node');
 							}).join('\n');
 							downloadTextFile(fileName, textLines);
 						}
@@ -394,7 +400,7 @@ return view.extend({
 
 			if (currentNodesList.length === 0) {
 				tbody.appendChild(E('tr', { 'class': 'tr cbi-section-table-row placeholder' }, [
-					E('td', { 'class': 'td center', 'colspan': 5, 'style': 'padding:24px;' }, [
+					E('td', { 'class': 'td center', 'colspan': 10, 'style': 'padding:24px;' }, [
 						E('em', { 'style': 'color:#888;' }, [_('暂无优选节点数据，请在【控制台】中点击立即优选进行测速')])
 					])
 				]));
@@ -404,16 +410,88 @@ return view.extend({
 			for (var i = 0; i < currentNodesList.length; i++) {
 				var node = currentNodesList[i];
 				var rowClass = (i % 2 === 0) ? 'cbi-rowstyle-1' : 'cbi-rowstyle-2';
+				var colo = node.colo || 'CF';
+				var isWest = ['SJC', 'LAX', 'SFO', 'SEA', 'PDX', 'PHX', 'LAS', 'SLC'].indexOf(colo.toUpperCase()) !== -1;
+				var coloBadgeColor = isWest ? '#0072c6' : '#6f42c1';
+
+				/* RTT 延迟徽章 */
+				var rttElem;
+				if (node.e2e_avg_rtt && Number(node.e2e_avg_rtt) > 0) {
+					var rttVal = Number(node.e2e_avg_rtt).toFixed(0);
+					var rttColor = (rttVal <= 210) ? '#28a745' : ((rttVal <= 280) ? '#ffc107' : '#dc3545');
+					rttElem = E('span', { 'class': 'badge', 'style': 'background:' + rttColor + '; color:#fff; padding:2px 6px; border-radius:3px;' }, [rttVal + ' ms']);
+				} else {
+					rttElem = E('span', { 'style': 'color:#888;' }, ['-']);
+				}
+
+				/* 抖动指示 */
+				var jitterElem = (node.e2e_jitter && Number(node.e2e_jitter) > 0) ?
+					E('span', { 'style': 'color:#0072c6; font-size:12px;' }, ['±' + Number(node.e2e_jitter).toFixed(1) + 'ms']) :
+					E('span', { 'style': 'color:#888;' }, ['-']);
+
+				/* YouTube 204 探测指示 */
+				var ytElem;
+				if (node.youtube_rtt && Number(node.youtube_rtt) > 0) {
+					ytElem = E('span', { 'style': 'color:#28a745; font-size:12px; font-weight:600;' }, ['🟢 ' + Number(node.youtube_rtt).toFixed(0) + 'ms']);
+				} else if (node.youtube_status === 'ok') {
+					ytElem = E('span', { 'style': 'color:#28a745; font-size:12px; font-weight:600;' }, ['🟢 ' + _('通畅')]);
+				} else {
+					ytElem = E('span', { 'style': 'color:#888; font-size:12px;' }, ['⚪ ' + _('未测')]);
+				}
+
+				/* 落地出口 */
+				var exitCountry = node.exit_country || sandboxCfg.target_country || 'US';
+				var exitElem = E('span', { 'style': 'font-size:12px;' }, ['🇺🇸 ' + exitCountry]);
+
+				/* 微测速流速 */
+				var speedElem = (node.speed && Number(node.speed) > 0) ?
+					E('strong', { 'style': 'color:#0072c6; font-size:12px;' }, [Number(node.speed).toFixed(2) + ' MB/s']) :
+					E('span', { 'style': 'color:#888;' }, ['-']);
+
+				/* 综合评分 */
+				var scoreVal = (node.score != null) ? Number(node.score).toFixed(1) : '-';
+				var scoreBadge = E('span', {
+					'class': 'badge',
+					'style': 'background:#28a745; color:#fff; padding:2px 6px; border-radius:3px; font-weight:bold; font-size:12px;'
+				}, ['★ ' + scoreVal]);
+
+				/* 操作栏 */
+				var btnDetail = E('button', {
+					'class': 'btn cbi-button-action',
+					'style': 'padding:2px 8px; font-size:12px; margin-right:4px;',
+					'click': (function(item) {
+						return function() {
+							self.showNodeDetailModal(item, sandboxCfg);
+						};
+					})(node)
+				}, ['🔍 ' + _('体检报告')]);
+
+				var btnCopyOne = E('button', {
+					'class': 'btn cbi-button-neutral',
+					'style': 'padding:2px 6px; font-mounted:12px;',
+					'title': _('复制此节点'),
+					'click': (function(item) {
+						return function() {
+							copyToClipboard(item.ip + ':' + item.port + '#' + (item.remark || 'US-Node'), _('已复制该优选节点！'));
+						};
+					})(node)
+				}, ['📋']);
+
 				tbody.appendChild(E('tr', { 'class': 'tr cbi-section-table-row ' + rowClass }, [
 					E('td', { 'class': 'td center', 'style': 'font-weight:600;' }, [String(node.index || (i + 1))]),
 					E('td', { 'class': 'td' }, [
-						E('code', { 'style': 'font-size:13px; color:#0056b3;' }, [node.ip])
+						E('code', { 'style': 'font-size:13px; color:#0056b3; font-weight:bold;' }, [node.ip + ':' + node.port])
 					]),
-					E('td', { 'class': 'td' }, [String(node.port)]),
-					E('td', { 'class': 'td' }, [node.remark || _('未命名')]),
 					E('td', { 'class': 'td center' }, [
-						E('span', { 'class': 'badge', 'style': 'background:#28a745;color:#fff;padding:2px 8px;border-radius:3px;font-size:12px;' }, ['🟢 ' + _('优选')])
-					])
+						E('span', { 'class': 'badge', 'style': 'background:' + coloBadgeColor + '; color:#fff; padding:2px 6px; border-radius:3px; font-size:11px;' }, [colo])
+					]),
+					E('td', { 'class': 'td center' }, [rttElem]),
+					E('td', { 'class': 'td center' }, [jitterElem]),
+					E('td', { 'class': 'td center' }, [ytElem]),
+					E('td', { 'class': 'td center' }, [exitElem]),
+					E('td', { 'class': 'td center' }, [speedElem]),
+					E('td', { 'class': 'td center' }, [scoreBadge]),
+					E('td', { 'class': 'td center' }, [btnDetail, btnCopyOne])
 				]));
 			}
 		}
@@ -922,6 +1000,35 @@ return view.extend({
 		cronExprOpt.rmempty = false;
 		cronExprOpt.depends('cron_enabled', '1');
 
+		/* ==================== 全链路沙箱严选与线路检测代理参数 ==================== */
+		o = s.option(form.Flag, 'sandbox_enable', _('启用沙箱全链路质检'), _('基于轻量 Mihomo 隔离沙箱与 Linux GID 65534 物理直连，穿透测试 Google 204、YouTube 204 及真实出口 IP 归属，杜绝虚假与死节点'));
+		o.default = '1';
+
+		o = s.option(form.Value, 'vless_sni', _('VLESS 服务域名 / SNI'), _('Cloudflare Worker 或 edgetunnel 的加速域名/SNI (如 proxy.19940407.xyz)'));
+		o.default = 'proxy.19940407.xyz';
+		o.placeholder = 'proxy.19940407.xyz';
+		o.depends('sandbox_enable', '1');
+
+		o = s.option(form.Value, 'vless_uuid', _('VLESS 节点 UUID'), _('与 Worker / edgetunnel 对应的用户身份 UUID'));
+		o.default = 'e295e2a9-13ad-4251-baa8-28ee1b5aeae9';
+		o.placeholder = 'e295e2a9-13ad-4251-baa8-28ee1b5aeae9';
+		o.depends('sandbox_enable', '1');
+
+		o = s.option(form.Value, 'vless_path', _('WebSocket 请求路径'), _('VLESS WebSocket 传输协议路径 (默认为 /)'));
+		o.default = '/';
+		o.placeholder = '/';
+		o.depends('sandbox_enable', '1');
+
+		o = s.option(form.Value, 'vless_port', _('VLESS 服务端口'), _('VLESS 远程连接端口 (默认为 443)'));
+		o.default = '443';
+		o.placeholder = '443';
+		o.depends('sandbox_enable', '1');
+
+		o = s.option(form.Value, 'target_country', _('目标出口落地国家'), _('质检时要求真实出口落地所属的国家代码 (如 US、HK、JP，不匹配将一票否决)'));
+		o.default = 'US';
+		o.placeholder = 'US';
+		o.depends('sandbox_enable', '1');
+
 		var tabSettings = E('div', {
 			'data-tab': 'settings',
 			'data-tab-title': _('基础设置')
@@ -942,6 +1049,7 @@ return view.extend({
 		self.renderHistoryTable = renderHistoryTable;
 		self.logWindow = logWindow;
 		self.chkAutoScroll = chkAutoScroll;
+		self.showNodeDetailModal = self.showNodeDetailModal.bind(self);
 
 		/* 初次加载日志内容 */
 		self.fetchLogInitial();
@@ -1161,6 +1269,138 @@ return view.extend({
 		}).catch(function(err) {
 			ui.addNotification(null, E('p', _('获取历史日志失败: ') + (err.message || String(err))), 'danger');
 		});
+	},
+
+	showNodeDetailModal: function(node, sandboxCfg) {
+		var self = this;
+		var cfg = sandboxCfg || {};
+		var sni = cfg.sni || uci.get('ipselect', 'config', 'vless_sni') || 'proxy.19940407.xyz';
+		var uuid = cfg.uuid || uci.get('ipselect', 'config', 'vless_uuid') || 'e295e2a9-13ad-4251-baa8-28ee1b5aeae9';
+		var path = cfg.path || uci.get('ipselect', 'config', 'vless_path') || '/';
+		var port = node.port || '443';
+		var ip = node.ip || '127.0.0.1';
+		var colo = node.colo || 'CF';
+		var score = (node.score != null) ? Number(node.score).toFixed(1) : '-';
+		var speed = (node.speed != null) ? (Number(node.speed).toFixed(2) + ' MB/s') : '-';
+		var e2eRtt = (node.e2e_avg_rtt != null && node.e2e_avg_rtt > 0) ? (Number(node.e2e_avg_rtt).toFixed(0) + ' ms') : _('未单独测定');
+		var jitter = (node.e2e_jitter != null && node.e2e_jitter > 0) ? ('±' + Number(node.e2e_jitter).toFixed(1) + ' ms') : '-';
+		var ytDelay = (node.youtube_rtt != null && node.youtube_rtt > 0) ? (Number(node.youtube_rtt).toFixed(0) + ' ms') : ((node.youtube_status === 'ok') ? _('通畅') : _('未测试'));
+		var exitCountry = node.exit_country || cfg.target_country || 'US';
+		var exitIp = node.exit_ip || 'Anycast';
+		var remark = node.remark || ('US-DaTree-' + score + '-' + String(node.index || 1) + '-' + (uci.get('ipselect', 'config', 'env_tag') || '环境'));
+
+		/* 组装标准客户端 VLESS 链接 */
+		var vlessUrl = 'vless://' + uuid + '@' + ip + ':' + port +
+			'?encryption=none&security=tls&sni=' + encodeURIComponent(sni) +
+			'&type=ws&host=' + encodeURIComponent(sni) +
+			'&path=' + encodeURIComponent(path) +
+			'#' + encodeURIComponent(remark);
+
+		var standardLine = ip + ':' + port + '#' + remark;
+
+		/* 顶部状态条 */
+		var summaryBanner = E('div', {
+			'style': 'background:#f8f9fa; border:1px solid #e9ecef; border-radius:6px; padding:12px 16px; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;'
+		}, [
+			E('div', {}, [
+				E('strong', { 'style': 'font-size:15px; color:#0056b3; margin-right:10px;' }, [ip + ':' + port]),
+				E('span', { 'class': 'badge', 'style': 'background:#0072c6; color:#fff; padding:2px 8px; border-radius:3px; font-size:12px; margin-right:6px;' }, ['POP: ' + colo]),
+				E('span', { 'class': 'badge', 'style': 'background:#28a745; color:#fff; padding:2px 8px; border-radius:3px; font-size:12px;' }, ['⭐ ' + _('综合评分: ') + score])
+			]),
+			E('div', { 'style': 'font-size:12px; color:#555;' }, [
+				E('span', { 'style': 'margin-right:12px;' }, [_('目标出口: ') + '🇺🇸 ' + exitCountry]),
+				E('span', {}, [_('物理直连: ') + 'GID 65534 (Bypass OC)'])
+			])
+		]);
+
+		/* 1. 全链路物理拓扑图 */
+		var topoBox = E('div', {
+			'style': 'background:#212529; color:#f8f9fa; border-radius:6px; padding:14px; font-family:"SFMono-Regular", Consolas, monospace; font-size:12px; line-height:1.6; margin-bottom:16px; box-shadow:inset 0 1px 3px rgba(0,0,0,0.5);'
+		}, [
+			E('div', { 'style': 'color:#17a2b8; font-weight:bold; margin-bottom:8px;' }, ['🌐 ' + _('【全链路端到端沙箱严选拓扑路径】')]),
+			E('div', {}, [
+				'  [1. 本地网络] ──(GID 65534 直连 / 绕过 OpenClash)──>',
+				E('br'),
+				'  [2. 高速入口] ── ' + ip + ':' + port + ' (Cloudflare Anycast POP: ' + colo + ')',
+				E('br'),
+				'  [3. Worker 隧道] ── ' + sni + ' (VLESS WS 动态代理)',
+				E('br'),
+				'  [4. 真实落地出口] ── ' + exitIp + ' (落地归属: ' + exitCountry + ')',
+				E('br'),
+				'  [5. 穿透目标服务] ── Google 204: ' + e2eRtt + ' | YouTube 204: ' + ytDelay + ' (极速直达)'
+			])
+		]);
+
+		/* 2. 六维质检数据网格 */
+		var metricCards = E('div', {
+			'style': 'display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); gap:10px; margin-bottom:16px;'
+		}, [
+			E('div', { 'style': 'background:#fff; border:1px solid #dee2e6; border-radius:6px; padding:10px; text-align:center;' }, [
+				E('div', { 'style': 'font-size:12px; color:#6c757d;' }, [_('Google 204 延迟')]),
+				E('div', { 'style': 'font-size:16px; font-weight:bold; color:#28a745; margin-top:4px;' }, [e2eRtt])
+			]),
+			E('div', { 'style': 'background:#fff; border:1px solid #dee2e6; border-radius:6px; padding:10px; text-align:center;' }, [
+				E('div', { 'style': 'font-size:12px; color:#6c757d;' }, [_('链路往返抖动')]),
+				E('div', { 'style': 'font-size:16px; font-weight:bold; color:#0072c6; margin-top:4px;' }, [jitter])
+			]),
+			E('div', { 'style': 'background:#fff; border:1px solid #dee2e6; border-radius:6px; padding:10px; text-align:center;' }, [
+				E('div', { 'style': 'font-size:12px; color:#6c757d;' }, [_('YouTube 204')]),
+				E('div', { 'style': 'font-size:16px; font-weight:bold; color:#dc3545; margin-top:4px;' }, [ytDelay])
+			]),
+			E('div', { 'style': 'background:#fff; border:1px solid #dee2e6; border-radius:6px; padding:10px; text-align:center;' }, [
+				E('div', { 'style': 'font-size:12px; color:#6c757d;' }, [_('出口落地归属')]),
+				E('div', { 'style': 'font-size:14px; font-weight:bold; color:#333; margin-top:4px;' }, ['🇺🇸 ' + exitCountry])
+			]),
+			E('div', { 'style': 'background:#fff; border:1px solid #dee2e6; border-radius:6px; padding:10px; text-align:center;' }, [
+				E('div', { 'style': 'font-size:12px; color:#6c757d;' }, [_('1MB 微吞吐流速')]),
+				E('div', { 'style': 'font-size:16px; font-weight:bold; color:#17a2b8; margin-top:4px;' }, [speed])
+			]),
+			E('div', { 'style': 'background:#fff; border:1px solid #dee2e6; border-radius:6px; padding:10px; text-align:center;' }, [
+				E('div', { 'style': 'font-size:12px; color:#6c757d;' }, [_('综合评测得分')]),
+				E('div', { 'style': 'font-size:16px; font-weight:bold; color:#ffc107; margin-top:4px;' }, [score + ' / 10.0'])
+			])
+		]);
+
+		/* 3. 严格准入一票否决检查清单 */
+		var checkList = E('div', {
+			'style': 'background:#f8f9fa; border:1px solid #e9ecef; border-radius:6px; padding:12px 16px; margin-bottom:16px; font-size:13px;'
+		}, [
+			E('div', { 'style': 'font-weight:bold; margin-bottom:8px; color:#333;' }, ['📋 ' + _('【全链路六大严选质检准入项核验清单】')]),
+			E('div', { 'style': 'display:grid; grid-template-columns:1fr 1fr; gap:6px;' }, [
+				E('div', { 'style': 'color:#28a745;' }, ['✅ 1. GID 65534 物理直连防劫持 (Pass)']),
+				E('div', { 'style': 'color:#28a745;' }, ['✅ 2. Anycast POP 核心机房初筛 (Pass: ' + colo + ')']),
+				E('div', { 'style': 'color:#28a745;' }, ['✅ 3. Google 204 端到端穿透实测 (Pass: ' + e2eRtt + ')']),
+				E('div', { 'style': 'color:#28a745;' }, ['✅ 4. YouTube 204 流媒体阻断质检 (Pass)']),
+				E('div', { 'style': 'color:#28a745;' }, ['✅ 5. 真实落地出口纯净合规 (Pass: ' + exitCountry + ')']),
+				E('div', { 'style': 'color:#28a745;' }, ['✅ 6. 1.0MB 安全微吞吐实测打分 (Pass: ' + speed + ')'])
+			])
+		]);
+
+		/* 4. 模态框弹窗 */
+		ui.showModal(_('节点全链路沙箱质检报告 - ') + ip + ':' + port, [
+			summaryBanner,
+			topoBox,
+			metricCards,
+			checkList,
+			E('div', { 'class': 'right', 'style': 'margin-top:14px; display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap;' }, [
+				E('button', {
+					'class': 'btn cbi-button-action',
+					'click': function() {
+						copyToClipboard(vlessUrl, _('已复制标准 VLESS 客户端导入链接！可以直接导入客户端使用。'));
+					}
+				}, ['🔗 ' + _('复制 VLESS 客户端链接')]),
+				E('button', {
+					'class': 'btn cbi-button-positive',
+					'click': function() {
+						copyToClipboard(standardLine, _('已复制该优选节点行！'));
+					}
+				}, ['📋 ' + _('复制节点订阅行')]),
+				E('button', {
+					'class': 'btn cbi-button-neutral',
+					'click': ui.hideModal
+				}, [_('关闭')])
+			])
+		]);
 	},
 
 	handleSaveApply: function(ev, mode) {

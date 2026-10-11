@@ -123,6 +123,15 @@ run_task() {
     AUTO_CLONE=$(get_config "auto_clone" "1")
     [ -z "$GITHUB_BRANCH" ] && GITHUB_BRANCH="main"
 
+    SANDBOX_ENABLE=$(get_config "sandbox_enable" "1")
+    VLESS_SNI=$(get_config "vless_sni" "proxy.19940407.xyz")
+    VLESS_UUID=$(get_config "vless_uuid" "e295e2a9-13ad-4251-baa8-28ee1b5aeae9")
+    VLESS_PATH=$(get_config "vless_path" "/")
+    VLESS_PORT=$(get_config "vless_port" "443")
+    TARGET_COUNTRY=$(get_config "target_country" "US")
+
+    export SANDBOX_ENABLE VLESS_SNI VLESS_UUID VLESS_PATH VLESS_PORT TARGET_COUNTRY
+
     # 保存当前任务上下文供 stop 中断时获取
     cat << EOF > "$INFO_FILE"
 TASK_ID='$TASK_ID'
@@ -170,8 +179,8 @@ EOF
             fi
         fi
         
-        echo "[*] 开始执行节点筛选测速: --tag ${ENV_TAG} --output ${OUTPUT_FILE} --interface ${INTERFACE}..." >> "$LOG_FILE"
-        if python3 scripts/filter_us_nodes.py --tag "$ENV_TAG" --output "$OUTPUT_FILE" --interface "$INTERFACE" >> "$LOG_FILE" 2>&1; then
+        echo "[*] 开始执行节点筛选测速: --tag ${ENV_TAG} --output ${OUTPUT_FILE} --interface ${INTERFACE} --sni ${VLESS_SNI} --target-country ${TARGET_COUNTRY} --sandbox ${SANDBOX_ENABLE}..." >> "$LOG_FILE"
+        if python3 scripts/filter_us_nodes.py --tag "$ENV_TAG" --output "$OUTPUT_FILE" --interface "$INTERFACE" --sni "$VLESS_SNI" --uuid "$VLESS_UUID" --path "$VLESS_PATH" --port "$VLESS_PORT" --target-country "$TARGET_COUNTRY" --sandbox "$SANDBOX_ENABLE" >> "$LOG_FILE" 2>&1; then
             echo "[+] 节点筛选测速完成！" >> "$LOG_FILE"
             if [ -f "$OUTPUT_FILE" ]; then
                 NODE_COUNT=$(grep -v '^#' "$OUTPUT_FILE" 2>/dev/null | grep -c ':' 2>/dev/null || true)
@@ -195,6 +204,8 @@ EOF
                 git config user.email "ipselect@local" || true
             fi
             git add "$OUTPUT_FILE"
+            DETAIL_FILE="${OUTPUT_FILE%.txt}_detail.json"
+            [ -f "$DETAIL_FILE" ] && git add "$DETAIL_FILE"
             if ! git diff --staged --quiet; then
                 git commit -m "auto: iStoreOS 节点优选更新 [$(date '+%Y-%m-%d %H:%M:%S')]" >> "$LOG_FILE" 2>&1
                 if run_git_masked push origin "$GITHUB_BRANCH"; then
@@ -356,9 +367,12 @@ case "$1" in
         WORKDIR=$(get_config "workdir" "/root/ipselect")
         OUTPUT_FILE=$(get_config "output_file" "best_us.txt")
         TARGET_PATH="${WORKDIR}/${OUTPUT_FILE}"
-        if [ -f "$TARGET_PATH" ]; then
+        DETAIL_PATH="${WORKDIR}/${OUTPUT_FILE%.txt}_detail.json"
+        if [ -f "$DETAIL_PATH" ]; then
+            cat "$DETAIL_PATH"
+        elif [ -f "$TARGET_PATH" ]; then
             python3 -c "
-import json, os, time
+import json, os, time, re
 path = '$TARGET_PATH'
 mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(path)))
 nodes = []
@@ -374,7 +388,35 @@ with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             ip, port = addr.split(':', 1)
         else:
             ip, port = addr, '443'
-        nodes.append({'index': idx, 'ip': ip.strip(), 'port': port.strip(), 'remark': remark})
+        
+        # 兼容性推断：从 remark 智能提取评分与流速
+        score = 5.0
+        score_m = re.search(r'US-DaTree-([0-9.]+)', remark)
+        if score_m:
+            try: score = float(score_m.group(1))
+            except Exception: pass
+        speed = 0.0
+        speed_m = re.search(r'([0-9.]+)\s*MB/s', remark)
+        if speed_m:
+            try: speed = float(speed_m.group(1))
+            except Exception: pass
+
+        nodes.append({
+            'index': idx,
+            'ip': ip.strip(),
+            'port': port.strip(),
+            'colo': 'CF',
+            'score': score,
+            'speed': speed,
+            'e2e_avg_rtt': 0.0,
+            'e2e_jitter': 0.0,
+            'youtube_rtt': 0.0,
+            'youtube_status': 'ok',
+            'exit_country': 'US',
+            'exit_ip': 'Anycast',
+            'is_cf': True,
+            'remark': remark
+        })
         idx += 1
 print(json.dumps({'file': '$OUTPUT_FILE', 'update_time': mtime, 'count': len(nodes), 'nodes': nodes}, ensure_ascii=False))
 "

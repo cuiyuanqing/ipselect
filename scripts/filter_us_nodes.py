@@ -160,14 +160,15 @@ DEFAULT_VLESS_SNI = "proxy.19940407.xyz"
 DEFAULT_VLESS_PATH = "/"
 
 
-def detect_vless_template() -> dict:
-    """自动从环境变量或 OpenClash 配置文件中提取实际运行的 VLESS 模板配置 (uuid, sni, path)"""
-    env_uuid = os.environ.get("VLESS_UUID")
-    env_sni = os.environ.get("VLESS_SNI")
-    env_path = os.environ.get("VLESS_PATH")
+def detect_vless_template(cli_sni=None, cli_uuid=None, cli_path=None, cli_port=None) -> dict:
+    """自动从 CLI 参数、环境变量或 OpenClash 配置文件中提取实际运行的 VLESS 模板配置 (uuid, sni, path, port)"""
+    env_uuid = cli_uuid or os.environ.get("VLESS_UUID")
+    env_sni = cli_sni or os.environ.get("VLESS_SNI")
+    env_path = cli_path or os.environ.get("VLESS_PATH")
+    env_port = cli_port or os.environ.get("VLESS_PORT", "443")
 
     if env_uuid and env_sni and env_path:
-        return {"uuid": env_uuid, "sni": env_sni, "path": env_path}
+        return {"uuid": env_uuid, "sni": env_sni, "path": env_path, "port": env_port}
 
     for provider_file in [
         "/etc/openclash/proxy_provider/datree1.yaml",
@@ -180,11 +181,13 @@ def detect_vless_template() -> dict:
                 uuid_m = re.search(r"uuid:\s*([a-f0-9\-]{36})", content, re.IGNORECASE)
                 sni_m = re.search(r"servername:\s*([^\s,}]+)", content)
                 path_m = re.search(r"path:\s*([^\s,}]+)", content)
+                port_m = re.search(r"port:\s*(\d+)", content)
                 if uuid_m and sni_m:
                     return {
                         "uuid": env_uuid or uuid_m.group(1),
                         "sni": env_sni or sni_m.group(1),
-                        "path": env_path or (path_m.group(1) if path_m else "/")
+                        "path": env_path or (path_m.group(1) if path_m else "/"),
+                        "port": env_port or (port_m.group(1) if port_m else "443")
                     }
             except Exception:
                 pass
@@ -192,7 +195,8 @@ def detect_vless_template() -> dict:
     return {
         "uuid": env_uuid or DEFAULT_VLESS_UUID,
         "sni": env_sni or DEFAULT_VLESS_SNI,
-        "path": env_path or DEFAULT_VLESS_PATH
+        "path": env_path or DEFAULT_VLESS_PATH,
+        "port": env_port or "443"
     }
 
 
@@ -412,43 +416,44 @@ def probe_e2e_delay(proxy_name: str, target_url: str, api_port: int = 19098, tim
     return None
 
 
-def probe_ip_sb_exit(proxy_port: int = 19998, timeout: float = 3.5, mock_exit: dict = None):
+def probe_ip_sb_exit(proxy_port: int = 19998, timeout: float = 3.5, mock_exit: dict = None, target_country: str = "US"):
     """
     通过本地沙箱的代理端口探测真实出口 IP 与落地国家归属。
-    返回 (is_us, country_code, exit_ip)
+    返回 (is_target_country, country_code, exit_ip)
     """
+    target = (target_country or "US").upper()
     if mock_exit is not None:
         cc = mock_exit.get('country_code', '').upper()
         ip = mock_exit.get('ip', '')
-        return (cc == 'US'), cc, ip
+        return (cc == target if target else True), cc, ip
 
     proxy_url = f"http://127.0.0.1:{proxy_port}"
     proxy_handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
     opener = urllib.request.build_opener(proxy_handler)
 
     urls = [IP_SB_GEOIP_URL, "http://ip-api.com/json"]
-    for target in urls:
+    for target_url in urls:
         try:
-            req = urllib.request.Request(target, headers={'User-Agent': 'Mozilla/5.0'})
+            req = urllib.request.Request(target_url, headers={'User-Agent': 'Mozilla/5.0'})
             with opener.open(req, timeout=timeout) as res:
                 if res.status == 200:
                     data = json.loads(res.read().decode('utf-8'))
                     country = (data.get('country_code') or data.get('countryCode') or '').upper()
                     exit_ip = data.get('ip') or data.get('query') or ''
-                    is_us = (country == 'US')
-                    return is_us, country, exit_ip
+                    is_match = (country == target if target else True)
+                    return is_match, country, exit_ip
         except Exception:
             continue
 
     return False, "", ""
 
 
-def evaluate_e2e_candidate(proxy_name: str, ip: str, port: int, colo: str, api_port: int = 19098, proxy_port: int = 19998, mock_data: dict = None):
+def evaluate_e2e_candidate(proxy_name: str, ip: str, port: int, colo: str, api_port: int = 19098, proxy_port: int = 19998, mock_data: dict = None, target_country: str = "US"):
     """
     对单个入围候选节点执行端到端全链路多维评估：
     1. Google 204 多轮 RTT 与抖动测试 (一票淘汰：丢包率 >= 30%)
     2. YouTube 204 连通性测试 (一票淘汰：连接失败)
-    3. ip.sb 出口落地国家与纯净度质检 (一票淘汰：非 US 出口)
+    3. ip.sb 出口落地国家与纯净度质检 (一票淘汰：非 target_country 出口)
     若任意环节触犯红线，返回 None；否则返回评测指标字典。
     """
     google_delays = []
@@ -488,8 +493,8 @@ def evaluate_e2e_candidate(proxy_name: str, ip: str, port: int, colo: str, api_p
     mock_exit = mock_data.get("ip_sb_exit") if mock_data else None
     if not mock_data:
         switch_sandbox_proxy(proxy_name, api_port=api_port)
-    is_us, exit_country, exit_ip = probe_ip_sb_exit(proxy_port=proxy_port, timeout=3.0, mock_exit=mock_exit)
-    if not is_us:
+    is_match_country, exit_country, exit_ip = probe_ip_sb_exit(proxy_port=proxy_port, timeout=3.0, mock_exit=mock_exit, target_country=target_country)
+    if not is_match_country:
         return None
 
     return {
@@ -1108,7 +1113,9 @@ def probe_node_multidimensional(candidate):
     return stab
 
 
-def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=None, mock_mode=False, mock_candidates=None):
+def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=None, mock_mode=False, mock_candidates=None,
+                          vless_sni=None, vless_uuid=None, vless_path=None, vless_port=None,
+                          target_country="US", sandbox_enable=True):
     """
     五阶漏斗端到端严选引擎：
     1. 阶段 1：快速 TCP 并发探针 (快速初筛死节点)
@@ -1204,11 +1211,11 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     print(f"\n[+] [阶段 3/5] 启动沙箱全链路真实代理实测 (入围节点数: {len(top25_candidates)}, 穿透 edgetunnel 测 Google/YouTube/ip.sb)...")
     sandbox = None
     e2e_results = []
-    use_sandbox = mock_mode or (find_clash_core() is not None)
+    use_sandbox = bool(sandbox_enable) and (mock_mode or (find_clash_core() is not None))
+    vless_tpl = detect_vless_template(cli_sni=vless_sni, cli_uuid=vless_uuid, cli_path=vless_path, cli_port=vless_port)
 
     if use_sandbox:
-        vless_tpl = detect_vless_template()
-        print(f"[*] 加载 VLESS 代理模板: SNI={vless_tpl['sni']}, UUID={vless_tpl['uuid'][:8]}..., PATH={vless_tpl['path']}")
+        print(f"[*] 加载 VLESS 代理模板: SNI={vless_tpl['sni']}, UUID={vless_tpl['uuid'][:8]}..., PATH={vless_tpl['path']}, 目标国家={target_country}")
         sandbox = MihomoSandbox(
             candidates=top25_candidates,
             vless_template=vless_tpl,
@@ -1228,7 +1235,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                         m_data = {
                             "google_delays": [190 + idx * 5, 195 + idx * 5, 200 + idx * 5],
                             "youtube_delay": 205 + idx * 5,
-                            "ip_sb_exit": {"country_code": "US", "ip": "104.28.19.1"}
+                            "ip_sb_exit": {"country_code": (target_country or "US").upper(), "ip": "104.28.19.1"}
                         }
                     eval_res = evaluate_e2e_candidate(
                         proxy_name=pname,
@@ -1237,7 +1244,8 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                         colo=colo,
                         api_port=19098,
                         proxy_port=19998,
-                        mock_data=m_data
+                        mock_data=m_data,
+                        target_country=target_country
                     )
                     return eval_res
 
@@ -1252,9 +1260,12 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         else:
             print("[!] 沙箱启动失败，平滑回退至直连稳定性测定")
     else:
-        print("[!] 当前系统未安装 clash_meta 内核，平滑回退至传统直连 TLS 稳定性测定")
+        if not sandbox_enable:
+            print("[*] 沙箱严选配置已停用，使用直连 TLS 稳定性测定模式")
+        else:
+            print("[!] 当前系统未安装 clash_meta 内核，平滑回退至传统直连 TLS 稳定性测定")
 
-    # 若沙箱未能产出结果（无内核或全军覆没），启动直连回退降级
+    # 若沙箱未能产出结果（无内核、未启用或全军覆没），启动直连回退降级
     if not e2e_results:
         print("[!] 启动直连稳定性深测回退兜底模式...")
         with ThreadPoolExecutor(max_workers=10) as executor:
@@ -1269,7 +1280,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                         'e2e_avg_rtt': res['avg_rtt'],
                         'e2e_jitter': res['jitter'],
                         'youtube_rtt': res['median_rtt'],
-                        'exit_country': 'US',
+                        'exit_country': target_country or 'US',
                         'exit_ip': 'Anycast'
                     })
 
@@ -1306,12 +1317,33 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
 
     print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质全链路真优选节点 ({tag}专属 / 全链路Google+YouTube实测+美区出口):")
     output_lines = []
+    detail_nodes = []
+    update_time_str = time.strftime('%Y-%m-%d %H:%M:%S')
+
     for idx, node in enumerate(selected_nodes, 1):
         colo_str = node.get('colo') or 'CF'
         line = format_node_line(node['ip'], node['port'], node['score'], idx, tag, node['speed'], colo_str)
         output_lines.append(line)
         cf_flag = "CF官方" if node.get('is_cf', True) else "第三方"
         print(f"  [{idx:02d}] {line} | 评分: {node['score']:.1f} | 机房: {colo_str} | 端到端RTT: {node['e2e_avg_rtt']:.0f}ms | 抖动: {node['e2e_jitter']:.0f}ms ({cf_flag})")
+
+        remark_str = line.split('#', 1)[1] if '#' in line else f"US-DaTree-{node['score']:.1f}-{idx:02d}-{tag}"
+        detail_nodes.append({
+            'index': idx,
+            'ip': node['ip'],
+            'port': str(node['port']),
+            'colo': colo_str,
+            'score': round(float(node['score']), 1),
+            'speed': round(float(node.get('speed', 0.0)), 2),
+            'e2e_avg_rtt': round(float(node.get('e2e_avg_rtt', 0.0)), 1),
+            'e2e_jitter': round(float(node.get('e2e_jitter', 0.0)), 1),
+            'youtube_rtt': round(float(node.get('youtube_rtt', 0.0)), 1),
+            'youtube_status': 'ok' if (node.get('youtube_rtt') and node.get('youtube_rtt') > 0) else 'fail',
+            'exit_country': node.get('exit_country') or (target_country or 'US'),
+            'exit_ip': node.get('exit_ip') or 'Anycast',
+            'is_cf': bool(node.get('is_cf', True)),
+            'remark': remark_str
+        })
 
     # 确定保存路径
     if os.path.isabs(output_file):
@@ -1325,19 +1357,57 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     with open(target_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(output_lines) + '\n')
 
+    # 生成结构化 JSON 详情文件供 LuCI 界面展示
+    detail_path = os.path.splitext(target_path)[0] + "_detail.json"
+    detail_data = {
+        'file': os.path.basename(target_path),
+        'tag': tag,
+        'update_time': update_time_str,
+        'count': len(detail_nodes),
+        'sandbox_config': {
+            'enabled': bool(sandbox_enable),
+            'sni': vless_tpl.get('sni', DEFAULT_VLESS_SNI),
+            'uuid': vless_tpl.get('uuid', DEFAULT_VLESS_UUID),
+            'path': vless_tpl.get('path', DEFAULT_VLESS_PATH),
+            'port': str(vless_tpl.get('port', '443')),
+            'target_country': target_country or 'US'
+        },
+        'nodes': detail_nodes
+    }
+    with open(detail_path, 'w', encoding='utf-8') as f:
+        json.dump(detail_data, f, ensure_ascii=False, indent=2)
+
     print(f"\n[+] 优选结果已写入: {target_path}")
+    print(f"[+] 优选详情已写入: {detail_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Cloudflare 节点四阶漏斗严选引擎与多维评估器")
+    parser = argparse.ArgumentParser(description="Cloudflare 节点五阶漏斗全链路严选引擎与多维评估器")
     parser.add_argument("--tag", default=os.environ.get("LOCATION_TAG", None), help="节点标识 (如: 公司, 家庭，缺省自动识别)")
     parser.add_argument("--output", default=os.environ.get("OUTPUT_FILE", None), help="输出文件名 (如: best_us.txt, home_us_best_node.txt，缺省自动识别)")
     parser.add_argument("--interface", default=os.environ.get("BIND_INTERFACE", None), help="绑定的出口网卡 (如: br-lan, eth0)")
+    parser.add_argument("--sni", default=os.environ.get("VLESS_SNI", None), help="VLESS SNI 服务域名")
+    parser.add_argument("--uuid", default=os.environ.get("VLESS_UUID", None), help="VLESS UUID")
+    parser.add_argument("--path", default=os.environ.get("VLESS_PATH", None), help="VLESS WebSocket 路径")
+    parser.add_argument("--port", default=os.environ.get("VLESS_PORT", "443"), help="VLESS 端口")
+    parser.add_argument("--target-country", default=os.environ.get("TARGET_COUNTRY", "US"), help="期望落地出口国家 (默认 US)")
+    parser.add_argument("--sandbox", default=os.environ.get("SANDBOX_ENABLE", "1"), help="是否启用沙箱质检 (1 或 0)")
 
     args = parser.parse_args()
     tag, output_file = detect_network_environment(cli_tag=args.tag, cli_output=args.output)
     print(f"[*] 环境自动感知检测结果: 位置=[{tag}], 输出文件=[{output_file}]")
-    run_filter_and_export(tag=tag, output_file=output_file, interface=args.interface)
+    sandbox_flag = str(args.sandbox).strip() not in ('0', 'false', 'False', 'no')
+    run_filter_and_export(
+        tag=tag,
+        output_file=output_file,
+        interface=args.interface,
+        vless_sni=args.sni,
+        vless_uuid=args.uuid,
+        vless_path=args.path,
+        vless_port=args.port,
+        target_country=args.target_country,
+        sandbox_enable=sandbox_flag
+    )
 
 
 if __name__ == '__main__':

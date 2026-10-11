@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 PKG_NAME = "luci-app-ipselect"
-PKG_VERSION = "1.1.0"
+PKG_VERSION = "1.2.0"
 PKG_RELEASE = "1"
 PKG_FULL_VERSION = f"{PKG_VERSION}-{PKG_RELEASE}"
 PKG_ARCH = "all"

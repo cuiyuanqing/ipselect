@@ -399,6 +399,7 @@ const requiredMethods = [
 	'refreshResults',
 	'refreshHistory',
 	'showHistoryLogModal',
+	'showNodeDetailModal',
 	'handleSaveApply'
 ];
 
@@ -441,7 +442,7 @@ console.log('\n[5/5] 执行 load() 与 render() 数据流，验证 4 大选项�
 	assert(tabKeys.includes('settings'), '必须包含基础设置选项卡 data-tab="settings"');
 	console.log('  ✅ 4 大核心选项卡 (console, results, history, settings) 结构完整初始化');
 
-	// 验证 UCI 核心配置项 (包含 GitHub Token 与 可视化 Cron 新增项)
+	// 验证 UCI 核心配置项 (包含 GitHub Token、可视化 Cron 与沙箱全链路代理新增项)
 	const expectedUciOptions = [
 		'enabled',
 		'workdir',
@@ -460,7 +461,13 @@ console.log('\n[5/5] 执行 load() 与 render() 数据流，验证 4 大选项�
 		'openclash_provider',
 		'cron_enabled',
 		'_cron_generator',
-		'cron_expression'
+		'cron_expression',
+		'sandbox_enable',
+		'vless_sni',
+		'vless_uuid',
+		'vless_path',
+		'vless_port',
+		'target_country'
 	];
 
 	expectedUciOptions.forEach(optName => {
@@ -468,11 +475,13 @@ console.log('\n[5/5] 执行 load() 与 render() 数据流，验证 4 大选项�
 		console.log(`  ✅ UCI 表单配置项就绪: ${optName}`);
 	});
 
-	// 验证 auto_push, openclash, cron 联动依赖
+	// 验证 auto_push, openclash, cron, sandbox 联动依赖
 	assert(formOptionsRecorded['github_token'].dependsList.some(d => d.depOpt === 'auto_push' && d.depVal === '1'), 'github_token 必须 depends 于 auto_push=1');
 	assert(formOptionsRecorded['openclash_provider'].dependsList.some(d => d.depOpt === 'openclash_sync' && d.depVal === '1'), 'openclash_provider 必须 depends 于 openclash_sync=1');
 	assert(formOptionsRecorded['cron_expression'].dependsList.some(d => d.depOpt === 'cron_enabled' && d.depVal === '1'), 'cron_expression 必须 depends 于 cron_enabled=1');
-	console.log('  ✅ 表单动态联动依赖条件 (auto_push, openclash_sync, cron_enabled) 配置完备');
+	assert(formOptionsRecorded['vless_sni'].dependsList.some(d => d.depOpt === 'sandbox_enable' && d.depVal === '1'), 'vless_sni 必须 depends 于 sandbox_enable=1');
+	assert(formOptionsRecorded['vless_uuid'].dependsList.some(d => d.depOpt === 'sandbox_enable' && d.depVal === '1'), 'vless_uuid 必须 depends 于 sandbox_enable=1');
+	console.log('  ✅ 表单动态联动依赖条件 (auto_push, openclash_sync, cron_enabled, sandbox_enable) 配置完备');
 
 	// 测试 handleSaveApply 调用与服务重载联动
 	fsCallsRecorded.length = 0;
