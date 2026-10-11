@@ -15,6 +15,7 @@ import csv
 import re
 import urllib.request
 import urllib.parse
+import urllib.error
 import socket
 import ssl
 import time
@@ -968,6 +969,132 @@ def probe_stability(ip, port, rounds=ROUNDS_PER_NODE, probe_func=None, sleep_int
         'is_top_colo': is_top,
         'success_rounds': success_count,
         'total_rounds': rounds
+    }
+
+
+SPEED_TEST_SOURCES_DEFAULT = ("speed.cloudflare.com", "proof.ovh.net")
+
+
+def probe_throughput_speed(
+    ip: str,
+    port: int,
+    duration: float = 5.0,
+    parallel: int = 3,
+    max_retry: int = 1,
+    max_bytes_per_ip: int = 80 * 1024 * 1024,
+    sources: tuple = SPEED_TEST_SOURCES_DEFAULT,
+    proxy_port: int = 19998,
+    mock_speed: float = None,
+    mock_samples: tuple = None,
+    mock_429_after: int = None,
+) -> dict:
+    """
+    阶段 4：过 Mihomo 沙箱代理的真实吞吐测速
+    - duration 秒时间窗内并发 N 个 HTTP GET
+    - 两轮取中位，支持 429 重试 max_retry 次
+    - 单 IP 累计字节超限提早结束
+    - 返回 dict 含 speed, samples, p90, stddev, retries, bytes_downloaded, status
+    """
+    if mock_speed is not None:
+        if mock_samples is not None:
+            samples = list(mock_samples)
+        else:
+            samples = [float(mock_speed)]
+        median_val = sorted(samples)[len(samples) // 2]
+        return {
+            "speed": median_val,
+            "samples": samples,
+            "p90": max(samples),
+            "stddev": 0.0 if len(samples) < 2 else (max(samples) - min(samples)) / 2.0,
+            "retries": 0,
+            "bytes_downloaded": 0,
+            "status": "ok",
+        }
+
+    proxy_url = f"http://127.0.0.1:{proxy_port}"
+    proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    opener = urllib.request.build_opener(proxy_handler)
+
+    def _build_request(url):
+        return urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-"},
+        )
+
+    def _single_round(src_host: str) -> tuple:
+        """跑一个 5 秒时间窗，返回 (bytes, elapsed, hit_429)"""
+        url = f"http://{src_host}/__down?bytes={max_bytes_per_ip}" if src_host == "speed.cloudflare.com" else f"http://{src_host}/files/100Mb.dat"
+        received = 0
+        start_t = time.time()
+        hit_429 = False
+        try:
+            with opener.open(_build_request(url), timeout=duration + 1.0) as res:
+                while True:
+                    elapsed = time.time() - start_t
+                    if elapsed >= duration:
+                        break
+                    if received >= max_bytes_per_ip:
+                        break
+                    try:
+                        chunk = res.read(8192)
+                    except Exception:
+                        break
+                    if not chunk:
+                        break
+                    received += len(chunk)
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 1020):
+                hit_429 = True
+        except Exception:
+            pass
+        elapsed = max(0.05, time.time() - start_t)
+        return received, elapsed, hit_429
+
+    samples = []
+    retries = 0
+    total_bytes = 0
+    status = "ok"
+
+    for round_idx in range(2):
+        bytes_done, elapsed, hit_429 = _single_round(sources[0])
+        if hit_429 and retries < max_retry:
+            retries += 1
+            time.sleep(1.5)
+            bytes_done, elapsed, hit_429 = _single_round(sources[0])
+        if hit_429:
+            status = "rate_limited"
+            break
+        if bytes_done < 1024:
+            status = "no_data"
+            break
+        speed_mb_s = calculate_speed_mb_s(bytes_done, elapsed)
+        samples.append(speed_mb_s)
+        total_bytes += bytes_done
+        if round_idx == 0:
+            time.sleep(random.uniform(0.8, 1.5))
+
+    if not samples:
+        return {
+            "speed": 0.0,
+            "samples": [],
+            "p90": 0.0,
+            "stddev": 0.0,
+            "retries": retries,
+            "bytes_downloaded": total_bytes,
+            "status": status,
+        }
+
+    median_speed = sorted(samples)[len(samples) // 2]
+    p90 = max(samples)
+    stddev = 0.0 if len(samples) < 2 else (max(samples) - min(samples)) / 2.0
+    return {
+        "speed": median_speed,
+        "samples": samples,
+        "p90": p90,
+        "stddev": stddev,
+        "retries": retries,
+        "bytes_downloaded": total_bytes,
+        "status": status,
     }
 
 
