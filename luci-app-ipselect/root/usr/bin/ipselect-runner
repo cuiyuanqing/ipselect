@@ -129,8 +129,11 @@ run_task() {
     VLESS_PATH=$(get_config "vless_path" "/")
     VLESS_PORT=$(get_config "vless_port" "443")
     TARGET_COUNTRY=$(get_config "target_country" "US")
+    RANDOM_CF_COUNT=$(get_config "random_cf_count" "1500")
+    STAGE2_ENTRY_LIMIT=$(get_config "stage2_entry_limit" "75")
+    STAGE4_SPEED_LIMIT=$(get_config "stage4_speed_limit" "30")
 
-    export SANDBOX_ENABLE VLESS_SNI VLESS_UUID VLESS_PATH VLESS_PORT TARGET_COUNTRY
+    export SANDBOX_ENABLE VLESS_SNI VLESS_UUID VLESS_PATH VLESS_PORT TARGET_COUNTRY RANDOM_CF_COUNT STAGE2_ENTRY_LIMIT STAGE4_SPEED_LIMIT
 
     # 保存当前任务上下文供 stop 中断时获取
     cat << EOF > "$INFO_FILE"
@@ -406,12 +409,8 @@ with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         else:
             ip, port = addr, '443'
         
-        # 兼容性推断：从 remark 智能提取评分与流速
+        # 兼容性推断：新格式 remark 为 US-<标签>-<序号>-<速度>MB/s，评分已从名称中移除，默认 5.0
         score = 5.0
-        score_m = re.search(r'US-DaTree-([0-9.]+)', remark)
-        if score_m:
-            try: score = float(score_m.group(1))
-            except Exception: pass
         speed = 0.0
         speed_m = re.search(r'([0-9.]+)\s*MB/s', remark)
         if speed_m:

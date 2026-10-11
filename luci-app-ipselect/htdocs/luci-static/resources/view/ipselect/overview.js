@@ -606,7 +606,7 @@ return view.extend({
 		o.rmempty = false;
 
 		/* 3. env_tag */
-		o = s.option(form.Value, 'env_tag', _('运行环境标签'), _('自定义网络或地理环境标识（如“公司”、“家庭”、“软路由”），该标签将直接注入到测速输出的节点名称中，例如：US-DaTree-95.0-01-公司'));
+		o = s.option(form.Value, 'env_tag', _('运行环境标签'), _('自定义网络或地理环境标识（如“公司”、“家庭”、“软路由”），该标签将直接注入到测速输出的节点名称中，例如：US-公司-01-0.95MB/s'));
 		o.default = '公司';
 		o.placeholder = '公司';
 		o.rmempty = false;
@@ -1029,6 +1029,21 @@ return view.extend({
 		o.placeholder = 'US';
 		o.depends('sandbox_enable', '1');
 
+		o = s.option(form.Value, 'random_cf_count', _('随机采样 CF 节点数'), _('除数据源外，从 Cloudflare Anycast 网段随机撒点生成的候选节点数 (edgetunnel 在线优选同机制，默认 1500；数值越大候选池越大，耗时越长)'));
+		o.default = '1500';
+		o.placeholder = '1500';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'stage2_entry_limit', _('沙箱入围上限'), _('阶段2 分层入围后进入沙箱全链路实测的节点数上限 (默认 75，越大越稳但耗时越长)'));
+		o.default = '75';
+		o.placeholder = '75';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'stage4_speed_limit', _('测速入围上限'), _('阶段4 真实微吞吐测速的节点数上限 (默认 30)'));
+		o.default = '30';
+		o.placeholder = '30';
+		o.rmempty = true;
+
 		var tabSettings = E('div', {
 			'data-tab': 'settings',
 			'data-tab-title': _('基础设置')
@@ -1287,7 +1302,7 @@ return view.extend({
 		var ytDelay = (node.youtube_rtt != null && node.youtube_rtt > 0) ? (Number(node.youtube_rtt).toFixed(0) + ' ms') : ((node.youtube_status === 'ok') ? _('通畅') : _('未测试'));
 		var exitCountry = node.exit_country || cfg.target_country || 'US';
 		var exitIp = node.exit_ip || 'Anycast';
-		var remark = node.remark || ('US-DaTree-' + score + '-' + String(node.index || 1) + '-' + (uci.get('ipselect', 'config', 'env_tag') || '环境'));
+		var remark = node.remark || ('US-' + (uci.get('ipselect', 'config', 'env_tag') || '环境') + '-' + String(node.index || 1) + '-' + ((node.speed != null) ? Number(node.speed).toFixed(2) + 'MB/s' : '0.00MB/s'));
 
 		/* 组装标准客户端 VLESS 链接 */
 		var vlessUrl = 'vless://' + uuid + '@' + ip + ':' + port +
