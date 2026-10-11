@@ -7,4 +7,8 @@
 ipselect text eol=lf
 ipselect-runner text eol=lf
 Makefile text eol=lf
+# 含内嵌 gzip 二进制 payload 的自安装脚本必须按二进制处理，禁止 git 换行符转换
+luci-app-ipselect-openwrt25-installer.sh binary
+# 编译产物 / 压缩归档保持二进制原样
 *.ipk binary
+*.tar.gz binary
