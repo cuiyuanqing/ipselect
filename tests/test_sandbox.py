@@ -32,7 +32,7 @@ class TestMihomoSandbox(unittest.TestCase):
         )
         self.assertIn("mixed-port: 19998", yaml_content)
         self.assertIn("external-controller: 127.0.0.1:19098", yaml_content)
-        self.assertIn("mode: direct", yaml_content)
+        self.assertIn("mode: global", yaml_content)
         self.assertIn("proxies:", yaml_content)
         self.assertIn("server: 104.16.222.118", yaml_content)
         self.assertIn("port: 8443", yaml_content)

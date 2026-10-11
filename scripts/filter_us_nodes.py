@@ -160,6 +160,42 @@ DEFAULT_VLESS_SNI = "proxy.19940407.xyz"
 DEFAULT_VLESS_PATH = "/"
 
 
+def detect_vless_template() -> dict:
+    """自动从环境变量或 OpenClash 配置文件中提取实际运行的 VLESS 模板配置 (uuid, sni, path)"""
+    env_uuid = os.environ.get("VLESS_UUID")
+    env_sni = os.environ.get("VLESS_SNI")
+    env_path = os.environ.get("VLESS_PATH")
+
+    if env_uuid and env_sni and env_path:
+        return {"uuid": env_uuid, "sni": env_sni, "path": env_path}
+
+    for provider_file in [
+        "/etc/openclash/proxy_provider/datree1.yaml",
+        "/etc/openclash/proxy_provider/datree.yaml"
+    ]:
+        if os.path.isfile(provider_file):
+            try:
+                with open(provider_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                uuid_m = re.search(r"uuid:\s*([a-f0-9\-]{36})", content, re.IGNORECASE)
+                sni_m = re.search(r"servername:\s*([^\s,}]+)", content)
+                path_m = re.search(r"path:\s*([^\s,}]+)", content)
+                if uuid_m and sni_m:
+                    return {
+                        "uuid": env_uuid or uuid_m.group(1),
+                        "sni": env_sni or sni_m.group(1),
+                        "path": env_path or (path_m.group(1) if path_m else "/")
+                    }
+            except Exception:
+                pass
+
+    return {
+        "uuid": env_uuid or DEFAULT_VLESS_UUID,
+        "sni": env_sni or DEFAULT_VLESS_SNI,
+        "path": env_path or DEFAULT_VLESS_PATH
+    }
+
+
 def find_clash_core():
     """查找本地系统中的 Mihomo (Clash Meta) 二进制内核"""
     candidates = [
@@ -185,7 +221,7 @@ def generate_sandbox_yaml(candidates, api_port=19098, proxy_port=19998, uuid=DEF
     lines = [
         f"mixed-port: {proxy_port}",
         f"external-controller: 127.0.0.1:{api_port}",
-        "mode: direct",
+        "mode: global",
         "log-level: silent",
         "ipv6: false",
         "dns:",
@@ -236,6 +272,13 @@ class MihomoSandbox:
 
     def start(self) -> bool:
         os.makedirs(self.work_dir, exist_ok=True)
+        if not self.mock_mode and os.name != 'nt':
+            try:
+                subprocess.run(["pkill", "-9", "-f", self.work_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(0.2)
+            except Exception:
+                pass
+
         uuid = self.vless_template.get("uuid", DEFAULT_VLESS_UUID)
         sni = self.vless_template.get("sni", DEFAULT_VLESS_SNI)
         path = self.vless_template.get("path", DEFAULT_VLESS_PATH)
@@ -275,12 +318,22 @@ class MihomoSandbox:
 
         # 轮询探测 REST API 就绪
         start_t = time.time()
-        while time.time() - start_t < 2.5:
+        while time.time() - start_t < 3.0:
             try:
                 req = urllib.request.Request(f"http://127.0.0.1:{self.api_port}/version")
                 with urllib.request.urlopen(req, timeout=0.5) as res:
                     if res.status == 200:
                         self._ready = True
+                        try:
+                            req_patch = urllib.request.Request(
+                                f"http://127.0.0.1:{self.api_port}/configs",
+                                data=json.dumps({'mode': 'global'}).encode('utf-8'),
+                                headers={'Content-Type': 'application/json'},
+                                method='PATCH'
+                            )
+                            urllib.request.urlopen(req_patch, timeout=1.0)
+                        except Exception:
+                            pass
                         return True
             except Exception:
                 time.sleep(0.1)
@@ -290,6 +343,11 @@ class MihomoSandbox:
 
     def is_ready(self) -> bool:
         return self._ready
+
+    def switch_proxy(self, proxy_name: str) -> bool:
+        if self.mock_mode:
+            return True
+        return switch_sandbox_proxy(proxy_name, api_port=self.api_port)
 
     def stop(self):
         self._ready = False
@@ -309,6 +367,21 @@ class MihomoSandbox:
                 shutil.rmtree(self.work_dir, ignore_errors=True)
             except Exception:
                 pass
+
+
+def switch_sandbox_proxy(proxy_name: str, api_port: int = 19098) -> bool:
+    """通过 REST API 将沙箱全局代理 (GLOBAL) 切换至指定的候选代理节点"""
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{api_port}/proxies/GLOBAL",
+            data=json.dumps({'name': proxy_name}).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='PUT'
+        )
+        with urllib.request.urlopen(req, timeout=1.5) as res:
+            return res.status in (200, 204)
+    except Exception:
+        return False
 
 
 GOOGLE_204_URL = "http://www.gstatic.com/generate_204"
@@ -386,9 +459,12 @@ def evaluate_e2e_candidate(proxy_name: str, ip: str, port: int, colo: str, api_p
     else:
         total_rounds = 3
         for idx in range(total_rounds):
+            # 提前失败截断：若丢包次数已达 2 次，不可能满足 >= 2 次成功，立即淘汰
+            if (idx - len(google_delays)) >= 2:
+                return None
             if idx > 0:
-                time.sleep(random.uniform(0.03, 0.06))
-            d = probe_e2e_delay(proxy_name, GOOGLE_204_URL, api_port=api_port)
+                time.sleep(random.uniform(0.02, 0.04))
+            d = probe_e2e_delay(proxy_name, GOOGLE_204_URL, api_port=api_port, timeout_ms=2500)
             if d is not None:
                 google_delays.append(d)
 
@@ -403,14 +479,16 @@ def evaluate_e2e_candidate(proxy_name: str, ip: str, port: int, colo: str, api_p
     if mock_data and "youtube_delay" in mock_data:
         yt_delay = mock_data["youtube_delay"]
     else:
-        yt_delay = probe_e2e_delay(proxy_name, YOUTUBE_204_URL, api_port=api_port, timeout_ms=3000)
+        yt_delay = probe_e2e_delay(proxy_name, YOUTUBE_204_URL, api_port=api_port, timeout_ms=4500)
 
     if yt_delay is None or yt_delay <= 0:
         return None
 
     # 3. ip.sb 出口归属一票否决
     mock_exit = mock_data.get("ip_sb_exit") if mock_data else None
-    is_us, exit_country, exit_ip = probe_ip_sb_exit(proxy_port=proxy_port, mock_exit=mock_exit)
+    if not mock_data:
+        switch_sandbox_proxy(proxy_name, api_port=api_port)
+    is_us, exit_country, exit_ip = probe_ip_sb_exit(proxy_port=proxy_port, timeout=3.0, mock_exit=mock_exit)
     if not is_us:
         return None
 
@@ -439,7 +517,7 @@ def probe_e2e_download_speed(proxy_port: int = 19998, max_bytes: int = 1048576, 
     proxy_handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
     opener = urllib.request.build_opener(proxy_handler)
 
-    test_url = f"http://speed.cloudflare.com/__down?bytes={max_bytes}"
+    test_url = "http://cachefly.cachefly.net/1mb.test"
     start_t = time.time()
     received = 0
     try:
@@ -1098,9 +1176,29 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
             if not any(s[0] == c[0] and s[1] == c[1] for s in stage2_survivors):
                 stage2_survivors.append((c[0], c[1], c[2], "CF", 200.0))
 
-    # 按初筛 TLS 握手 RTT 排序，取前 25 名入围阶段 3 沙箱全链路实测
-    stage2_survivors.sort(key=lambda x: (x[4] if x[4] else 999.0))
-    top25_candidates = stage2_survivors[:25]
+    # 候选节点智能分层入围策略：兼顾美西直连高稳定机房 (SJC/LAX/SFO 等) 与亚太低延迟机房
+    us_candidates = [c for c in stage2_survivors if is_us_west_colo(c[3]) or is_us_colo(c[3]) or c[3] in ('SJC', 'LAX', 'SFO', 'SEA', 'PDX')]
+    apac_candidates = [c for c in stage2_survivors if is_apac_colo(c[3]) or c[3] in ('HKG', 'NRT', 'SIN', 'KIX')]
+    other_candidates = [c for c in stage2_survivors if c not in us_candidates and c not in apac_candidates]
+
+    us_candidates.sort(key=lambda x: (x[4] if x[4] else 999.0))
+    apac_candidates.sort(key=lambda x: (x[4] if x[4] else 999.0))
+    other_candidates.sort(key=lambda x: (x[4] if x[4] else 999.0))
+
+    chosen = []
+    chosen.extend(us_candidates[:12])
+    chosen.extend(apac_candidates[:10])
+    chosen.extend(other_candidates[:3])
+
+    if len(chosen) < 25:
+        stage2_survivors.sort(key=lambda x: (x[4] if x[4] else 999.0))
+        for c in stage2_survivors:
+            if c not in chosen:
+                chosen.append(c)
+            if len(chosen) >= 25:
+                break
+
+    top25_candidates = chosen
 
     # ================= 阶段 3：沙箱全链路真机实测 (Google + YouTube + ip.sb) =================
     print(f"\n[+] [阶段 3/5] 启动沙箱全链路真实代理实测 (入围节点数: {len(top25_candidates)}, 穿透 edgetunnel 测 Google/YouTube/ip.sb)...")
@@ -1109,8 +1207,11 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     use_sandbox = mock_mode or (find_clash_core() is not None)
 
     if use_sandbox:
+        vless_tpl = detect_vless_template()
+        print(f"[*] 加载 VLESS 代理模板: SNI={vless_tpl['sni']}, UUID={vless_tpl['uuid'][:8]}..., PATH={vless_tpl['path']}")
         sandbox = MihomoSandbox(
             candidates=top25_candidates,
+            vless_template=vless_tpl,
             work_dir="/tmp/ipselect_sandbox" if not mock_mode else tempfile.mkdtemp(prefix="mock_sb_"),
             api_port=19098,
             proxy_port=19998,
@@ -1140,7 +1241,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                     )
                     return eval_res
 
-                with ThreadPoolExecutor(max_workers=5) as executor:
+                with ThreadPoolExecutor(max_workers=10) as executor:
                     future_map = {executor.submit(probe_single, idx, item): item for idx, item in enumerate(top25_candidates, 1)}
                     for future in as_completed(future_map):
                         res = future.result()
@@ -1183,14 +1284,21 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
 
     # ================= 阶段 4：真实微吞吐测速 =================
     print(f"\n[+] [阶段 4/5] 启动 1.0MB 安全微吞吐测速 (入围节点数: {len(candidates_for_speed)})...")
-    for node in candidates_for_speed:
-        if mock_mode:
+    if mock_mode:
+        for node in candidates_for_speed:
             spd = 1.85
-        else:
-            spd = probe_real_download_speed(node['ip'], node['port'], 1048576, 2.0, fallback_rtt=node['e2e_avg_rtt'])
-        node['speed'] = spd
-        node['score'] = calculate_e2e_score(node['e2e_avg_rtt'], node['e2e_jitter'], spd, node['colo'])
-        node['is_cf'] = is_official_cloudflare_ip(node['ip'])
+            node['speed'] = spd
+            node['score'] = calculate_e2e_score(node['e2e_avg_rtt'], node['e2e_jitter'], spd, node['colo'])
+            node['is_cf'] = is_official_cloudflare_ip(node['ip'])
+    else:
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            future_map = {executor.submit(probe_real_download_speed, n['ip'], n['port'], 1048576, 2.0, fallback_rtt=n['e2e_avg_rtt']): n for n in candidates_for_speed}
+            for future in as_completed(future_map):
+                node = future_map[future]
+                spd = future.result()
+                node['speed'] = spd
+                node['score'] = calculate_e2e_score(node['e2e_avg_rtt'], node['e2e_jitter'], spd, node['colo'])
+                node['is_cf'] = is_official_cloudflare_ip(node['ip'])
 
     # ================= 阶段 5：综合评分排序并导出 Top 15 =================
     candidates_for_speed.sort(key=lambda x: (-x['score'], x['e2e_avg_rtt'], -x['speed']))
