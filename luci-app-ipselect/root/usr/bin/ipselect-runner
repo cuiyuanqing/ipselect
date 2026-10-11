@@ -123,6 +123,11 @@ run_task() {
     AUTO_CLONE=$(get_config "auto_clone" "1")
     [ -z "$GITHUB_BRANCH" ] && GITHUB_BRANCH="main"
 
+    SPEED_TEST_DURATION=$(get_config "speed_test_duration" "5")
+    SPEED_TEST_PARALLEL=$(get_config "speed_test_parallel" "3")
+    SPEED_TEST_NODE_CONCURRENCY=$(get_config "speed_test_node_concurrency" "4")
+    SPEED_TEST_MAX_RETRY=$(get_config "speed_test_max_retry" "1")
+    SPEED_TEST_MAX_BYTES_PER_IP=$(get_config "speed_test_max_bytes_per_ip" "80")
     SANDBOX_ENABLE=$(get_config "sandbox_enable" "1")
     VLESS_SNI=$(get_config "vless_sni" "proxy.19940407.xyz")
     VLESS_UUID=$(get_config "vless_uuid" "e295e2a9-13ad-4251-baa8-28ee1b5aeae9")
@@ -133,7 +138,7 @@ run_task() {
     STAGE2_ENTRY_LIMIT=$(get_config "stage2_entry_limit" "75")
     STAGE4_SPEED_LIMIT=$(get_config "stage4_speed_limit" "30")
 
-    export SANDBOX_ENABLE VLESS_SNI VLESS_UUID VLESS_PATH VLESS_PORT TARGET_COUNTRY RANDOM_CF_COUNT STAGE2_ENTRY_LIMIT STAGE4_SPEED_LIMIT
+    export SANDBOX_ENABLE VLESS_SNI VLESS_UUID VLESS_PATH VLESS_PORT TARGET_COUNTRY RANDOM_CF_COUNT STAGE2_ENTRY_LIMIT STAGE4_SPEED_LIMIT SPEED_TEST_DURATION SPEED_TEST_PARALLEL SPEED_TEST_NODE_CONCURRENCY SPEED_TEST_MAX_RETRY SPEED_TEST_MAX_BYTES_PER_IP
 
     # 保存当前任务上下文供 stop 中断时获取
     cat << EOF > "$INFO_FILE"
