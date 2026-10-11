@@ -1044,6 +1044,48 @@ return view.extend({
 		o.placeholder = '30';
 		o.rmempty = true;
 
+		/* v1.4.0+ 阶段 4 改为过隧道 + 时长 + 并发测速；speed_test_* 参数决定测速精度与耗时。 */
+		s.field('Value', 'speed_test_duration', __('单节点测速时长(秒)'), {
+			datatype: 'uinteger',
+			default: 5,
+			min: 1,
+			max: 30,
+			placeholder: '默认 5，建议 3-8',
+			optional: true,
+		});
+		s.field('Value', 'speed_test_parallel', __('单节点并发下载数'), {
+			datatype: 'uinteger',
+			default: 3,
+			min: 1,
+			max: 8,
+			placeholder: '默认 3，建议 2-4',
+			optional: true,
+		});
+		s.field('Value', 'speed_test_node_concurrency', __('同时测速节点数'), {
+			datatype: 'uinteger',
+			default: 4,
+			min: 1,
+			max: 8,
+			placeholder: '默认 4，CPU 受限可调低',
+			optional: true,
+		});
+		s.field('Value', 'speed_test_max_retry', __('429/1020 重试次数'), {
+			datatype: 'uinteger',
+			default: 1,
+			min: 0,
+			max: 3,
+			placeholder: '默认 1，超过即弃用该节点',
+			optional: true,
+		});
+		s.field('Value', 'speed_test_max_bytes_per_ip', __('单 IP 累计下载上限(MB)'), {
+			datatype: 'uinteger',
+			default: 80,
+			min: 10,
+			max: 500,
+			placeholder: '默认 80，越大越准但越慢',
+			optional: true,
+		});
+
 		var tabSettings = E('div', {
 			'data-tab': 'settings',
 			'data-tab-title': _('基础设置')
