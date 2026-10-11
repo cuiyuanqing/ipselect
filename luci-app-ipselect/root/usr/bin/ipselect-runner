@@ -27,7 +27,7 @@ get_config() {
 run_git_masked() {
     # 执行 git 命令，捕获输出与退出码，将 GITHUB_TOKEN 脱敏后追加到 LOG_FILE
     local tmp_out
-    tmp_out=$(git "$@" 2>&1)
+    tmp_out=$(PAGER=cat git --no-pager "$@" 2>&1)
     local ret=$?
     if [ -n "$GITHUB_TOKEN" ]; then
         echo "$tmp_out" | sed "s#${GITHUB_TOKEN}#********#g" >> "$LOG_FILE"
@@ -102,6 +102,152 @@ if os.path.isdir(log_dir):
 " 2>/dev/null || true
 }
 
+run_task() {
+    TRIGGER="${1:-manual}"
+    START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+    TASK_ID=$(date '+%Y%m%d-%H%M%S')
+    T_START=$(date +%s)
+    
+    WORKDIR=$(get_config "workdir" "/root/ipselect")
+    ENV_TAG=$(get_config "env_tag" "公司")
+    OUTPUT_FILE=$(get_config "output_file" "best_us.txt")
+    INTERFACE=$(get_config "interface" "br-lan")
+    AUTO_PUSH=$(get_config "auto_push" "1")
+    OPENCLASH_SYNC=$(get_config "openclash_sync" "1")
+    PROVIDER_NAME=$(get_config "openclash_provider" "datree")
+    GITHUB_REPO=$(get_config "github_repo" "")
+    GITHUB_TOKEN=$(get_config "github_token" "")
+    GITHUB_BRANCH=$(get_config "github_branch" "main")
+    GITHUB_USER=$(get_config "github_user" "")
+    GITHUB_EMAIL=$(get_config "github_email" "")
+    AUTO_CLONE=$(get_config "auto_clone" "1")
+    [ -z "$GITHUB_BRANCH" ] && GITHUB_BRANCH="main"
+
+    # 保存当前任务上下文供 stop 中断时获取
+    cat << EOF > "$INFO_FILE"
+TASK_ID='$TASK_ID'
+START_TIME='$START_TIME'
+TRIGGER='$TRIGGER'
+T_START='$T_START'
+EOF
+
+    echo "========== [${START_TIME}] 任务开始执行 (触发源: ${TRIGGER}) ==========" > "$LOG_FILE"
+    STATUS="success"
+    GIT_STATUS="skipped"
+    OC_STATUS="skipped"
+    NODE_COUNT=0
+
+    # 自动克隆检查
+    if [ ! -d "$WORKDIR/.git" ] && [ "$AUTO_CLONE" = "1" ] && [ -n "$GITHUB_REPO" ] && [ -n "$GITHUB_TOKEN" ]; then
+        mkdir -p "$(dirname "$WORKDIR")"
+        if [ ! -d "$WORKDIR" ] || [ -z "$(ls -A "$WORKDIR" 2>/dev/null)" ]; then
+            echo "[*] 工作目录不存在或为空，正在自动从 GitHub 克隆远程仓库..." >> "$LOG_FILE"
+            CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+            if run_git_masked clone -b "$GITHUB_BRANCH" "$CLONE_URL" "$WORKDIR"; then
+                echo "[+] 仓库自动克隆成功！" >> "$LOG_FILE"
+                (cd "$WORKDIR" && git config pull.rebase true 2>/dev/null || true)
+            else
+                echo "[!] 自动克隆失败，请检查 Token 权限与网络连接！" >> "$LOG_FILE"
+            fi
+        fi
+    fi
+
+    if [ -d "$WORKDIR" ]; then
+        cd "$WORKDIR"
+        echo "[*] 进入工作目录: $WORKDIR" >> "$LOG_FILE"
+        if [ -d ".git" ]; then
+            if [ -n "$GITHUB_REPO" ] && [ -n "$GITHUB_TOKEN" ]; then
+                AUTH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+                git remote set-url origin "$AUTH_URL" 2>/dev/null || git remote add origin "$AUTH_URL" 2>/dev/null || true
+            fi
+            git config pull.rebase true 2>/dev/null || true
+            git config rebase.autoStash true 2>/dev/null || true
+            git rebase --abort 2>/dev/null || true
+            echo "[*] 同步远程最新代码 (git pull --rebase --autostash origin ${GITHUB_BRANCH})..." >> "$LOG_FILE"
+            if ! run_git_masked pull --rebase --autostash origin "$GITHUB_BRANCH"; then
+                echo "[!] 变基拉取遇到冲突或异常，自动清理未决状态..." >> "$LOG_FILE"
+                git rebase --abort 2>/dev/null || true
+            fi
+        fi
+        
+        echo "[*] 开始执行节点筛选测速: --tag ${ENV_TAG} --output ${OUTPUT_FILE} --interface ${INTERFACE}..." >> "$LOG_FILE"
+        if python3 scripts/filter_us_nodes.py --tag "$ENV_TAG" --output "$OUTPUT_FILE" --interface "$INTERFACE" >> "$LOG_FILE" 2>&1; then
+            echo "[+] 节点筛选测速完成！" >> "$LOG_FILE"
+            if [ -f "$OUTPUT_FILE" ]; then
+                NODE_COUNT=$(grep -v '^#' "$OUTPUT_FILE" 2>/dev/null | grep -c ':' 2>/dev/null || true)
+                [ -z "$NODE_COUNT" ] && NODE_COUNT=0
+            fi
+        else
+            echo "[!] 节点筛选测速发生异常！" >> "$LOG_FILE"
+            STATUS="failed"
+        fi
+
+        if [ "$STATUS" = "success" ] && [ "$AUTO_PUSH" = "1" ] && [ -d ".git" ]; then
+            echo "[*] 检测 Git 变更并提交..." >> "$LOG_FILE"
+            if [ -n "$GITHUB_USER" ]; then
+                git config user.name "$GITHUB_USER" || true
+            elif [ -z "$(git config user.name 2>/dev/null)" ]; then
+                git config user.name "iStoreOS-IPSelect" || true
+            fi
+            if [ -n "$GITHUB_EMAIL" ]; then
+                git config user.email "$GITHUB_EMAIL" || true
+            elif [ -z "$(git config user.email 2>/dev/null)" ]; then
+                git config user.email "ipselect@local" || true
+            fi
+            git add "$OUTPUT_FILE"
+            if ! git diff --staged --quiet; then
+                git commit -m "auto: iStoreOS 节点优选更新 [$(date '+%Y-%m-%d %H:%M:%S')]" >> "$LOG_FILE" 2>&1
+                if run_git_masked push origin "$GITHUB_BRANCH"; then
+                    echo "[+] 成功推送到 GitHub 远程仓库！" >> "$LOG_FILE"
+                    GIT_STATUS="pushed"
+                else
+                    echo "[*] 首次推送失败 (远端可能存在新提交)，尝试变基拉取后重试推送..." >> "$LOG_FILE"
+                    if run_git_masked pull --rebase --autostash origin "$GITHUB_BRANCH" && run_git_masked push origin "$GITHUB_BRANCH"; then
+                        echo "[+] 变基后成功推送到 GitHub 远程仓库！" >> "$LOG_FILE"
+                        GIT_STATUS="pushed"
+                    else
+                        echo "[!] 推送到 GitHub 失败！" >> "$LOG_FILE"
+                        git rebase --abort 2>/dev/null || true
+                        GIT_STATUS="error"
+                    fi
+                fi
+            else
+                echo "[*] 节点未发生变动，无需推送" >> "$LOG_FILE"
+                GIT_STATUS="unchanged"
+            fi
+        fi
+    else
+        echo "[!] 错误: 工作目录 $WORKDIR 不存在！" >> "$LOG_FILE"
+        STATUS="failed"
+    fi
+
+    if [ "$STATUS" = "success" ] && [ "$OPENCLASH_SYNC" = "1" ]; then
+        echo "[*] 联动触发 OpenClash 订阅更新..." >> "$LOG_FILE"
+        OC_HOOK="${BASE_ROOT}/usr/bin/update_openclash_sub.sh"
+        [ ! -x "$OC_HOOK" ] && OC_HOOK="/usr/bin/update_openclash_sub.sh"
+        if [ -x "$OC_HOOK" ]; then
+            "$OC_HOOK" >> "$LOG_FILE" 2>&1 || true
+            OC_STATUS="success"
+        else
+            echo "[*] $OC_HOOK 不存在，跳过联动" >> "$LOG_FILE"
+            OC_STATUS="skipped"
+        fi
+    fi
+
+    T_END=$(date +%s)
+    DURATION=$((T_END - T_START))
+    echo "========== [$(date '+%Y-%m-%d %H:%M:%S')] 任务执行完毕 (耗时: ${DURATION}s, 状态: ${STATUS}) ==========" >> "$LOG_FILE"
+
+    # 归档日志快照
+    ARCHIVE_LOG="${HISTORY_LOG_DIR}/history_${TASK_ID}.log"
+    cp "$LOG_FILE" "$ARCHIVE_LOG"
+
+    # 更新历史记录 JSON 并淘汰旧日志
+    record_history "$TASK_ID" "$START_TIME" "$TRIGGER" "$DURATION" "$STATUS" "$NODE_COUNT" "$GIT_STATUS" "$OC_STATUS" "$ARCHIVE_LOG"
+
+    rm -f "$INFO_FILE" "$PID_FILE"
+}
+
 case "$1" in
     status)
         if is_running; then
@@ -119,6 +265,11 @@ case "$1" in
         echo "{\"running\": $RUNNING, \"pid\": $PID, \"last_run\": \"$LAST_RUN\"}"
         ;;
 
+    run)
+        TRIGGER="${2:-manual}"
+        run_task "$TRIGGER"
+        ;;
+
     start)
         if is_running; then
             CURR_PID=$(cat "$PID_FILE" 2>/dev/null | tr -d ' \r\n')
@@ -126,153 +277,12 @@ case "$1" in
             exit 1
         fi
         TRIGGER="${2:-manual}"
-        START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-        TASK_ID=$(date '+%Y%m%d-%H%M%S')
-        T_START=$(date +%s)
-        
-        WORKDIR=$(get_config "workdir" "/root/ipselect")
-        ENV_TAG=$(get_config "env_tag" "公司")
-        OUTPUT_FILE=$(get_config "output_file" "best_us.txt")
-        INTERFACE=$(get_config "interface" "br-lan")
-        AUTO_PUSH=$(get_config "auto_push" "1")
-        OPENCLASH_SYNC=$(get_config "openclash_sync" "1")
-        PROVIDER_NAME=$(get_config "openclash_provider" "datree")
-        GITHUB_REPO=$(get_config "github_repo" "")
-        GITHUB_TOKEN=$(get_config "github_token" "")
-        GITHUB_BRANCH=$(get_config "github_branch" "main")
-        GITHUB_USER=$(get_config "github_user" "")
-        GITHUB_EMAIL=$(get_config "github_email" "")
-        AUTO_CLONE=$(get_config "auto_clone" "1")
-        [ -z "$GITHUB_BRANCH" ] && GITHUB_BRANCH="main"
-
-        # 保存当前任务上下文供 stop 中断时获取
-        cat << EOF > "$INFO_FILE"
-TASK_ID='$TASK_ID'
-START_TIME='$START_TIME'
-TRIGGER='$TRIGGER'
-T_START='$T_START'
-EOF
-
-        # 后台异步启动执行
-        (
-            echo "========== [${START_TIME}] 任务开始执行 (触发源: ${TRIGGER}) ==========" > "$LOG_FILE"
-            STATUS="success"
-            GIT_STATUS="skipped"
-            OC_STATUS="skipped"
-            NODE_COUNT=0
-
-            # 自动克隆检查
-            if [ ! -d "$WORKDIR/.git" ] && [ "$AUTO_CLONE" = "1" ] && [ -n "$GITHUB_REPO" ] && [ -n "$GITHUB_TOKEN" ]; then
-                mkdir -p "$(dirname "$WORKDIR")"
-                if [ ! -d "$WORKDIR" ] || [ -z "$(ls -A "$WORKDIR" 2>/dev/null)" ]; then
-                    echo "[*] 工作目录不存在或为空，正在自动从 GitHub 克隆远程仓库..." >> "$LOG_FILE"
-                    CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
-                    if run_git_masked clone -b "$GITHUB_BRANCH" "$CLONE_URL" "$WORKDIR"; then
-                        echo "[+] 仓库自动克隆成功！" >> "$LOG_FILE"
-                        (cd "$WORKDIR" && git config pull.rebase true 2>/dev/null || true)
-                    else
-                        echo "[!] 自动克隆失败，请检查 Token 权限与网络连接！" >> "$LOG_FILE"
-                    fi
-                fi
-            fi
-
-            if [ -d "$WORKDIR" ]; then
-                cd "$WORKDIR"
-                echo "[*] 进入工作目录: $WORKDIR" >> "$LOG_FILE"
-                if [ -d ".git" ]; then
-                    if [ -n "$GITHUB_REPO" ] && [ -n "$GITHUB_TOKEN" ]; then
-                        AUTH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
-                        git remote set-url origin "$AUTH_URL" 2>/dev/null || git remote add origin "$AUTH_URL" 2>/dev/null || true
-                    fi
-                    git config pull.rebase true 2>/dev/null || true
-                    git config rebase.autoStash true 2>/dev/null || true
-                    git rebase --abort 2>/dev/null || true
-                    echo "[*] 同步远程最新代码 (git pull --rebase --autostash origin ${GITHUB_BRANCH})..." >> "$LOG_FILE"
-                    if ! run_git_masked pull --rebase --autostash origin "$GITHUB_BRANCH"; then
-                        echo "[!] 变基拉取遇到冲突或异常，自动清理未决状态..." >> "$LOG_FILE"
-                        git rebase --abort 2>/dev/null || true
-                    fi
-                fi
-                
-                echo "[*] 开始执行节点筛选测速: --tag ${ENV_TAG} --output ${OUTPUT_FILE} --interface ${INTERFACE}..." >> "$LOG_FILE"
-                if python3 scripts/filter_us_nodes.py --tag "$ENV_TAG" --output "$OUTPUT_FILE" --interface "$INTERFACE" >> "$LOG_FILE" 2>&1; then
-                    echo "[+] 节点筛选测速完成！" >> "$LOG_FILE"
-                    if [ -f "$OUTPUT_FILE" ]; then
-                        NODE_COUNT=$(grep -v '^#' "$OUTPUT_FILE" 2>/dev/null | grep -c ':' 2>/dev/null || true)
-                        [ -z "$NODE_COUNT" ] && NODE_COUNT=0
-                    fi
-                else
-                    echo "[!] 节点筛选测速发生异常！" >> "$LOG_FILE"
-                    STATUS="failed"
-                fi
-
-                if [ "$STATUS" = "success" ] && [ "$AUTO_PUSH" = "1" ] && [ -d ".git" ]; then
-                    echo "[*] 检测 Git 变更并提交..." >> "$LOG_FILE"
-                    if [ -n "$GITHUB_USER" ]; then
-                        git config user.name "$GITHUB_USER" || true
-                    elif [ -z "$(git config user.name 2>/dev/null)" ]; then
-                        git config user.name "iStoreOS-IPSelect" || true
-                    fi
-                    if [ -n "$GITHUB_EMAIL" ]; then
-                        git config user.email "$GITHUB_EMAIL" || true
-                    elif [ -z "$(git config user.email 2>/dev/null)" ]; then
-                        git config user.email "ipselect@local" || true
-                    fi
-                    git add "$OUTPUT_FILE"
-                    if ! git diff --staged --quiet; then
-                        git commit -m "auto: iStoreOS 节点优选更新 [$(date '+%Y-%m-%d %H:%M:%S')]" >> "$LOG_FILE" 2>&1
-                        if run_git_masked push origin "$GITHUB_BRANCH"; then
-                            echo "[+] 成功推送到 GitHub 远程仓库！" >> "$LOG_FILE"
-                            GIT_STATUS="pushed"
-                        else
-                            echo "[*] 首次推送失败 (远端可能存在新提交)，尝试变基拉取后重试推送..." >> "$LOG_FILE"
-                            if run_git_masked pull --rebase --autostash origin "$GITHUB_BRANCH" && run_git_masked push origin "$GITHUB_BRANCH"; then
-                                echo "[+] 变基后成功推送到 GitHub 远程仓库！" >> "$LOG_FILE"
-                                GIT_STATUS="pushed"
-                            else
-                                echo "[!] 推送到 GitHub 失败！" >> "$LOG_FILE"
-                                git rebase --abort 2>/dev/null || true
-                                GIT_STATUS="error"
-                            fi
-                        fi
-                    else
-                        echo "[*] 节点未发生变动，无需推送" >> "$LOG_FILE"
-                        GIT_STATUS="unchanged"
-                    fi
-                fi
-            else
-                echo "[!] 错误: 工作目录 $WORKDIR 不存在！" >> "$LOG_FILE"
-                STATUS="failed"
-            fi
-
-            if [ "$STATUS" = "success" ] && [ "$OPENCLASH_SYNC" = "1" ]; then
-                echo "[*] 联动触发 OpenClash 订阅更新..." >> "$LOG_FILE"
-                OC_HOOK="${BASE_ROOT}/usr/bin/update_openclash_sub.sh"
-                [ ! -x "$OC_HOOK" ] && OC_HOOK="/usr/bin/update_openclash_sub.sh"
-                if [ -x "$OC_HOOK" ]; then
-                    "$OC_HOOK" >> "$LOG_FILE" 2>&1 || true
-                    OC_STATUS="success"
-                else
-                    echo "[*] $OC_HOOK 不存在，跳过联动" >> "$LOG_FILE"
-                    OC_STATUS="skipped"
-                fi
-            fi
-
-            T_END=$(date +%s)
-            DURATION=$((T_END - T_START))
-            echo "========== [$(date '+%Y-%m-%d %H:%M:%S')] 任务执行完毕 (耗时: ${DURATION}s, 状态: ${STATUS}) ==========" >> "$LOG_FILE"
-
-            # 归档日志快照
-            ARCHIVE_LOG="${HISTORY_LOG_DIR}/history_${TASK_ID}.log"
-            cp "$LOG_FILE" "$ARCHIVE_LOG"
-
-            # 更新历史记录 JSON 并淘汰旧日志
-            record_history "$TASK_ID" "$START_TIME" "$TRIGGER" "$DURATION" "$STATUS" "$NODE_COUNT" "$GIT_STATUS" "$OC_STATUS" "$ARCHIVE_LOG"
-
-            rm -f "$INFO_FILE" "$PID_FILE"
-        ) >/dev/null 2>&1 &
-        BG_PID=$!
-        echo "$BG_PID" > "$PID_FILE"
+        if [ -x "/sbin/start-stop-daemon" ]; then
+            /sbin/start-stop-daemon -S -b -m -p "$PID_FILE" -x /bin/sh -- "$0" run "$TRIGGER"
+        else
+            ( run_task "$TRIGGER" ) </dev/null >/dev/null 2>&1 &
+            echo $! > "$PID_FILE"
+        fi
         echo "{\"success\": true, \"message\": \"任务已启动\"}"
         ;;
 
