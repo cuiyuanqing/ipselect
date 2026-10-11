@@ -22,6 +22,9 @@ import argparse
 import ipaddress
 import statistics
 import random
+import subprocess
+import shutil
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SNI_HOST = "proxy.19940407.xyz"
@@ -148,6 +151,162 @@ def init_network_bypass(interface=None):
             print("[*] 已启用 Linux GID=65534 规则，成功绕过 OpenClash 本地代理劫持")
         except Exception as e:
             print(f"[!] 设置 GID 失败 (可忽略): {e}")
+
+
+DEFAULT_VLESS_UUID = "e295e2a9-13ad-4251-baa8-28ee1b5aeae9"
+DEFAULT_VLESS_SNI = "proxy.19940407.xyz"
+DEFAULT_VLESS_PATH = "/"
+
+
+def find_clash_core():
+    """查找本地系统中的 Mihomo (Clash Meta) 二进制内核"""
+    candidates = [
+        "/etc/openclash/core/clash_meta",
+        "/usr/bin/clash_meta",
+        "/usr/bin/mihomo",
+        "/usr/local/bin/mihomo",
+        shutil.which("clash_meta") if hasattr(shutil, 'which') else None,
+        shutil.which("mihomo") if hasattr(shutil, 'which') else None,
+        shutil.which("clash") if hasattr(shutil, 'which') else None
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def generate_sandbox_yaml(candidates, api_port=19098, proxy_port=19998, uuid=DEFAULT_VLESS_UUID, sni=DEFAULT_VLESS_SNI, path=DEFAULT_VLESS_PATH):
+    """
+    生成轻量级无 TUN 的 Mihomo 隔离沙箱配置文件。
+    包含指定的一组入围 VLESS 节点。
+    """
+    lines = [
+        f"mixed-port: {proxy_port}",
+        f"external-controller: 127.0.0.1:{api_port}",
+        "mode: direct",
+        "log-level: silent",
+        "ipv6: false",
+        "dns:",
+        "  enable: true",
+        "  listen: 127.0.0.1:19953",
+        "  enhanced-mode: fake-ip",
+        "  nameserver:",
+        "    - 223.5.5.5",
+        "    - 119.29.29.29",
+        "tun:",
+        "  enable: false",
+        "proxies:"
+    ]
+    for idx, cand in enumerate(candidates, start=1):
+        ip = cand[0]
+        port = cand[1]
+        name = f"node_{idx:02d}"
+        lines.append(f"  - name: {name}")
+        lines.append("    type: vless")
+        lines.append(f"    server: {ip}")
+        lines.append(f"    port: {port}")
+        lines.append(f"    uuid: {uuid}")
+        lines.append("    tls: true")
+        lines.append("    skip-cert-verify: false")
+        lines.append(f"    servername: {sni}")
+        lines.append("    client-fingerprint: chrome")
+        lines.append("    network: ws")
+        lines.append("    ws-opts:")
+        lines.append(f"      path: {path}")
+        lines.append("      headers:")
+        lines.append(f"        Host: {sni}")
+
+    return "\n".join(lines) + "\n"
+
+
+class MihomoSandbox:
+    """Mihomo Meta 直连隔离沙箱生命周期管理器"""
+    def __init__(self, candidates, vless_template=None, work_dir="/tmp/ipselect_sandbox", api_port=19098, proxy_port=19998, core_path=None, mock_mode=False):
+        self.candidates = candidates
+        self.vless_template = vless_template or {}
+        self.work_dir = work_dir
+        self.api_port = api_port
+        self.proxy_port = proxy_port
+        self.core_path = core_path or find_clash_core()
+        self.mock_mode = mock_mode or (self.core_path is None)
+        self.process = None
+        self._ready = False
+
+    def start(self) -> bool:
+        os.makedirs(self.work_dir, exist_ok=True)
+        uuid = self.vless_template.get("uuid", DEFAULT_VLESS_UUID)
+        sni = self.vless_template.get("sni", DEFAULT_VLESS_SNI)
+        path = self.vless_template.get("path", DEFAULT_VLESS_PATH)
+
+        yaml_content = generate_sandbox_yaml(
+            candidates=self.candidates,
+            api_port=self.api_port,
+            proxy_port=self.proxy_port,
+            uuid=uuid,
+            sni=sni,
+            path=path
+        )
+        yaml_path = os.path.join(self.work_dir, "sandbox.yaml")
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            f.write(yaml_content)
+
+        if self.mock_mode:
+            self._ready = True
+            return True
+
+        # Linux 真实环境以 GID 65534 启动内核，绕过 OpenClash
+        preexec = None
+        if os.name != 'nt' and hasattr(os, 'setgid') and os.getuid() == 0:
+            preexec = lambda: os.setgid(65534)
+
+        cmd = [self.core_path, "-d", self.work_dir, "-f", yaml_path]
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=preexec
+            )
+        except Exception as e:
+            print(f"[!] 启动 Mihomo 沙箱异常: {e}")
+            return False
+
+        # 轮询探测 REST API 就绪
+        start_t = time.time()
+        while time.time() - start_t < 2.5:
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{self.api_port}/version")
+                with urllib.request.urlopen(req, timeout=0.5) as res:
+                    if res.status == 200:
+                        self._ready = True
+                        return True
+            except Exception:
+                time.sleep(0.1)
+
+        self._ready = False
+        return False
+
+    def is_ready(self) -> bool:
+        return self._ready
+
+    def stop(self):
+        self._ready = False
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+            self.process = None
+
+        if os.path.exists(self.work_dir):
+            try:
+                shutil.rmtree(self.work_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 def infer_environment_from_ips(ip_list):
