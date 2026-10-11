@@ -1482,8 +1482,10 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                         res = future.result()
                         if res:
                             e2e_results.append(res)
-            finally:
+            except Exception as _sb_e:
+                print(f"[!] 阶段 3 沙箱执行异常: {_sb_e}")
                 sandbox.stop()
+                raise
         else:
             print("[!] 沙箱启动失败，平滑回退至直连稳定性测定")
     else:
@@ -1514,6 +1516,8 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     print(f"[+] [阶段 3/5] 全链路真实可用性检测完毕，通过严格质检节点数: {len(e2e_results)} / {len(topN_candidates)}")
     if not e2e_results:
         print("[-] 错误: 无任何节点通过全链路真实代理考核。")
+        if sandbox is not None:
+            sandbox.stop()
         return
 
     # 按全链路 RTT 排序，取前 N 名进行真实微吞吐测速（放大入围数，确保测速后仍足量凑满 Top 15）
@@ -1555,14 +1559,19 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         node["score"] = base_score
         node["is_cf"] = is_official_cloudflare_ip(node["ip"])
 
-    if mock_mode:
-        for idx, node in enumerate(candidates_for_speed, 1):
-            _probe_one_node(node, mock_speed_value=2.5 + idx * 0.3)
-    else:
-        with ThreadPoolExecutor(max_workers=SPEED_TEST_NODE_CONCURRENCY) as executor:
-            futures = [executor.submit(_probe_one_node, n, None) for n in candidates_for_speed]
-            for f in as_completed(futures):
-                pass
+    try:
+        if mock_mode:
+            for idx, node in enumerate(candidates_for_speed, 1):
+                _probe_one_node(node, mock_speed_value=2.5 + idx * 0.3)
+        else:
+            with ThreadPoolExecutor(max_workers=SPEED_TEST_NODE_CONCURRENCY) as executor:
+                futures = [executor.submit(_probe_one_node, n, None) for n in candidates_for_speed]
+                for f in as_completed(futures):
+                    pass
+    finally:
+        # 沙箱进程已无后续使用，主动释放（修复: 之前在阶段 3 finally 中提前 stop 导致阶段 4 speed=0）
+        if sandbox is not None:
+            sandbox.stop()
 
     # ================= 阶段 5：综合评分排序并导出 Top 15 =================
     candidates_for_speed.sort(key=lambda x: (-x['score'], x['e2e_avg_rtt'], -x['speed']))
