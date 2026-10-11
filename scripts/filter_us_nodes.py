@@ -986,21 +986,23 @@ def probe_throughput_speed(
     proxy_port: int = 19998,
     mock_speed: float = None,
     mock_samples: tuple = None,
-    mock_429_after: int = None,
 ) -> dict:
     """
     阶段 4：过 Mihomo 沙箱代理的真实吞吐测速
-    - duration 秒时间窗内并发 N 个 HTTP GET
+    - duration 秒时间窗内并发 N 个 HTTP GET (N = parallel)
     - 两轮取中位，支持 429 重试 max_retry 次
     - 单 IP 累计字节超限提早结束
     - 返回 dict 含 speed, samples, p90, stddev, retries, bytes_downloaded, status
+
+    Mock 参数优先级说明：当同时给定 mock_samples 与 mock_speed 时，
+    mock_samples 优先 (它代表两轮取中位所需的样本集)，mock_speed 被忽略。
     """
-    if mock_speed is not None:
+    if mock_speed is not None or mock_samples is not None:
         if mock_samples is not None:
             samples = list(mock_samples)
         else:
             samples = [float(mock_speed)]
-        median_val = sorted(samples)[len(samples) // 2]
+        median_val = statistics.median(samples)
         return {
             "speed": median_val,
             "samples": samples,
@@ -1021,8 +1023,8 @@ def probe_throughput_speed(
             headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-"},
         )
 
-    def _single_round(src_host: str) -> tuple:
-        """跑一个 5 秒时间窗，返回 (bytes, elapsed, hit_429)"""
+    def _single_download(src_host: str) -> tuple:
+        """跑一个 duration 秒时间窗的单个 HTTP GET，返回 (bytes, elapsed, hit_429)"""
         url = f"http://{src_host}/__down?bytes={max_bytes_per_ip}" if src_host == "speed.cloudflare.com" else f"http://{src_host}/files/100Mb.dat"
         received = 0
         start_t = time.time()
@@ -1050,17 +1052,36 @@ def probe_throughput_speed(
         elapsed = max(0.05, time.time() - start_t)
         return received, elapsed, hit_429
 
+    def _run_parallel_round(src_host: str, workers: int) -> tuple:
+        """并发启动 workers 个下载，全部命中 src_host (单源限流控制清晰)。
+        返回 (total_bytes, wall_clock_elapsed, hit_429)"""
+        wall_start = time.time()
+        total_bytes = 0
+        hit_429 = False
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            futures = [executor.submit(_single_download, src_host) for _ in range(max(1, workers))]
+            for fut in as_completed(futures):
+                try:
+                    got_bytes, _worker_elapsed, got_429 = fut.result()
+                except Exception:
+                    got_bytes, _worker_elapsed, got_429 = 0, duration, False
+                total_bytes += got_bytes
+                if got_429:
+                    hit_429 = True
+        elapsed = max(0.05, time.time() - wall_start)
+        return total_bytes, elapsed, hit_429
+
     samples = []
     retries = 0
     total_bytes = 0
     status = "ok"
 
     for round_idx in range(2):
-        bytes_done, elapsed, hit_429 = _single_round(sources[0])
+        bytes_done, elapsed, hit_429 = _run_parallel_round(sources[0], parallel)
         if hit_429 and retries < max_retry:
             retries += 1
             time.sleep(1.5)
-            bytes_done, elapsed, hit_429 = _single_round(sources[0])
+            bytes_done, elapsed, hit_429 = _run_parallel_round(sources[0], parallel)
         if hit_429:
             status = "rate_limited"
             break
@@ -1084,7 +1105,7 @@ def probe_throughput_speed(
             "status": status,
         }
 
-    median_speed = sorted(samples)[len(samples) // 2]
+    median_speed = statistics.median(samples)
     p90 = max(samples)
     stddev = 0.0 if len(samples) < 2 else (max(samples) - min(samples)) / 2.0
     return {
