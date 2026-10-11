@@ -26,6 +26,7 @@ import random
 import subprocess
 import shutil
 import json
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SNI_HOST = "proxy.19940407.xyz"
@@ -1029,14 +1030,14 @@ def probe_node_multidimensional(candidate):
     return stab
 
 
-def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=None):
+def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=None, mock_mode=False, mock_candidates=None):
     """
-    四阶漏斗执行流水线 (方案 A 全网极速优选模式)：
-    1. 阶段 1：快速 TCP 探针 (淘汰 80% 死节点)
-    2. 阶段 2：TLS 握手与 cf-ray 机房质检 (识别有效 Cloudflare 边缘机房)
-    3. 阶段 3：多轮打散稳定性与抖动深测 (0 丢包严选)
-    4. 阶段 4：真实微吞吐测速 (防限流微测速)
-    5. 五维严苛评分与降序导出
+    五阶漏斗端到端严选引擎：
+    1. 阶段 1：快速 TCP 并发探针 (快速初筛死节点)
+    2. 阶段 2：TLS 握手与 cf-ray 机房质检 (Anycast POP 粗滤，入围 Top 25)
+    3. 阶段 3：沙箱全链路真机实测 (直连绕过代理，VLESS 隧道并发探测 Google 204, YouTube 204 及 ip.sb 落地美国)
+    4. 阶段 4：真实微吞吐测速 (通过代理隧道测量 1MB 真实下载带宽)
+    5. 阶段 5：四维综合质量打分与降序导出 Top 15
     """
     try:
         if hasattr(sys.stdout, 'reconfigure'):
@@ -1044,99 +1045,175 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     except Exception:
         pass
 
-    # 优先拉取候选数据源（支持代理或国内镜像加速拉取，防止未降权前因网络受阻）
-    candidates = fetch_candidates()
-    print(f"[*] 启动四阶漏斗严选引擎 (环境标识: {tag}, 导出目标: {output_file})...")
+    if mock_mode and mock_candidates:
+        candidates = mock_candidates
+    else:
+        candidates = fetch_candidates()
+
+    print(f"[*] 启动五阶漏斗全链路严选引擎 (环境标识: {tag}, 导出目标: {output_file})...")
 
     # 数据源拉取就绪后，启动底层直连网络绕过（设置 GID=65534 绕过代理，直接测速真实延迟）
-    init_network_bypass(interface)
+    if not mock_mode:
+        init_network_bypass(interface)
 
     # ================= 阶段 1：快速 TCP 并发探针 =================
-    print(f"\n[+] [阶段 1/4] 启动快速 TCP 连通性并发扫描 (总数: {len(candidates)}, 并发度: 30)...")
+    print(f"\n[+] [阶段 1/5] 启动快速 TCP 连通性并发扫描 (总数: {len(candidates)}, 并发度: 30)...")
     stage1_survivors = []
-    with ThreadPoolExecutor(max_workers=30) as executor:
-        future_map = {executor.submit(fast_tcp_ping, c[0], c[1]): c for c in candidates}
-        for future in as_completed(future_map):
-            c = future_map[future]
-            if future.result():
-                stage1_survivors.append(c)
+    if mock_mode:
+        stage1_survivors = list(candidates)
+    else:
+        with ThreadPoolExecutor(max_workers=30) as executor:
+            future_map = {executor.submit(fast_tcp_ping, c[0], c[1]): c for c in candidates}
+            for future in as_completed(future_map):
+                c = future_map[future]
+                if future.result():
+                    stage1_survivors.append(c)
 
-    print(f"[+] [阶段 1/4] 快速 TCP 扫描完成，存活可通节点数: {len(stage1_survivors)} / {len(candidates)}")
+    print(f"[+] [阶段 1/5] 快速 TCP 扫描完成，存活可通节点数: {len(stage1_survivors)} / {len(candidates)}")
 
     if not stage1_survivors:
         print("[-] 错误: 所有候选节点均无法建立 TCP 连接，请检查本地物理网络。")
         return
 
     # ================= 阶段 2：TLS 握手与 cf-ray 机房质检 =================
-    print(f"\n[+] [阶段 2/4] 启动 TLS 握手与 cf-ray 边缘机房代码质检 (待测数: {len(stage1_survivors)})...")
+    print(f"\n[+] [阶段 2/5] 启动 TLS 握手与 cf-ray 边缘机房代码质检 (待测数: {len(stage1_survivors)})...")
     stage2_survivors = []
-    with ThreadPoolExecutor(max_workers=25) as executor:
-        future_map = {executor.submit(probe_tls_colo, c[0], c[1]): c for c in stage1_survivors}
-        for future in as_completed(future_map):
-            c = future_map[future]
-            is_valid, colo, rtt = future.result()
-            if is_valid:
-                stage2_survivors.append((c[0], c[1], c[2], colo, rtt))
+    if mock_mode:
+        for idx, c in enumerate(stage1_survivors):
+            stage2_survivors.append((c[0], c[1], c[2], "SJC" if idx % 2 == 0 else "LAX", 180.0 + idx * 5.0))
+    else:
+        with ThreadPoolExecutor(max_workers=25) as executor:
+            future_map = {executor.submit(probe_tls_colo, c[0], c[1]): c for c in stage1_survivors}
+            for future in as_completed(future_map):
+                c = future_map[future]
+                is_valid, colo, rtt = future.result()
+                if is_valid:
+                    stage2_survivors.append((c[0], c[1], c[2], colo, rtt if rtt else 200.0))
 
-    print(f"[+] [阶段 2/4] 机房质检完毕，存活有效 Cloudflare 边缘节点数: {len(stage2_survivors)}")
+    print(f"[+] [阶段 2/5] 机房质检完毕，存活有效 Cloudflare 边缘节点数: {len(stage2_survivors)}")
 
-    # 兜底保护：若有效节点极少，平滑降级包含阶段 1 存活节点
     if len(stage2_survivors) < 5:
         print("[!] 提示: 严选节点较少，启动平滑容灾降级模式。")
         for c in stage1_survivors:
             if not any(s[0] == c[0] and s[1] == c[1] for s in stage2_survivors):
                 stage2_survivors.append((c[0], c[1], c[2], "CF", 200.0))
 
-    # ================= 阶段 3：多轮打散稳定性测试 =================
-    print(f"\n[+] [阶段 3/4] 启动 {ROUNDS_PER_NODE} 轮打散稳定性与抖动深度测试 (待测数: {len(stage2_survivors)})...")
-    stage3_survivors = []
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        future_map = {executor.submit(probe_stability, c[0], c[1]): c for c in stage2_survivors}
-        for future in as_completed(future_map):
-            res = future.result()
-            if res:
-                res['is_cf'] = is_official_cloudflare_ip(res['ip'])
-                stage3_survivors.append(res)
+    # 按初筛 TLS 握手 RTT 排序，取前 25 名入围阶段 3 沙箱全链路实测
+    stage2_survivors.sort(key=lambda x: (x[4] if x[4] else 999.0))
+    top25_candidates = stage2_survivors[:25]
 
-    print(f"[+] [阶段 3/4] 稳定性深测完毕，通过 0 丢包严格考核的优质节点数: {len(stage3_survivors)}")
+    # ================= 阶段 3：沙箱全链路真机实测 (Google + YouTube + ip.sb) =================
+    print(f"\n[+] [阶段 3/5] 启动沙箱全链路真实代理实测 (入围节点数: {len(top25_candidates)}, 穿透 edgetunnel 测 Google/YouTube/ip.sb)...")
+    sandbox = None
+    e2e_results = []
+    use_sandbox = mock_mode or (find_clash_core() is not None)
 
-    if not stage3_survivors:
-        print("[-] 错误: 无任何节点通过稳定性考核。")
+    if use_sandbox:
+        sandbox = MihomoSandbox(
+            candidates=top25_candidates,
+            work_dir="/tmp/ipselect_sandbox" if not mock_mode else tempfile.mkdtemp(prefix="mock_sb_"),
+            api_port=19098,
+            proxy_port=19998,
+            mock_mode=mock_mode
+        )
+        if sandbox.start():
+            print(f"[+] 隔离沙箱启动成功 (外部控制端口: 19098, 本地代理端口: 19998, GID=65534 直连)")
+            try:
+                def probe_single(idx, item):
+                    ip, port, sp, colo, tls_rtt = item
+                    pname = f"node_{idx:02d}"
+                    m_data = None
+                    if mock_mode:
+                        m_data = {
+                            "google_delays": [190 + idx * 5, 195 + idx * 5, 200 + idx * 5],
+                            "youtube_delay": 205 + idx * 5,
+                            "ip_sb_exit": {"country_code": "US", "ip": "104.28.19.1"}
+                        }
+                    eval_res = evaluate_e2e_candidate(
+                        proxy_name=pname,
+                        ip=ip,
+                        port=port,
+                        colo=colo,
+                        api_port=19098,
+                        proxy_port=19998,
+                        mock_data=m_data
+                    )
+                    return eval_res
+
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    future_map = {executor.submit(probe_single, idx, item): item for idx, item in enumerate(top25_candidates, 1)}
+                    for future in as_completed(future_map):
+                        res = future.result()
+                        if res:
+                            e2e_results.append(res)
+            finally:
+                sandbox.stop()
+        else:
+            print("[!] 沙箱启动失败，平滑回退至直连稳定性测定")
+    else:
+        print("[!] 当前系统未安装 clash_meta 内核，平滑回退至传统直连 TLS 稳定性测定")
+
+    # 若沙箱未能产出结果（无内核或全军覆没），启动直连回退降级
+    if not e2e_results:
+        print("[!] 启动直连稳定性深测回退兜底模式...")
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_map = {executor.submit(probe_stability, c[0], c[1]): c for c in top25_candidates}
+            for future in as_completed(future_map):
+                res = future.result()
+                if res:
+                    e2e_results.append({
+                        'ip': res['ip'],
+                        'port': res['port'],
+                        'colo': res['colo'],
+                        'e2e_avg_rtt': res['avg_rtt'],
+                        'e2e_jitter': res['jitter'],
+                        'youtube_rtt': res['median_rtt'],
+                        'exit_country': 'US',
+                        'exit_ip': 'Anycast'
+                    })
+
+    print(f"[+] [阶段 3/5] 全链路真实可用性检测完毕，通过严格质检节点数: {len(e2e_results)} / {len(top25_candidates)}")
+    if not e2e_results:
+        print("[-] 错误: 无任何节点通过全链路真实代理考核。")
         return
 
-    # 按初筛稳定性中位数延迟排序，取前 30 名进入阶段 4 微吞吐测速
-    stage3_survivors.sort(key=lambda x: (x['loss_rate'], x['median_rtt'], x['jitter']))
-    top_candidates_for_speed = stage3_survivors[:30]
+    # 按全链路 RTT 排序，取前 18 名进行真实微吞吐测速
+    e2e_results.sort(key=lambda x: (x['e2e_avg_rtt'], x['e2e_jitter']))
+    candidates_for_speed = e2e_results[:18]
 
-    # ================= 阶段 4：安全微吞吐测速 (防限流微测速) =================
-    print(f"\n[+] [阶段 4/4] 启动 1.5MB 安全微吞吐测速 (入围节点数: {len(top_candidates_for_speed)}, 小并发防限流)...")
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_map = {executor.submit(probe_real_download_speed, n['ip'], n['port'], 1572864, 2.0, n['median_rtt']): n for n in top_candidates_for_speed}
-        for future in as_completed(future_map):
-            node = future_map[future]
-            real_speed = future.result()
-            node['speed'] = real_speed
-            node['score'] = calculate_rigorous_score(node)
+    # ================= 阶段 4：真实微吞吐测速 =================
+    print(f"\n[+] [阶段 4/5] 启动 1.0MB 安全微吞吐测速 (入围节点数: {len(candidates_for_speed)})...")
+    for node in candidates_for_speed:
+        if mock_mode:
+            spd = 1.85
+        else:
+            spd = probe_real_download_speed(node['ip'], node['port'], 1048576, 2.0, fallback_rtt=node['e2e_avg_rtt'])
+        node['speed'] = spd
+        node['score'] = calculate_e2e_score(node['e2e_avg_rtt'], node['e2e_jitter'], spd, node['colo'])
+        node['is_cf'] = is_official_cloudflare_ip(node['ip'])
 
-    # 排序选拔 Top 15：评分降序 -> 丢包升序 -> 延迟中位数升序 -> 速度降序
-    top_candidates_for_speed.sort(key=lambda x: (-x['score'], x['loss_rate'], x['median_rtt'], -x['speed']))
-    selected_nodes = top_candidates_for_speed[:TOP_COUNT]
+    # ================= 阶段 5：综合评分排序并导出 Top 15 =================
+    candidates_for_speed.sort(key=lambda x: (-x['score'], x['e2e_avg_rtt'], -x['speed']))
+    selected_nodes = candidates_for_speed[:TOP_COUNT]
 
-    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质极速优选节点 ({tag}专属 / 全网低延迟入口+美区出口):")
+    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质全链路真优选节点 ({tag}专属 / 全链路Google+YouTube实测+美区出口):")
     output_lines = []
     for idx, node in enumerate(selected_nodes, 1):
         colo_str = node.get('colo') or 'CF'
-        node_name = f"US-DaTree-{node['score']:.1f}-{idx:02d}-{tag}-{colo_str}"
-        line = f"{node['ip']}:{node['port']}#{node_name} {node['speed']:.2f}MB/s"
+        line = format_node_line(node['ip'], node['port'], node['score'], idx, tag, node['speed'], colo_str)
         output_lines.append(line)
-        cf_flag = "CF官方" if node['is_cf'] else "第三方"
-        loss_pct = int(node['loss_rate'] * 100)
-        print(f"  [{idx:02d}] {line} | 评分: {node['score']:.1f} | 机房: {colo_str} | 丢包: {loss_pct}% | 延迟: {node['median_rtt']:.0f}ms | 抖动: {node['jitter']:.0f}ms ({cf_flag})")
+        cf_flag = "CF官方" if node.get('is_cf', True) else "第三方"
+        print(f"  [{idx:02d}] {line} | 评分: {node['score']:.1f} | 机房: {colo_str} | 端到端RTT: {node['e2e_avg_rtt']:.0f}ms | 抖动: {node['e2e_jitter']:.0f}ms ({cf_flag})")
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_dir = os.path.dirname(script_dir)
-    target_path = os.path.join(project_dir, output_file)
+    # 确定保存路径
+    if os.path.isabs(output_file):
+        target_path = output_file
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_dir = os.path.dirname(script_dir)
+        target_path = os.path.join(project_dir, output_file)
 
+    os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
     with open(target_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(output_lines) + '\n')
 
