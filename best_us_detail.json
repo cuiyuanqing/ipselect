@@ -1,0 +1,80 @@
+{
+  "file": "best_us.txt",
+  "tag": "公司",
+  "update_time": "2026-10-11 14:19:41",
+  "count": 4,
+  "sandbox_config": {
+    "enabled": true,
+    "sni": "proxy.19940407.xyz",
+    "uuid": "e295e2a9-13ad-4251-baa8-28ee1b5aeae9",
+    "path": "/",
+    "port": "443",
+    "target_country": "US"
+  },
+  "nodes": [
+    {
+      "index": 1,
+      "ip": "172.64.67.117",
+      "port": "8443",
+      "colo": "LAX",
+      "score": 4.1,
+      "speed": 0.55,
+      "e2e_avg_rtt": 1562.0,
+      "e2e_jitter": 60.0,
+      "youtube_rtt": 3200.0,
+      "youtube_status": "ok",
+      "exit_country": "US",
+      "exit_ip": "104.28.166.42",
+      "is_cf": true,
+      "remark": "US-DaTree-4.1-01-公司 0.55MB/s"
+    },
+    {
+      "index": 2,
+      "ip": "104.18.166.129",
+      "port": "8443",
+      "colo": "SJC",
+      "score": 3.0,
+      "speed": 0.51,
+      "e2e_avg_rtt": 1825.7,
+      "e2e_jitter": 823.0,
+      "youtube_rtt": 2676.0,
+      "youtube_status": "ok",
+      "exit_country": "US",
+      "exit_ip": "104.28.157.119",
+      "is_cf": true,
+      "remark": "US-DaTree-3.0-02-公司 0.51MB/s"
+    },
+    {
+      "index": 3,
+      "ip": "104.26.8.117",
+      "port": "8443",
+      "colo": "SEA",
+      "score": 2.1,
+      "speed": 0.25,
+      "e2e_avg_rtt": 1796.0,
+      "e2e_jitter": 475.0,
+      "youtube_rtt": 3701.0,
+      "youtube_status": "ok",
+      "exit_country": "US",
+      "exit_ip": "104.28.153.5",
+      "is_cf": true,
+      "remark": "US-DaTree-2.1-03-公司 0.25MB/s"
+    },
+    {
+      "index": 4,
+      "ip": "172.67.166.186",
+      "port": "8443",
+      "colo": "SEA",
+      "score": 1.8,
+      "speed": 0.08,
+      "e2e_avg_rtt": 1960.0,
+      "e2e_jitter": 599.0,
+      "youtube_rtt": 3483.0,
+      "youtube_status": "ok",
+      "exit_country": "US",
+      "exit_ip": "104.28.160.75",
+      "is_cf": true,
+      "remark": "US-DaTree-1.8-04-公司 0.08MB/s"
+    }
+  ]
+}
