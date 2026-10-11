@@ -22,3 +22,17 @@ Cloudflare 节点优选与订阅自动化维护仓库。
 ## 🛠 本地工具脚本
 * 节点筛选脚本：[`scripts/filter_us_nodes.py`](./scripts/filter_us_nodes.py)
 * 自动化工作流：[`.github/workflows/update_us_nodes.yml`](./.github/workflows/update_us_nodes.yml)
+
+## 阶段 4 真实吞吐测速（v1.4.0+）
+
+默认参数：5 秒 × 2 轮 / 节点内并发 3 / 节点间并发 4 / 429 重试 1 次 / 单 IP 累计下载 80MB。
+
+| UCI 选项 | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| `speed_test_duration` | `SPEED_TEST_DURATION` | 5 | 单节点测速时间窗(秒)，越大越准 |
+| `speed_test_parallel` | `SPEED_TEST_PARALLEL` | 3 | 节点内并发下载数 |
+| `speed_test_node_concurrency` | `SPEED_TEST_NODE_CONCURRENCY` | 4 | 同时测速的节点数 |
+| `speed_test_max_retry` | `SPEED_TEST_MAX_RETRY` | 1 | 429/1020 重试次数 |
+| `speed_test_max_bytes_per_ip` | `SPEED_TEST_MAX_BYTES_PER_IP` | 80 | 单 IP 累计下载上限(MB) |
+
+**总耗时估算**：30 节点 × (5s + 1s + 5s) / 4 并发 ≈ 75-90 秒。
