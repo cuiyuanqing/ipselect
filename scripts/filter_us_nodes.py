@@ -44,6 +44,7 @@ SPEED_TEST_DURATION = int(os.environ.get("SPEED_TEST_DURATION", "5"))
 SPEED_TEST_PARALLEL = int(os.environ.get("SPEED_TEST_PARALLEL", "3"))
 SPEED_TEST_NODE_CONCURRENCY = int(os.environ.get("SPEED_TEST_NODE_CONCURRENCY", "4"))
 SPEED_TEST_MAX_RETRY = int(os.environ.get("SPEED_TEST_MAX_RETRY", "1"))
+# 环境变量名沿用 UCI key SPEED_TEST_MAX_BYTES_PER_IP（单位 MB）；Python 内部用 _MB 后缀避免与字节常量混淆
 SPEED_TEST_MAX_BYTES_MB = int(os.environ.get("SPEED_TEST_MAX_BYTES_PER_IP", "80"))
 ROUNDS_PER_NODE = 6
 THREAD_WORKERS = 25
