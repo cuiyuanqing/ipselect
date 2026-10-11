@@ -1045,46 +1045,30 @@ return view.extend({
 		o.rmempty = true;
 
 		/* v1.4.0+ 阶段 4 改为过隧道 + 时长 + 并发测速；speed_test_* 参数决定测速精度与耗时。 */
-		s.field('Value', 'speed_test_duration', __('单节点测速时长(秒)'), {
-			datatype: 'uinteger',
-			default: 5,
-			min: 1,
-			max: 30,
-			placeholder: '默认 5，建议 3-8',
-			optional: true,
-		});
-		s.field('Value', 'speed_test_parallel', __('单节点并发下载数'), {
-			datatype: 'uinteger',
-			default: 3,
-			min: 1,
-			max: 8,
-			placeholder: '默认 3，建议 2-4',
-			optional: true,
-		});
-		s.field('Value', 'speed_test_node_concurrency', __('同时测速节点数'), {
-			datatype: 'uinteger',
-			default: 4,
-			min: 1,
-			max: 8,
-			placeholder: '默认 4，CPU 受限可调低',
-			optional: true,
-		});
-		s.field('Value', 'speed_test_max_retry', __('429/1020 重试次数'), {
-			datatype: 'uinteger',
-			default: 1,
-			min: 0,
-			max: 3,
-			placeholder: '默认 1，超过即弃用该节点',
-			optional: true,
-		});
-		s.field('Value', 'speed_test_max_bytes_per_ip', __('单 IP 累计下载上限(MB)'), {
-			datatype: 'uinteger',
-			default: 80,
-			min: 10,
-			max: 500,
-			placeholder: '默认 80，越大越准但越慢',
-			optional: true,
-		});
+		o = s.option(form.Value, 'speed_test_duration', _('单节点测速时长(秒)'), _('单节点 5 秒时间窗 × 2 轮取中位；越大越准但任务耗时变长 (默认 5，建议 3-8)'));
+		o.default = '5';
+		o.placeholder = '5';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'speed_test_parallel', _('单节点并发下载数'), _('节点内并发 HTTP GET 数；贴 YouTube 实际连接数 (默认 3，建议 2-4)'));
+		o.default = '3';
+		o.placeholder = '3';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'speed_test_node_concurrency', _('同时测速节点数'), _('阶段 4 同时并行测速的节点数；CPU 受限可调低 (默认 4)'));
+		o.default = '4';
+		o.placeholder = '4';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'speed_test_max_retry', _('429/1020 重试次数'), _('节点测速命中 Cloudflare 限流时的重试次数；超过即弃用该节点 (默认 1)'));
+		o.default = '1';
+		o.placeholder = '1';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'speed_test_max_bytes_per_ip', _('单 IP 累计下载上限(MB)'), _('节点测速累计下载字节上限；远低于任何 edge 反爬阈值 (默认 80)'));
+		o.default = '80';
+		o.placeholder = '80';
+		o.rmempty = true;
 
 		var tabSettings = E('div', {
 			'data-tab': 'settings',
