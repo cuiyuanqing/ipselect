@@ -38,6 +38,26 @@ class TestFullPipelineMock(unittest.TestCase):
         self.assertIn("#US-测试-", lines[0])
         self.assertIn("-测试", lines[0])
 
+    def test_full_pipeline_mock_has_speed_field(self):
+        """mock 流水线最终节点应包含 speed 字段且非 None"""
+        out_file = os.path.join(self.test_dir, "test_best2.txt")
+        detail_file = out_file.replace(".txt", "_detail.json")
+        run_filter_and_export(
+            tag="速度",
+            output_file=out_file,
+            mock_mode=True,
+            mock_candidates=[
+                ("104.16.222.118", 8443, 0.0),
+                ("104.18.223.253", 8443, 0.0),
+            ],
+        )
+        import json
+        with open(detail_file, "r", encoding="utf-8") as f:
+            detail = json.load(f)
+        self.assertGreater(len(detail["nodes"]), 0)
+        self.assertIn("speed", detail["nodes"][0])
+        self.assertIsNotNone(detail["nodes"][0]["speed"])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -40,6 +40,11 @@ STAGE2_ENTRY_LIMIT = int(os.environ.get("STAGE2_ENTRY_LIMIT", "75"))
 STAGE4_SPEED_LIMIT = int(os.environ.get("STAGE4_SPEED_LIMIT", "30"))
 # 随机采样 Cloudflare Anycast 候选数（edgetunnel 在线优选同机制，用于扩充到数千候选）
 RANDOM_CF_COUNT = int(os.environ.get("RANDOM_CF_COUNT", "1500"))
+SPEED_TEST_DURATION = int(os.environ.get("SPEED_TEST_DURATION", "5"))
+SPEED_TEST_PARALLEL = int(os.environ.get("SPEED_TEST_PARALLEL", "3"))
+SPEED_TEST_NODE_CONCURRENCY = int(os.environ.get("SPEED_TEST_NODE_CONCURRENCY", "4"))
+SPEED_TEST_MAX_RETRY = int(os.environ.get("SPEED_TEST_MAX_RETRY", "1"))
+SPEED_TEST_MAX_BYTES_MB = int(os.environ.get("SPEED_TEST_MAX_BYTES_PER_IP", "80"))
 ROUNDS_PER_NODE = 6
 THREAD_WORKERS = 25
 
@@ -1514,23 +1519,49 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     e2e_results.sort(key=lambda x: (x['e2e_avg_rtt'], x['e2e_jitter']))
     candidates_for_speed = e2e_results[:STAGE4_SPEED_LIMIT]
 
-    # ================= 阶段 4：真实微吞吐测速 =================
-    print(f"\n[+] [阶段 4/5] 启动 1.0MB 安全微吞吐测速 (入围节点数: {len(candidates_for_speed)})...")
+    # ================= 阶段 4：过隧道真实吞吐测速（方向 A） =================
+    print(f"\n[+] [阶段 4/5] 启动过隧道真实吞吐测速 (时长 {SPEED_TEST_DURATION}s×2轮 / 并发 {SPEED_TEST_PARALLEL} / 入围 {len(candidates_for_speed)} 节点)...")
+
+    def _probe_one_node(node, mock_speed_value):
+        if mock_mode:
+            res = probe_throughput_speed(
+                ip=node["ip"], port=node["port"],
+                mock_speed=mock_speed_value,
+                duration=SPEED_TEST_DURATION,
+                parallel=SPEED_TEST_PARALLEL,
+                max_retry=SPEED_TEST_MAX_RETRY,
+                max_bytes_per_ip=SPEED_TEST_MAX_BYTES_MB * 1024 * 1024,
+            )
+        else:
+            res = probe_throughput_speed(
+                ip=node["ip"], port=node["port"],
+                duration=SPEED_TEST_DURATION,
+                parallel=SPEED_TEST_PARALLEL,
+                max_retry=SPEED_TEST_MAX_RETRY,
+                max_bytes_per_ip=SPEED_TEST_MAX_BYTES_MB * 1024 * 1024,
+                proxy_port=19998,
+            )
+        node["speed"] = res["speed"]
+        node["speed_p90"] = res["p90"]
+        node["speed_stddev"] = res["stddev"]
+        node["speed_samples"] = res["samples"]
+        node["speed_status"] = res["status"]
+        if res["status"] != "ok":
+            node["speed"] = 0.0
+        base_score = calculate_e2e_score(node["e2e_avg_rtt"], node["e2e_jitter"], node["speed"], node.get("colo"))
+        if res["stddev"] > 3.0:
+            base_score = max(0.0, base_score - 0.5)
+        node["score"] = base_score
+        node["is_cf"] = is_official_cloudflare_ip(node["ip"])
+
     if mock_mode:
-        for node in candidates_for_speed:
-            spd = 1.85
-            node['speed'] = spd
-            node['score'] = calculate_e2e_score(node['e2e_avg_rtt'], node['e2e_jitter'], spd, node['colo'])
-            node['is_cf'] = is_official_cloudflare_ip(node['ip'])
+        for idx, node in enumerate(candidates_for_speed, 1):
+            _probe_one_node(node, mock_speed_value=2.5 + idx * 0.3)
     else:
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            future_map = {executor.submit(probe_real_download_speed, n['ip'], n['port'], 1048576, 2.0, fallback_rtt=n['e2e_avg_rtt']): n for n in candidates_for_speed}
-            for future in as_completed(future_map):
-                node = future_map[future]
-                spd = future.result()
-                node['speed'] = spd
-                node['score'] = calculate_e2e_score(node['e2e_avg_rtt'], node['e2e_jitter'], spd, node['colo'])
-                node['is_cf'] = is_official_cloudflare_ip(node['ip'])
+        with ThreadPoolExecutor(max_workers=SPEED_TEST_NODE_CONCURRENCY) as executor:
+            futures = [executor.submit(_probe_one_node, n, None) for n in candidates_for_speed]
+            for f in as_completed(futures):
+                pass
 
     # ================= 阶段 5：综合评分排序并导出 Top 15 =================
     candidates_for_speed.sort(key=lambda x: (-x['score'], x['e2e_avg_rtt'], -x['speed']))
