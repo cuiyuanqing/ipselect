@@ -185,9 +185,10 @@ EOF
                         git remote set-url origin "$AUTH_URL" 2>/dev/null || git remote add origin "$AUTH_URL" 2>/dev/null || true
                     fi
                     git config pull.rebase true 2>/dev/null || true
+                    git config rebase.autoStash true 2>/dev/null || true
                     git rebase --abort 2>/dev/null || true
-                    echo "[*] 同步远程最新代码 (git pull --rebase origin ${GITHUB_BRANCH})..." >> "$LOG_FILE"
-                    if ! run_git_masked pull --rebase origin "$GITHUB_BRANCH"; then
+                    echo "[*] 同步远程最新代码 (git pull --rebase --autostash origin ${GITHUB_BRANCH})..." >> "$LOG_FILE"
+                    if ! run_git_masked pull --rebase --autostash origin "$GITHUB_BRANCH"; then
                         echo "[!] 变基拉取遇到冲突或异常，自动清理未决状态..." >> "$LOG_FILE"
                         git rebase --abort 2>/dev/null || true
                     fi
@@ -225,7 +226,7 @@ EOF
                             GIT_STATUS="pushed"
                         else
                             echo "[*] 首次推送失败 (远端可能存在新提交)，尝试变基拉取后重试推送..." >> "$LOG_FILE"
-                            if run_git_masked pull --rebase origin "$GITHUB_BRANCH" && run_git_masked push origin "$GITHUB_BRANCH"; then
+                            if run_git_masked pull --rebase --autostash origin "$GITHUB_BRANCH" && run_git_masked push origin "$GITHUB_BRANCH"; then
                                 echo "[+] 变基后成功推送到 GitHub 远程仓库！" >> "$LOG_FILE"
                                 GIT_STATUS="pushed"
                             else
