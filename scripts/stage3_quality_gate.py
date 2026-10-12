@@ -78,21 +78,17 @@ class StabilityResult:
 
 # ==================== v4 强制上下文 ====================
 class IPv4OnlyContext:
-    """临时把 socket.getaddrinfo 锁到 AF_INET,避免 v6 路径干扰 v4 客户端判定"""
-    _original = None
-
+    """临时把 socket.getaddrinfo 锁到 AF_INET, 避免 v6 路径干扰 v4 客户端判定"""
     def __enter__(self):
-        if IPv4OnlyContext._original is None:
-            IPv4OnlyContext._original = socket.getaddrinfo
+        self._original = socket.getaddrinfo
         def v4_only(host, port, *args, **kwargs):
-            results = IPv4OnlyContext._original(host, port, *args, **kwargs)
+            results = self._original(host, port, *args, **kwargs)
             return [ai for ai in results if ai[0] == socket.AF_INET]
         socket.getaddrinfo = v4_only
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        socket.getaddrinfo = IPv4OnlyContext._original
-        IPv4OnlyContext._original = None
+        socket.getaddrinfo = self._original
         return False
 
 
