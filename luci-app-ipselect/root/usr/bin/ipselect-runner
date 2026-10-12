@@ -204,6 +204,17 @@ EOF
             fi
         fi
         
+        # [防御] v5 同步校验: 远端 scripts 若是 v1(含 speed.cloudflare.com 测速源),强制覆盖本地工作区
+        #   背景: v1 测速源 self-test 会得到 0.00MB/s,见 docs/lessons_learned_speedtest_v5.md §六
+        _REMOTE_HASH=$(run_git_masked ls-tree "origin/${GITHUB_BRANCH}" scripts/filter_us_nodes.py 2>/dev/null | awk '{print $3}' | head -1)
+        if [ -n "$_REMOTE_HASH" ]; then
+            _HAS_V1_CF_SOURCE=$(run_git_masked cat-file blob "$_REMOTE_HASH" 2>/dev/null | grep -c 'speed.cloudflare.com' || true)
+            if [ "${_HAS_V1_CF_SOURCE:-0}" -gt 0 ]; then
+                echo "[!] 防御性检测: 远端 scripts 仍是 v1(含 speed.cloudflare.com 测速源),强制覆盖本地以避免再次产出 0.00MB/s..." >> "$LOG_FILE"
+                git checkout "origin/${GITHUB_BRANCH}" -- scripts/filter_us_nodes.py 2>/dev/null || true
+            fi
+        fi
+
         echo "[*] 开始执行节点筛选测速: --tag ${ENV_TAG} --output ${OUTPUT_FILE} --interface ${INTERFACE} --sni ${VLESS_SNI} --target-country ${TARGET_COUNTRY} --sandbox ${SANDBOX_ENABLE}..." >> "$LOG_FILE"
         if python3 scripts/filter_us_nodes.py --tag "$ENV_TAG" --output "$OUTPUT_FILE" --interface "$INTERFACE" --sni "$VLESS_SNI" --uuid "$VLESS_UUID" --path "$VLESS_PATH" --port "$VLESS_PORT" --target-country "$TARGET_COUNTRY" --sandbox "$SANDBOX_ENABLE" >> "$LOG_FILE" 2>&1; then
             echo "[+] 节点筛选测速完成！" >> "$LOG_FILE"
@@ -233,13 +244,52 @@ EOF
             [ -f "$DETAIL_FILE" ] && git add "$DETAIL_FILE"
             if ! git diff --staged --quiet; then
                 git commit -m "auto: iStoreOS 节点优选更新 [$(date '+%Y-%m-%d %H:%M:%S')]" >> "$LOG_FILE" 2>&1
-                if run_git_masked push origin "$GITHUB_BRANCH"; then
-                    echo "[+] 成功推送到 GitHub 远程仓库！" >> "$LOG_FILE"
+
+                # [强化 1] 推送前主动 fetch + rebase,避免 commit 后才发现非快进而被拒
+                run_git_masked fetch origin "$GITHUB_BRANCH" >> "$LOG_FILE" 2>&1 || true
+                if run_git_masked push origin "$GITHUB_BRANCH" >> "$LOG_FILE" 2>&1; then
+                    echo "[+] 首次推送成功！" >> "$LOG_FILE"
                     GIT_STATUS="pushed"
                 else
-                    echo "[*] 首次推送失败 (远端可能存在新提交)，尝试变基拉取后重试推送..." >> "$LOG_FILE"
-                    if run_git_masked pull --rebase --autostash origin "$GITHUB_BRANCH" && run_git_masked push origin "$GITHUB_BRANCH"; then
-                        echo "[+] 变基后成功推送到 GitHub 远程仓库！" >> "$LOG_FILE"
+                    echo "[*] 首次推送失败,拉取远端并解决机器生成文件冲突..." >> "$LOG_FILE"
+                    # [强化 2] 机器生成文件冲突时永远保留 ours(本地最新跑出来的数据一定比远端旧值更准)
+                    if run_git_masked pull --rebase --autostash origin "$GITHUB_BRANCH" >> "$LOG_FILE" 2>&1; then
+                        if grep -q "<<<<<<< " "$OUTPUT_FILE" 2>/dev/null; then
+                            echo "[*] 检测到 ${OUTPUT_FILE} 冲突标记,保留本地最新数据 (checkout --ours)..." >> "$LOG_FILE"
+                            git checkout --ours -- "$OUTPUT_FILE" 2>/dev/null
+                            [ -f "$DETAIL_FILE" ] && git checkout --ours -- "$DETAIL_FILE" 2>/dev/null
+                            git add "$OUTPUT_FILE" "$DETAIL_FILE" 2>/dev/null
+                        fi
+                    else
+                        # rebase 也失败 → abort,直接 fetch 后用本地 ours 强制重置机器文件
+                        echo "[!] rebase 失败,强制同步:保留本地 ${OUTPUT_FILE} 最新数据,丢弃远端旧值..." >> "$LOG_FILE"
+                        git rebase --abort 2>/dev/null || true
+                        run_git_masked fetch origin "$GITHUB_BRANCH" >> "$LOG_FILE" 2>&1 || true
+                        git checkout "origin/${GITHUB_BRANCH}" -- . 2>/dev/null
+                        # 把本地最新文件写回(机器文件本地永远准)
+                        [ -f "$OUTPUT_FILE" ] && git add "$OUTPUT_FILE"
+                        [ -f "$DETAIL_FILE" ] && git add "$DETAIL_FILE"
+                        git commit -m "auto: iStoreOS 节点优选更新 (rebase 冲突后强制 ours) [$(date '+%Y-%m-%d %H:%M:%S')]" >> "$LOG_FILE" 2>&1 || true
+                    fi
+
+                    # [强化 3] 推送重试 3 次(间隔 5/10/15s)
+                    _PUSHED=0
+                    for _attempt in 1 2 3; do
+                        if run_git_masked push origin "$GITHUB_BRANCH" >> "$LOG_FILE" 2>&1; then
+                            echo "[+] 第 ${_attempt} 次推送成功！" >> "$LOG_FILE"
+                            _PUSHED=1
+                            break
+                        else
+                            if [ "$_attempt" -lt 3 ]; then
+                                _wait=$((_attempt * 5))
+                                echo "[!] 第 ${_attempt} 次推送失败,${_wait}s 后重试..." >> "$LOG_FILE"
+                                sleep "$_wait"
+                            else
+                                echo "[!] 第 ${_attempt} 次推送失败,放弃重试" >> "$LOG_FILE"
+                            fi
+                        fi
+                    done
+                    if [ "$_PUSHED" -eq 1 ]; then
                         GIT_STATUS="pushed"
                     else
                         echo "[!] 推送到 GitHub 失败！" >> "$LOG_FILE"
@@ -251,13 +301,18 @@ EOF
                 echo "[*] 节点未发生变动，无需推送" >> "$LOG_FILE"
                 GIT_STATUS="unchanged"
             fi
+            # [强化 4] 推送未成功时改 STATUS,禁止 OpenClash 联动使用未推送的脏文件
+            if [ "$AUTO_PUSH" = "1" ] && [ "$GIT_STATUS" = "error" ]; then
+                echo "[!] 推送失败,降级 STATUS=push_failed 阻止 OpenClash 联动误用本地脏文件" >> "$LOG_FILE"
+                STATUS="push_failed"
+            fi
         fi
     else
         echo "[!] 错误: 工作目录 $WORKDIR 不存在！" >> "$LOG_FILE"
         STATUS="failed"
     fi
 
-    if [ "$STATUS" = "success" ] && [ "$OPENCLASH_SYNC" = "1" ]; then
+    if [ "$STATUS" = "success" ] && [ "$GIT_STATUS" = "pushed" ] && [ "$OPENCLASH_SYNC" = "1" ]; then
         echo "[*] 联动触发 OpenClash 订阅更新..." >> "$LOG_FILE"
         OC_HOOK="${BASE_ROOT}/usr/bin/update_openclash_sub.sh"
         [ ! -x "$OC_HOOK" ] && OC_HOOK="/usr/bin/update_openclash_sub.sh"
