@@ -178,3 +178,88 @@ def probe_real_youtube_page(proxy_name: str, ip: str, port: int,
         else:
             last_err = err
     return ProbeResult(ok=False, error=last_err, attempt=1, duration_ms=duration_ms)
+
+
+# ==================== 60s/30s 区间稳定性 ====================
+def probe_60s_stability(proxy_name: str, ip: str, port: int,
+                        api_port: int = 19098) -> StabilityResult:
+    """
+    60s 连续区间真实页面稳定性测试 (Google + YouTube 同步探测)
+
+    - 12 次采样, 间隔 5s
+    - 每次同时测 google.com + youtube.com
+    - 12 次中至少 11 次两边都过 → 稳定
+    """
+    return _stability_worker(
+        proxy_name, ip, port,
+        api_port=api_port,
+        interval_sec=PROBE_INTERVAL_SEC,
+        total_rounds=PROBE_TOTAL_ROUNDS,
+        pass_threshold=PROBE_PASS_THRESHOLD,
+        window_sec=60,
+    )
+
+
+def probe_30s_stability(proxy_name: str, ip: str, port: int,
+                        api_port: int = 19098) -> StabilityResult:
+    """
+    30s 降级区间真实页面稳定性测试 (Google + YouTube 同步探测)
+
+    - 10 次采样, 间隔 3s
+    - 每次同时测 google.com + youtube.com
+    - 10 次中至少 9 次两边都过 → 稳定
+    """
+    return _stability_worker(
+        proxy_name, ip, port,
+        api_port=api_port,
+        interval_sec=DEGRADED_INTERVAL_SEC,
+        total_rounds=DEGRADED_TOTAL_ROUNDS,
+        pass_threshold=DEGRADED_PASS_THRESHOLD,
+        window_sec=30,
+    )
+
+
+def _stability_worker(proxy_name: str, ip: str, port: int,
+                      api_port: int, interval_sec: float, total_rounds: int,
+                      pass_threshold: int, window_sec: int) -> StabilityResult:
+    """区间密集采样的核心 worker, 同步 Google + YouTube"""
+    start = time.time()
+    passed = 0
+    failed_rounds: list = []
+    google_ok_count = 0
+    youtube_ok_count = 0
+    for round_idx in range(total_rounds):
+        if round_idx > 0:
+            time.sleep(interval_sec)
+        g = probe_real_google_page(proxy_name, ip, port, api_port=api_port)
+        y = probe_real_youtube_page(proxy_name, ip, port, api_port=api_port)
+        if g.ok:
+            google_ok_count += 1
+        if y.ok:
+            youtube_ok_count += 1
+        if g.ok and y.ok:
+            passed += 1
+        else:
+            failed_rounds.append({
+                'round': round_idx,
+                'google_ok': g.ok,
+                'youtube_ok': y.ok,
+                'google_err': g.error if not g.ok else "",
+                'youtube_err': y.error if not y.ok else "",
+            })
+    duration_ms = int((time.time() - start) * 1000)
+    pass_rate = passed / total_rounds
+    return StabilityResult(
+        proxy_name=proxy_name,
+        ip=ip,
+        port=port,
+        passed=passed,
+        total=total_rounds,
+        pass_rate=pass_rate,
+        failed_rounds=failed_rounds,
+        is_stable=passed >= pass_threshold,
+        window_sec=window_sec,
+        duration_ms=duration_ms,
+        google_pass_rate=google_ok_count / total_rounds,
+        youtube_pass_rate=youtube_ok_count / total_rounds,
+    )
