@@ -330,7 +330,11 @@ EOF
         STATUS="failed"
     fi
 
-    if [ "$STATUS" = "success" ] && [ "$GIT_STATUS" = "pushed" ] && [ "$OPENCLASH_SYNC" = "1" ]; then
+    # v2 阶段 3 真实质量门: 接受 success 和 quality_downgraded 状态
+    # quality_downgraded 表示走了 204 兜底, best_us.txt 内容仍可信
+    # no_quality 状态: 不推送, 不联动 OpenClash
+    if [ "$GIT_STATUS" = "pushed" ] && [ "$OPENCLASH_SYNC" = "1" ] && \
+       { [ "$STATUS" = "success" ] || [ "$STATUS" = "quality_downgraded" ]; }; then
         echo "[*] 联动触发 OpenClash 订阅更新..." >> "$LOG_FILE"
         OC_HOOK="${BASE_ROOT}/usr/bin/update_openclash_sub.sh"
         [ ! -x "$OC_HOOK" ] && OC_HOOK="/usr/bin/update_openclash_sub.sh"
