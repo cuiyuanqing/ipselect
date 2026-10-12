@@ -30,6 +30,7 @@ import shutil
 import json
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
 SNI_HOST = "proxy.19940407.xyz"
 TOP_COUNT = 15
@@ -476,14 +477,75 @@ def probe_ip_sb_exit(proxy_port: int = 19998, timeout: float = 3.5, mock_exit: d
     return False, "", ""
 
 
-def evaluate_e2e_candidate(proxy_name: str, ip: str, port: int, colo: str, api_port: int = 19098, proxy_port: int = 19998, mock_data: dict = None, target_country: str = "US"):
+def evaluate_node_quality_v2(proxy_name: str, ip: str, port: int, colo: str,
+                              api_port: int = 19098, proxy_port: int = 19998,
+                              target_country: str = "US",
+                              stability_result=None) -> Optional[dict]:
     """
-    对单个入围候选节点执行端到端全链路多维评估：
-    1. Google 204 多轮 RTT 与抖动测试 (一票淘汰：丢包率 >= 30%)
-    2. YouTube 204 连通性测试 (一票淘汰：连接失败)
-    3. ip.sb 出口落地国家与纯净度质检 (一票淘汰：非 target_country 出口)
-    若任意环节触犯红线，返回 None；否则返回评测指标字典。
+    阶段 3 真实质量门 v2 — 薄壳包装
+
+    判定逻辑:
+    1. 真实页面 60s 区间稳定性 (Google + YouTube 同步) — 必须
+    2. ip.sb 出口国家 = target_country — 必须
     """
+    from stage3_quality_gate import probe_60s_stability, IPv4OnlyContext
+
+    # 1. 60s 区间稳定性 (由上游并发预跑, 这里直接复用)
+    if stability_result is None:
+        # 兜底: 单节点跑 60s (不推荐, 耗时长)
+        with IPv4OnlyContext():
+            stability_result = probe_60s_stability(proxy_name, ip, port, api_port=api_port)
+    if not stability_result.is_stable:
+        return None
+
+    # 2. ip.sb 出口国家 (沿用原 switch + probe_ip_sb_exit 逻辑)
+    switch_sandbox_proxy(proxy_name, api_port=api_port)
+    is_match_country, exit_country, exit_ip = probe_ip_sb_exit(
+        proxy_port=proxy_port, timeout=3.0, target_country=target_country
+    )
+    if not is_match_country:
+        return None
+
+    # 3. e2e_avg_rtt 估算 (用稳定性测试中 Google 探测的中位耗时)
+    avg_rtt = (stability_result.duration_ms / stability_result.total / 2) if stability_result.total else 0.0
+    return {
+        'proxy_name': proxy_name,
+        'ip': ip,
+        'port': port,
+        'colo': colo,
+        'e2e_avg_rtt': avg_rtt,
+        'e2e_jitter': 0.0,
+        'youtube_rtt': 0.0,
+        'exit_ip': exit_ip,
+        'exit_country': exit_country,
+        'quality_gate_version': 2,
+        'real_page_pass_rate': stability_result.pass_rate,
+        'real_page_failed_rounds': stability_result.failed_rounds,
+        'stability_window_sec': stability_result.window_sec,
+    }
+
+
+def evaluate_e2e_candidate(proxy_name: str, ip: str, port: int, colo: str,
+                            api_port: int = 19098, proxy_port: int = 19998,
+                            mock_data: dict = None, target_country: str = "US"):
+    """
+    向后兼容旧调用方:
+    - mock_data 路径: 走纯 mock (旧 204 逻辑)
+    - 真实路径: 委托给 evaluate_node_quality_v2
+    """
+    if mock_data:
+        # mock 模式 - 保留旧行为, 不引入真实探测
+        return _evaluate_e2e_candidate_mock(
+            proxy_name, ip, port, colo, api_port, proxy_port, mock_data, target_country
+        )
+    return evaluate_node_quality_v2(
+        proxy_name, ip, port, colo, api_port, proxy_port, target_country
+    )
+
+
+def _evaluate_e2e_candidate_mock(proxy_name, ip, port, colo, api_port, proxy_port,
+                                   mock_data, target_country):
+    """mock 模式 - 完整保留 evaluate_e2e_candidate 旧 204 逻辑"""
     google_delays = []
     if mock_data and "google_delays" in mock_data:
         raw_delays = mock_data["google_delays"]
@@ -492,7 +554,6 @@ def evaluate_e2e_candidate(proxy_name: str, ip: str, port: int, colo: str, api_p
     else:
         total_rounds = 3
         for idx in range(total_rounds):
-            # 提前失败截断：若丢包次数已达 2 次，不可能满足 >= 2 次成功，立即淘汰
             if (idx - len(google_delays)) >= 2:
                 return None
             if idx > 0:
@@ -501,23 +562,19 @@ def evaluate_e2e_candidate(proxy_name: str, ip: str, port: int, colo: str, api_p
             if d is not None:
                 google_delays.append(d)
 
-    # 1. Google 连通性一票否决：成功轮次 < 2 (丢包率 >= 30%)
     if len(google_delays) < (total_rounds - 1):
         return None
 
     e2e_avg_rtt = sum(google_delays) / len(google_delays)
     e2e_jitter = (max(google_delays) - min(google_delays)) if len(google_delays) > 1 else 0.0
 
-    # 2. YouTube 连通性一票否决
     if mock_data and "youtube_delay" in mock_data:
         yt_delay = mock_data["youtube_delay"]
     else:
         yt_delay = probe_e2e_delay(proxy_name, YOUTUBE_204_URL, api_port=api_port, timeout_ms=4500)
-
     if yt_delay is None or yt_delay <= 0:
         return None
 
-    # 3. ip.sb 出口归属一票否决
     mock_exit = mock_data.get("ip_sb_exit") if mock_data else None
     if not mock_data:
         switch_sandbox_proxy(proxy_name, api_port=api_port)
@@ -534,7 +591,8 @@ def evaluate_e2e_candidate(proxy_name: str, ip: str, port: int, colo: str, api_p
         'e2e_jitter': e2e_jitter,
         'youtube_rtt': yt_delay,
         'exit_ip': exit_ip,
-        'exit_country': exit_country
+        'exit_country': exit_country,
+        'quality_gate_version': 1,  # mock 路径仍用 v1 标记
     }
 
 
