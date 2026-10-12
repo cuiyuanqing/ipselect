@@ -94,3 +94,91 @@ class IPv4OnlyContext:
         socket.getaddrinfo = IPv4OnlyContext._original
         IPv4OnlyContext._original = None
         return False
+
+
+# ==================== 真实页面探测 ====================
+def fetch_homepage_html(url: str, api_port: int = 19098, max_bytes: int = MAX_BYTES_PER_PROBE,
+                         timeout_sec: float = PROBE_TIMEOUT_SEC) -> Tuple[Optional[bytes], str]:
+    """
+    通过沙箱代理拉取首 N 字节 HTML
+    返回 (html_bytes_or_None, error_message)
+    """
+    proxy_url = f"http://127.0.0.1:{api_port + 90}"  # 19998 = 19098 + 90
+    proxy_handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
+    opener = urllib.request.build_opener(proxy_handler)
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
+    })
+    try:
+        with opener.open(req, timeout=timeout_sec + 0.5) as res:
+            data = res.read(max_bytes)
+            return data, ""
+    except urllib.error.HTTPError as e:
+        return None, f"HTTPError {e.code}"
+    except urllib.error.URLError as e:
+        return None, f"URLError {e.reason}"
+    except (socket.timeout, TimeoutError):
+        return None, "timeout"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _match_title(html: bytes, patterns: List[str]) -> str:
+    """在 HTML 中找首个匹配的 title 字符串, 找到返回该 pattern, 没找到返回空串"""
+    if not html:
+        return ""
+    try:
+        text = html.decode('utf-8', errors='ignore')
+    except Exception:
+        return ""
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(0)
+    return ""
+
+
+def probe_real_google_page(proxy_name: str, ip: str, port: int,
+                            api_port: int = 19098) -> ProbeResult:
+    """单次 google.com 主页真实页面探测, 失败重试 1 次"""
+    start = time.time()
+    last_err = ""
+    duration_ms = 0
+    for attempt in (0, 1):
+        if attempt > 0:
+            time.sleep(RETRY_BACKOFF_SEC)
+        html, err = fetch_homepage_html(GOOGLE_HOMEPAGE_URL, api_port=api_port)
+        duration_ms = int((time.time() - start) * 1000)
+        if html is not None:
+            title = _match_title(html, GOOGLE_TITLE_PATTERNS)
+            if title:
+                return ProbeResult(ok=True, html_len=len(html), title_matched=title,
+                                   attempt=attempt, duration_ms=duration_ms)
+            last_err = "title_not_matched"
+        else:
+            last_err = err
+    return ProbeResult(ok=False, error=last_err, attempt=1, duration_ms=duration_ms)
+
+
+def probe_real_youtube_page(proxy_name: str, ip: str, port: int,
+                             api_port: int = 19098) -> ProbeResult:
+    """单次 youtube.com 主页真实页面探测, 失败重试 1 次"""
+    start = time.time()
+    last_err = ""
+    duration_ms = 0
+    for attempt in (0, 1):
+        if attempt > 0:
+            time.sleep(RETRY_BACKOFF_SEC)
+        html, err = fetch_homepage_html(YOUTUBE_HOMEPAGE_URL, api_port=api_port)
+        duration_ms = int((time.time() - start) * 1000)
+        if html is not None:
+            title = _match_title(html, YOUTUBE_TITLE_PATTERNS)
+            if title:
+                return ProbeResult(ok=True, html_len=len(html), title_matched=title,
+                                   attempt=attempt, duration_ms=duration_ms)
+            last_err = "title_not_matched"
+        else:
+            last_err = err
+    return ProbeResult(ok=False, error=last_err, attempt=1, duration_ms=duration_ms)
