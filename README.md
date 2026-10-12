@@ -22,6 +22,7 @@ Cloudflare 节点优选与订阅自动化维护仓库。
 ## 🛠 本地工具脚本
 * 节点筛选脚本：[`scripts/filter_us_nodes.py`](./scripts/filter_us_nodes.py)
 * 自动化工作流：[`.github/workflows/update_us_nodes.yml`](./.github/workflows/update_us_nodes.yml)
+* **阶段 4 测速 no_data 深度排障实战录**：[`docs/lessons_learned_speedtest_v5.md`](./docs/lessons_learned_speedtest_v5.md) — 三层根因（edgetunnel Worker 拒 plain HTTP / CF WAF 反爬 / CF self-test 禁忌）、v1→v5 演进、测速源白名单/黑名单、双 Mihomo 隔离架构、诊断日志体系
 
 ## 阶段 4 真实吞吐测速（v1.4.0+）
 

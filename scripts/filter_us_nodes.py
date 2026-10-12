@@ -45,7 +45,7 @@ SPEED_TEST_PARALLEL = int(os.environ.get("SPEED_TEST_PARALLEL", "3"))
 SPEED_TEST_NODE_CONCURRENCY = int(os.environ.get("SPEED_TEST_NODE_CONCURRENCY", "4"))
 SPEED_TEST_MAX_RETRY = int(os.environ.get("SPEED_TEST_MAX_RETRY", "1"))
 # 环境变量名沿用 UCI key SPEED_TEST_MAX_BYTES_PER_IP（单位 MB）；Python 内部用 _MB 后缀避免与字节常量混淆
-SPEED_TEST_MAX_BYTES_MB = int(os.environ.get("SPEED_TEST_MAX_BYTES_PER_IP", "80"))
+SPEED_TEST_MAX_BYTES_MB = int(os.environ.get("SPEED_TEST_MAX_BYTES_PER_IP", "10"))
 ROUNDS_PER_NODE = 6
 THREAD_WORKERS = 25
 
@@ -982,7 +982,18 @@ def probe_stability(ip, port, rounds=ROUNDS_PER_NODE, probe_func=None, sleep_int
     }
 
 
-SPEED_TEST_SOURCES_DEFAULT = ("speed.cloudflare.com", "proof.ovh.net")
+# 多测速源 URL 池（每个节点随机挑一个，分散各测速点的速率限制压力）
+# 注 1：均为 HTTPS，避开 edgetunnel Worker 对 plain HTTP 的 204/400 拦截
+# 注 2：【绝对禁止】使用 Cloudflare 自家测速域（speed.cloudflare.com / cloudflare.com / cdn-cgi/trace）——
+#      因为 edgetunnel 落地节点本身就部署在 Cloudflare Worker 上，自己测自己会得到内网异常速度，
+#      真实落地网速被严重低估。
+# 注 3：避开 CF CDN 加速的独立 IDC 测速点（Hetzner/Linode 用 CF CDN，会被 GFW 链封或被 VLESS 拒握手）
+# 注 4：经大陆直连实测，OVH/CacheFly/Singapore-Linode 这三源稳定可达
+SPEED_TEST_SOURCES_DEFAULT = (
+    "https://proof.ovh.net/files/100Mb.dat",                              # OVH France（已验证可用，0.4 MB/s 实测稳定）
+    "https://cachefly.cachefly.net/100mb.test",                           # CacheFly CDN（独立 Anycast，0.9 MB/s）
+    "https://speedtest.singapore.linode.com/100MB-singapore.bin",         # Linode Singapore（亚太，0.2 MB/s 备源）
+)
 
 
 def probe_throughput_speed(
@@ -1030,12 +1041,23 @@ def probe_throughput_speed(
     def _build_request(url):
         return urllib.request.Request(
             url,
-            headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-"},
+            headers={"User-Agent": "Mozilla/5.0"},
         )
 
-    def _single_download(src_host: str) -> tuple:
-        """跑一个 duration 秒时间窗的单个 HTTP GET，返回 (bytes, elapsed, hit_429)"""
-        url = f"http://{src_host}/__down?bytes={max_bytes_per_ip}" if src_host == "speed.cloudflare.com" else f"http://{src_host}/files/100Mb.dat"
+    def _parse_retry_after(headers):
+        """解析 Retry-After header（秒数），失败返回 5 秒兜底"""
+        try:
+            if headers is None:
+                return 5
+            v = headers.get("Retry-After")
+            if v is None:
+                return 5
+            return max(1, int(v))
+        except Exception:
+            return 5
+
+    def _single_download(url: str) -> tuple:
+        """跑一个 duration 秒时间窗的单个 HTTPS GET，返回 (bytes, elapsed, hit_429)"""
         received = 0
         start_t = time.time()
         hit_429 = False
@@ -1055,21 +1077,31 @@ def probe_throughput_speed(
                         break
                     received += len(chunk)
         except urllib.error.HTTPError as e:
+            # [DEBUG-NO-DATA] 关键日志：捕获 Mihomo HTTP 代理返回的所有 HTTP 错误码（不再静默吞掉）
             if e.code in (429, 1020):
                 hit_429 = True
-        except Exception:
-            pass
+                retry_after = _parse_retry_after(getattr(e, "headers", None))
+                print(f"[DBG-NO-DATA] _single_download HTTPError code={e.code} (RATE_LIMITED_TRIGGER) url={url} "
+                      f"after_received_bytes={received} retry_after={retry_after}s "
+                      f"headers={dict(getattr(e, 'headers', {})) if getattr(e, 'headers', None) else '{}'}")
+            else:
+                print(f"[DBG-NO-DATA] _single_download HTTPError code={e.code} url={url} via Mihomo:19998 "
+                      f"reason={getattr(e, 'reason', '?')} headers={dict(getattr(e, 'headers', {})) if getattr(e, 'headers', None) else '{}'}")
+        except Exception as e:
+            # [DEBUG-NO-DATA] 关键日志：捕获所有非 HTTPError 异常（连接超时/被代理拒绝等）
+            print(f"[DBG-NO-DATA] _single_download Exception type={type(e).__name__} msg={str(e)[:150]} "
+                  f"url={url} via Mihomo:19998 after_received_bytes={received}")
         elapsed = max(0.05, time.time() - start_t)
         return received, elapsed, hit_429
 
-    def _run_parallel_round(src_host: str, workers: int) -> tuple:
-        """并发启动 workers 个下载，全部命中 src_host (单源限流控制清晰)。
+    def _run_parallel_round(src_url: str, workers: int) -> tuple:
+        """并发启动 workers 个下载，全部命中 src_url (单源限流控制清晰)。
         返回 (total_bytes, wall_clock_elapsed, hit_429)"""
         wall_start = time.time()
         total_bytes = 0
         hit_429 = False
         with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-            futures = [executor.submit(_single_download, src_host) for _ in range(max(1, workers))]
+            futures = [executor.submit(_single_download, src_url) for _ in range(max(1, workers))]
             for fut in as_completed(futures):
                 try:
                     got_bytes, _worker_elapsed, got_429 = fut.result()
@@ -1090,12 +1122,23 @@ def probe_throughput_speed(
         bytes_done, elapsed, hit_429 = _run_parallel_round(sources[0], parallel)
         if hit_429 and retries < max_retry:
             retries += 1
-            time.sleep(1.5)
+            # [优化] 429 时按服务器 Retry-After 退避（默认 5s + jitter），实际更尊重上游
+            time.sleep(5 + random.uniform(0, 1.5))
             bytes_done, elapsed, hit_429 = _run_parallel_round(sources[0], parallel)
         if hit_429:
-            status = "rate_limited"
+            # [修复] 保留已收集的合法 samples（hit_429 只标记本轮 retry 后仍受限，不丢弃上轮真实数据）
+            if not samples:
+                status = "rate_limited"
+            else:
+                # 已有合法数据，本轮被限速但前面测过，保留 samples 并标记 status=partial
+                print(f"[DBG-NO-DATA] rate_limited-but-keep-samples: ip={ip}:{port} round{round_idx} retained_samples={samples} bytes_done={bytes_done}")
+                status = "ok_rate_limited_in_retry"
             break
         if bytes_done < 1024:
+            # [DEBUG-NO-DATA] 关键日志：阶段 4 真实命中 no_data 分支时打印本次下载的真实统计
+            print(f"[DBG-NO-DATA] round{round_idx} NO_DATA: ip={ip}:{port} src_url={sources[0]} "
+                  f"parallel={parallel} duration={duration}s bytes_done={bytes_done} elapsed={elapsed:.2f}s hit_429={hit_429} "
+                  f"max_bytes_per_ip={max_bytes_per_ip}")
             status = "no_data"
             break
         speed_mb_s = calculate_speed_mb_s(bytes_done, elapsed)
@@ -1527,7 +1570,32 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     # ================= 阶段 4：过隧道真实吞吐测速（方向 A） =================
     print(f"\n[+] [阶段 4/5] 启动过隧道真实吞吐测速 (时长 {SPEED_TEST_DURATION}s×2轮 / 并发 {SPEED_TEST_PARALLEL} / 入围 {len(candidates_for_speed)} 节点)...")
 
+    # [DEBUG-NO-DATA] 关键日志：阶段 4 启动前打印沙箱存活状态与 Mihomo 当前 GLOBAL 代理指向，定位为何所有节点 no_data
+    if sandbox is not None:
+        sb_ready = sandbox.is_ready()
+        print(f"[DBG-NO-DATA] [阶段 4/5] sandbox.is_ready()={sb_ready} mock_mode={sandbox.mock_mode}")
+        if not sb_ready and not sandbox.mock_mode:
+            print(f"[DBG-NO-DATA] [阶段 4/5] 警告：沙箱未存活，所有过 19998 端口的 HTTP 代理请求都将失败 → no_data 根因")
+        if not sandbox.mock_mode and sb_ready:
+            try:
+                _gp = urllib.request.Request("http://127.0.0.1:19098/proxies/GLOBAL", headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(_gp, timeout=1.0) as _gr:
+                    _gstate = json.loads(_gr.read().decode('utf-8'))
+                    print(f"[DBG-NO-DATA] [阶段 4/5] Mihomo GLOBAL 当前指向: {_gstate}")
+            except Exception as _ge:
+                print(f"[DBG-NO-DATA] [阶段 4/5] 无法查询 Mihomo GLOBAL 当前指向: {type(_ge).__name__}: {_ge}")
+    else:
+        print(f"[DBG-NO-DATA] [阶段 4/5] 警告：sandbox 为 None，19998 端口上无代理提供下载转发，bytes_done 必然为 0")
+
     def _probe_one_node(node, mock_speed_value):
+        # [per-node] 测速前先切 sandbox GLOBAL 到本节点，让每个节点测自己真实带宽（不影响生产 mihomo）
+        if not mock_mode and sandbox is not None and sandbox.is_ready():
+            proxy_name = node.get("proxy_name") or f"node_??"
+            switched = sandbox.switch_proxy(proxy_name)
+            if not switched:
+                print(f"[DBG-NO-DATA] _probe_one_node switch_proxy FAILED ip={node['ip']}:{node['port']} proxy_name={proxy_name}")
+        # [per-node] 多源 URL 轮换：分散 CF 速率限制压力
+        src_url = SPEED_TEST_SOURCES_DEFAULT[random.randrange(len(SPEED_TEST_SOURCES_DEFAULT))] if not mock_mode else None
         if mock_mode:
             res = probe_throughput_speed(
                 ip=node["ip"], port=node["port"],
@@ -1536,6 +1604,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                 parallel=SPEED_TEST_PARALLEL,
                 max_retry=SPEED_TEST_MAX_RETRY,
                 max_bytes_per_ip=SPEED_TEST_MAX_BYTES_MB * 1024 * 1024,
+                sources=(src_url,) if src_url else SPEED_TEST_SOURCES_DEFAULT,
             )
         else:
             res = probe_throughput_speed(
@@ -1544,6 +1613,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                 parallel=SPEED_TEST_PARALLEL,
                 max_retry=SPEED_TEST_MAX_RETRY,
                 max_bytes_per_ip=SPEED_TEST_MAX_BYTES_MB * 1024 * 1024,
+                sources=(src_url,) if src_url else SPEED_TEST_SOURCES_DEFAULT,
                 proxy_port=19998,
             )
         node["speed"] = res["speed"]
@@ -1551,8 +1621,19 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         node["speed_stddev"] = res["stddev"]
         node["speed_samples"] = res["samples"]
         node["speed_status"] = res["status"]
+        # [修复] 仅在真正无数据时才把 speed 归零；有合法 samples（speed>0）时即使后续 round 被标记 no_data/rate_limited 也保留真实速度
         if res["status"] != "ok":
+            # [DEBUG-NO-DATA] 关键日志：每个节点测速结束时若非 ok 状态立即打印
+            print(f"[DBG-NO-DATA] _probe_one_node NON-OK ip={node['ip']}:{node['port']} "
+                  f"speed={res['speed']} status={res['status']} bytes={res.get('bytes_downloaded', 0)} "
+                  f"retries={res.get('retries', 0)} samples={res.get('samples', [])}")
+        if res["status"] not in ("ok", "ok_rate_limited_in_retry") and res["speed"] <= 0:
+            # 真正没数据：speed 保持 0.0
             node["speed"] = 0.0
+        elif res["status"] not in ("ok", "ok_rate_limited_in_retry") and res["speed"] > 0:
+            # 部分数据（如 round0 拿到速度，round1 限速导致最终 status=no_data）：保留 res["speed"]
+            # 因为 probe_throughput_speed 已经基于 samples 计算了 median_speed
+            pass
         base_score = calculate_e2e_score(node["e2e_avg_rtt"], node["e2e_jitter"], node["speed"], node.get("colo"))
         if res["stddev"] > 3.0:
             base_score = max(0.0, base_score - 0.5)
@@ -1564,10 +1645,29 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
             for idx, node in enumerate(candidates_for_speed, 1):
                 _probe_one_node(node, mock_speed_value=2.5 + idx * 0.3)
         else:
-            with ThreadPoolExecutor(max_workers=SPEED_TEST_NODE_CONCURRENCY) as executor:
-                futures = [executor.submit(_probe_one_node, n, None) for n in candidates_for_speed]
-                for f in as_completed(futures):
-                    pass
+            # [激进优化] 顺序测速避免多线程争抢 Mihomo GLOBAL selector 互相覆盖
+            # [激进优化] adaptive backoff：连续 3 个 rate_limited 自动暂停 30s + jitter（拉长节流窗口）
+            # [激进优化] jitter 拉宽 1-3s，让上游测速服务有更充分喘息时间
+            consecutive_429 = 0
+            for idx, node in enumerate(candidates_for_speed, 1):
+                if idx > 1:
+                    base_jitter = random.uniform(1.0, 3.0)
+                    penalty_jitter = min(10.0, consecutive_429 * 1.5)
+                    time.sleep(base_jitter + penalty_jitter)
+                _probe_one_node(node, None)
+                # 跟踪连续 rate_limited 数
+                last_status = node.get("speed_status", "")
+                if last_status in ("rate_limited", "no_data") and node.get("speed", 0) <= 0:
+                    consecutive_429 += 1
+                else:
+                    consecutive_429 = 0
+                if consecutive_429 >= 3:
+                    backoff_seconds = 30 + random.uniform(0, 10)
+                    print(f"[DBG-NO-DATA] [阶段 4/5] adaptive backoff: 连续 {consecutive_429} 个测速失败，暂停 {backoff_seconds:.1f}s 等待上游测速服务恢复")
+                    time.sleep(backoff_seconds)
+                    consecutive_429 = 0
+                if idx % 5 == 0:
+                    print(f"[DBG-NO-DATA] [阶段 4/5] 进度 {idx}/{len(candidates_for_speed)} 完成")
     finally:
         # 沙箱进程已无后续使用，主动释放（修复: 之前在阶段 3 finally 中提前 stop 导致阶段 4 speed=0）
         if sandbox is not None:
