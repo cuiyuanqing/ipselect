@@ -188,13 +188,31 @@ EOF
                 git reset --hard HEAD 2>/dev/null || true
             fi
 
-            echo "[*] 同步远程最新代码 (git pull --rebase --autostash origin ${GITHUB_BRANCH})..." >> "$LOG_FILE"
-            if ! run_git_masked pull --rebase --autostash origin "$GITHUB_BRANCH"; then
-                echo "[!] 变基拉取遇到冲突或异常，自动清理并强制同步核心代码..." >> "$LOG_FILE"
-                git rebase --abort 2>/dev/null || true
-                git merge --abort 2>/dev/null || true
-                run_git_masked fetch origin "$GITHUB_BRANCH" 2>/dev/null || true
-                git checkout "origin/${GITHUB_BRANCH}" -- scripts/ 2>/dev/null || true
+            # [激进同步] 任务开始立即 fetch + reset --hard origin/$GITHUB_BRANCH
+            #   核心: 丢弃所有本地未推送 commit,强制工作区永远与远端一致
+            #   原因: 软路由 /usr/bin/ipselect-runner 是 ipk 部署的旧版,本地的脏 commit (ee7e672/4fa3593)
+            #         反复触发 rebase conflict,导致 fallback checkout scripts/ 不到位,runner 永远跑 v1
+            echo "[*] [激进同步] fetch + reset --hard origin/${GITHUB_BRANCH} (丢弃所有本地未推送 commit)..." >> "$LOG_FILE"
+            run_git_masked fetch origin "$GITHUB_BRANCH" >> "$LOG_FILE" 2>&1 || true
+            # 备份一份 best_us.txt 以防 reset 后丢失 (虽然 reset --hard 不会丢 untracked, 但保险)
+            _BACKUP_DIR="${DATA_DIR}/last_run_backup"
+            mkdir -p "$_BACKUP_DIR" 2>/dev/null || true
+            [ -f "$OUTPUT_FILE" ] && cp -f "$OUTPUT_FILE" "$_BACKUP_DIR/${OUTPUT_FILE}.pre_reset.$(date +%s)" 2>/dev/null || true
+            # 先清掉未合并状态再 reset
+            git rebase --abort 2>/dev/null || true
+            git merge --abort 2>/dev/null || true
+            if git reset --hard "origin/${GITHUB_BRANCH}" >> "$LOG_FILE" 2>&1; then
+                echo "[+] [激进同步] 工作区已强制对齐远端 origin/${GITHUB_BRANCH}" >> "$LOG_FILE"
+            else
+                echo "[!] [激进同步] reset --hard 失败,尝试 rebase 兜底..." >> "$LOG_FILE"
+                if run_git_masked pull --rebase --autostash origin "$GITHUB_BRANCH" >> "$LOG_FILE" 2>&1; then
+                    echo "[+] rebase 兜底成功" >> "$LOG_FILE"
+                else
+                    echo "[!] rebase 兜底也失败,放弃 best_us.txt 冲突用 ours 解决..." >> "$LOG_FILE"
+                    git rebase --abort 2>/dev/null || true
+                    run_git_masked fetch origin "$GITHUB_BRANCH" >> "$LOG_FILE" 2>&1 || true
+                    git checkout "origin/${GITHUB_BRANCH}" -- scripts/ 2>/dev/null || true
+                fi
             fi
 
             # 最终安全屏障：杜绝任何包含冲突标记的代码文件
