@@ -700,9 +700,12 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
         stab = stability_map.get(name)
         if stab is None:
             # 降级 2 路径: 没有 stability_result, 用 stub
+            # is_stable=True: 204 通过视为可判定通过, 让 evaluate_node_quality_v2 继续走
+            #   ip.sb 出口国家真实校验链路; total=1 配合 duration_ms=0 得 avg_rtt=0.0 避免除零
             stab = type('Stub', (), {
                 'pass_rate': 0.0, 'failed_rounds': [], 'window_sec': 0, 'duration_ms': 0,
                 'google_pass_rate': 0.0, 'youtube_pass_rate': 0.0,
+                'is_stable': True, 'total': 1,
             })()
         result = evaluate_node_quality_v2(
             proxy_name=name, ip=ip, port=port, colo=colo,
