@@ -92,14 +92,52 @@ class IPv4OnlyContext:
         return False
 
 
-# ==================== 真实页面探测 ====================
-def fetch_homepage_html(url: str, api_port: int = 19098, max_bytes: int = MAX_BYTES_PER_PROBE,
+# ==================== 沙箱控制与真实页面探测 ====================
+def switch_sandbox_proxy(proxy_name: str, api_port: int = 19098) -> bool:
+    """通过 REST API 将沙箱全局代理 (GLOBAL) 切换至指定的候选代理节点"""
+    import json
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{api_port}/proxies/GLOBAL",
+            data=json.dumps({'name': proxy_name}).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='PUT'
+        )
+        with urllib.request.urlopen(req, timeout=1.5) as res:
+            return res.status in (200, 204)
+    except Exception:
+        return False
+
+
+def probe_tunnel_delay(proxy_name: str, target_url: str, api_port: int = 19098,
+                       timeout_ms: int = 2500) -> Optional[int]:
+    """通过 Mihomo REST API 测试单个代理节点的独立端到端延迟（无并发竞争）"""
+    import json
+    import urllib.parse
+    encoded_url = urllib.parse.quote(target_url, safe='')
+    req_url = f"http://127.0.0.1:{api_port}/proxies/{urllib.parse.quote(proxy_name)}/delay?url={encoded_url}&timeout={timeout_ms}"
+    try:
+        req = urllib.request.Request(req_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=(timeout_ms / 1000.0) + 0.5) as res:
+            if res.status == 200:
+                body = json.loads(res.read().decode('utf-8'))
+                delay = body.get('delay')
+                if delay and int(delay) > 0:
+                    return int(delay)
+    except Exception:
+        pass
+    return None
+
+
+def fetch_homepage_html(url: str, api_port: int = 19098, proxy_port: Optional[int] = None,
+                         max_bytes: int = MAX_BYTES_PER_PROBE,
                          timeout_sec: float = PROBE_TIMEOUT_SEC) -> Tuple[Optional[bytes], str]:
     """
     通过沙箱代理拉取首 N 字节 HTML
     返回 (html_bytes_or_None, error_message)
     """
-    proxy_url = f"http://127.0.0.1:{api_port + 90}"  # 19998 = 19098 + 90
+    target_port = proxy_port if proxy_port is not None else (api_port + 90)
+    proxy_url = f"http://127.0.0.1:{target_port}"
     proxy_handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
     opener = urllib.request.build_opener(proxy_handler)
     req = urllib.request.Request(url, headers={
@@ -137,15 +175,18 @@ def _match_title(html: bytes, patterns: List[str]) -> str:
 
 
 def probe_real_google_page(proxy_name: str, ip: str, port: int,
-                            api_port: int = 19098) -> ProbeResult:
+                            api_port: int = 19098, proxy_port: Optional[int] = None,
+                            do_switch: bool = False) -> ProbeResult:
     """单次 google.com 主页真实页面探测, 失败重试 1 次"""
+    if do_switch and proxy_name:
+        switch_sandbox_proxy(proxy_name, api_port=api_port)
     start = time.time()
     last_err = ""
     duration_ms = 0
     for attempt in (0, 1):
         if attempt > 0:
             time.sleep(RETRY_BACKOFF_SEC)
-        html, err = fetch_homepage_html(GOOGLE_HOMEPAGE_URL, api_port=api_port)
+        html, err = fetch_homepage_html(GOOGLE_HOMEPAGE_URL, api_port=api_port, proxy_port=proxy_port)
         duration_ms = int((time.time() - start) * 1000)
         if html is not None:
             title = _match_title(html, GOOGLE_TITLE_PATTERNS)
@@ -159,15 +200,18 @@ def probe_real_google_page(proxy_name: str, ip: str, port: int,
 
 
 def probe_real_youtube_page(proxy_name: str, ip: str, port: int,
-                             api_port: int = 19098) -> ProbeResult:
+                             api_port: int = 19098, proxy_port: Optional[int] = None,
+                             do_switch: bool = False) -> ProbeResult:
     """单次 youtube.com 主页真实页面探测, 失败重试 1 次"""
+    if do_switch and proxy_name:
+        switch_sandbox_proxy(proxy_name, api_port=api_port)
     start = time.time()
     last_err = ""
     duration_ms = 0
     for attempt in (0, 1):
         if attempt > 0:
             time.sleep(RETRY_BACKOFF_SEC)
-        html, err = fetch_homepage_html(YOUTUBE_HOMEPAGE_URL, api_port=api_port)
+        html, err = fetch_homepage_html(YOUTUBE_HOMEPAGE_URL, api_port=api_port, proxy_port=proxy_port)
         duration_ms = int((time.time() - start) * 1000)
         if html is not None:
             title = _match_title(html, YOUTUBE_TITLE_PATTERNS)
@@ -223,6 +267,8 @@ def _stability_worker(proxy_name: str, ip: str, port: int,
                       api_port: int, interval_sec: float, total_rounds: int,
                       pass_threshold: int, window_sec: int) -> StabilityResult:
     """区间密集采样的核心 worker, 同步 Google + YouTube"""
+    if proxy_name:
+        switch_sandbox_proxy(proxy_name, api_port=api_port)
     start = time.time()
     passed = 0
     failed_rounds: list = []
