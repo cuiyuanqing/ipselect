@@ -596,6 +596,126 @@ def _evaluate_e2e_candidate_mock(proxy_name, ip, port, colo, api_port, proxy_por
     }
 
 
+def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
+                                   api_port=19098, proxy_port=19998,
+                                   max_duration_sec=600):
+    """
+    阶段 3 v2 主循环:
+    1. v4 强制 + 10 并发跑 60s 区间质量门
+    2. 10min 超时保护
+    3. 降级链路 (8-11 → 30s 重测; 4-7 → 204 兜底; <4 → no_quality)
+    """
+    from stage3_quality_gate import (
+        probe_60s_stability, probe_30s_stability, IPv4OnlyContext,
+    )
+
+    e2e_results: list = []
+    stage3_status = "success"
+    stage_start = time.time()
+
+    # 准备 node_XX 命名
+    candidates_with_name = [
+        (f"node_{idx:02d}", item) for idx, item in enumerate(topN_candidates, 1)
+    ]
+
+    # ===== 60s 区间预跑 =====
+    print(f"\n[*] [阶段 3 v2] 启动 60s 区间真实质量门 (Google+YouTube 同步, 入围 {len(candidates_with_name)} 节点)...")
+    stability_map: dict = {}
+    with IPv4OnlyContext():
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_map = {
+                executor.submit(probe_60s_stability, name, item[0], item[1], api_port=api_port): (name, item)
+                for name, item in candidates_with_name
+            }
+            for future in as_completed(future_map):
+                if (time.time() - stage_start) > max_duration_sec:
+                    print(f"[!] 阶段 3 v2 超过 {max_duration_sec}s, 主动中断")
+                    break
+                name, item = future_map[future]
+                try:
+                    res = future.result()
+                    stability_map[name] = res
+                    print(f"  [{name}] {res.ip}:{res.port} pass={res.passed}/{res.total} "
+                          f"google={res.google_pass_rate:.0%} youtube={res.youtube_pass_rate:.0%} "
+                          f"{'✓' if res.is_stable else '✗'}")
+                except Exception as e:
+                    print(f"  [{name}] 异常: {e}")
+
+    stable_nodes = [(name, item) for name, item in candidates_with_name
+                    if stability_map.get(name) and stability_map[name].is_stable]
+
+    # ===== 降级决策 =====
+    if len(stable_nodes) >= 12:
+        chosen = stable_nodes
+    elif len(stable_nodes) >= 8:
+        # 降级 1: 30s 区间重测这 8-11 个
+        print(f"\n[*] 触发降级 1: 60s 通过 {len(stable_nodes)} 节点, 启动 30s 区间重测...")
+        re_stable: list = []
+        with IPv4OnlyContext():
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_map = {
+                    executor.submit(probe_30s_stability, name, item[0], item[1], api_port=api_port): (name, item)
+                    for name, item in stable_nodes
+                }
+                for future in as_completed(future_map):
+                    if (time.time() - stage_start) > max_duration_sec:
+                        break
+                    name, item = future_map[future]
+                    try:
+                        res = future.result()
+                        if res.is_stable:
+                            re_stable.append((name, item))
+                            stability_map[name] = res  # 用 30s 结果覆盖
+                    except Exception:
+                        pass
+        chosen = re_stable if re_stable else stable_nodes
+    elif len(stable_nodes) >= 4:
+        # 降级 2: 回退 204 探针
+        print(f"\n[!] 触发降级 2: 60s 仅 {len(stable_nodes)} 节点通过, 回退 204 探针...")
+        fallback: list = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_map = {
+                executor.submit(probe_stability, item[0], item[1]): (name, item)
+                for name, item in candidates_with_name
+            }
+            for future in as_completed(future_map):
+                name, item = future_map[future]
+                try:
+                    res = future.result()
+                    if res:
+                        fallback.append((name, item))
+                except Exception:
+                    pass
+        chosen = fallback if len(fallback) >= 4 else []
+        if chosen:
+            stage3_status = "quality_downgraded"
+    else:
+        # 降级 3: 严重劣化, 不输出
+        print(f"[!] 触发降级 3: 60s 通过 {len(stable_nodes)} 节点 < 4, 上游严重劣化")
+        chosen = []
+        stage3_status = "no_quality"
+
+    # ===== 拼装 e2e_results =====
+    for name, (ip, port, sp, colo, tls_rtt) in chosen:
+        stab = stability_map.get(name)
+        if stab is None:
+            # 降级 2 路径: 没有 stability_result, 用 stub
+            stab = type('Stub', (), {
+                'pass_rate': 0.0, 'failed_rounds': [], 'window_sec': 0, 'duration_ms': 0,
+                'google_pass_rate': 0.0, 'youtube_pass_rate': 0.0,
+            })()
+        result = evaluate_node_quality_v2(
+            proxy_name=name, ip=ip, port=port, colo=colo,
+            api_port=api_port, proxy_port=proxy_port,
+            target_country=target_country, stability_result=stab,
+        )
+        if result:
+            e2e_results.append(result)
+
+    print(f"\n[+] 阶段 3 v2 完成: 通过 {len(e2e_results)} 节点, 状态={stage3_status}, 耗时 {int(time.time() - stage_start)}s")
+    return e2e_results, stage3_status
+
+
 def probe_e2e_download_speed(proxy_port: int = 19998, max_bytes: int = 1048576, max_duration: float = 2.0, fallback_rtt: float = 200.0, mock_speed: float = None) -> float:
     """
     通过本地沙箱代理执行真实代理微吞吐测速：
@@ -1535,8 +1655,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     topN_candidates = chosen
     print(f"[+] [阶段 2/5] 分层入围结果: 美西 {len(us_candidates)} / 亚太 {len(apac_candidates)} / 其他 {len(other_candidates)}，进入沙箱 {len(topN_candidates)} 个")
 
-    # ================= 阶段 3：沙箱全链路真机实测 (Google + YouTube + ip.sb) =================
-    print(f"\n[+] [阶段 3/5] 启动沙箱全链路真实代理实测 (入围节点数: {len(topN_candidates)}, 穿透 edgetunnel 测 Google/YouTube/ip.sb)...")
+    # ================= 阶段 3 v2：真实质量门 =================
     sandbox = None
     e2e_results = []
     use_sandbox = bool(sandbox_enable) and (mock_mode or (find_clash_core() is not None))
@@ -1555,36 +1674,13 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         if sandbox.start():
             print(f"[+] 隔离沙箱启动成功 (外部控制端口: 19098, 本地代理端口: 19998, GID=65534 直连)")
             try:
-                def probe_single(idx, item):
-                    ip, port, sp, colo, tls_rtt = item
-                    pname = f"node_{idx:02d}"
-                    m_data = None
-                    if mock_mode:
-                        m_data = {
-                            "google_delays": [190 + idx * 5, 195 + idx * 5, 200 + idx * 5],
-                            "youtube_delay": 205 + idx * 5,
-                            "ip_sb_exit": {"country_code": (target_country or "US").upper(), "ip": "104.28.19.1"}
-                        }
-                    eval_res = evaluate_e2e_candidate(
-                        proxy_name=pname,
-                        ip=ip,
-                        port=port,
-                        colo=colo,
-                        api_port=19098,
-                        proxy_port=19998,
-                        mock_data=m_data,
-                        target_country=target_country
-                    )
-                    return eval_res
-
-                with ThreadPoolExecutor(max_workers=10) as executor:
-                    future_map = {executor.submit(probe_single, idx, item): item for idx, item in enumerate(topN_candidates, 1)}
-                    for future in as_completed(future_map):
-                        res = future.result()
-                        if res:
-                            e2e_results.append(res)
+                e2e_results, stage3_status = run_stage3_real_quality_gate(
+                    topN_candidates, sandbox, target_country,
+                    api_port=19098, proxy_port=19998, max_duration_sec=600,
+                )
+                globals()['_STAGE3_STATUS'] = stage3_status
             except Exception as _sb_e:
-                print(f"[!] 阶段 3 沙箱执行异常: {_sb_e}")
+                print(f"[!] 阶段 3 v2 沙箱执行异常: {_sb_e}")
                 sandbox.stop()
                 raise
         else:
@@ -1593,9 +1689,9 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         if not sandbox_enable:
             print("[*] 沙箱严选配置已停用，使用直连 TLS 稳定性测定模式")
         else:
-            print("[!] 当前系统未安装 clash_meta 内核，平滑回退至传统直连 TLS 稳定性测定")
+            print("[!] 当前系统未安装 clash_meta 内核，平滑回级至传统直连 TLS 稳定性测定")
 
-    # 若沙箱未能产出结果（无内核、未启用或全军覆没），启动直连回退降级
+    # 沙箱未启动 / 未产出结果 → 沿用直连兜底
     if not e2e_results:
         print("[!] 启动直连稳定性深测回退兜底模式...")
         with ThreadPoolExecutor(max_workers=10) as executor:
@@ -1611,7 +1707,8 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                         'e2e_jitter': res['jitter'],
                         'youtube_rtt': res['median_rtt'],
                         'exit_country': target_country or 'US',
-                        'exit_ip': 'Anycast'
+                        'exit_ip': 'Anycast',
+                        'quality_gate_version': 1,  # 标记为旧版直连兜底
                     })
 
     print(f"[+] [阶段 3/5] 全链路真实可用性检测完毕，通过严格质检节点数: {len(e2e_results)} / {len(topN_candidates)}")
