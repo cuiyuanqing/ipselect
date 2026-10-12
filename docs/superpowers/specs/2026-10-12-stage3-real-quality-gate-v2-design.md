@@ -64,11 +64,26 @@ Top 15
 
 - URL：`https://www.google.com/`
 - 拉取首 256KB HTML
-- 校验：HTML 包含 `<title>Google</title>`（或当前 Google 主页实际 title 字符串）
+- 校验：HTML `<title>` 标签**多模式匹配**（任一命中即过）：
+  - `<title>Google</title>`
+  - `<title>Google Search</title>`
+  - `<title>谷歌搜索</title>`
+  - `<title>` 内容包含 `Google` 或 `谷歌` 字样
 - 超时：5s/次
 - 失败重试：1 次（解决瞬时抖动）
 - v4 优先：明确 `socket.AF_INET`，避免 v6 路径干扰 v4 客户端
 - TLS 指纹：保留 Python urllib（不引入 curl_cffi，避免新依赖）
+
+**新增** `probe_real_youtube_page()` 函数（**同步探测 Google + YouTube**）：
+
+- URL：`https://www.youtube.com/`
+- 拉取首 256KB HTML
+- 校验：HTML `<title>` 标签**多模式匹配**（任一命中即过）：
+  - `<title>YouTube</title>`
+  - `<title>YouTube - Home</title>`
+  - `<title>` 内容包含 `YouTube` 字样
+- 超时：5s/次
+- 失败重试：1 次
 
 **为什么 256KB 而非 1MB**：
 - Google 主页 HTML 主体 ~50-100KB
@@ -76,10 +91,10 @@ Top 15
 - 1MB 会把 fonts.googleapis.com、www.gstatic.com 等子资源全拉下来，但子资源加载是浏览器的事，沙箱内测会大幅增加耗时且不能复现客户端体验
 - **测的是"HTML 主体可达"**，子资源由浏览器处理，沙箱不替代浏览器
 
-**为什么只测 Google 不测 YouTube**：
-- Jeff 核心诉求是"打不开 Google"
-- 双 URL 探测耗时 ×2，但收益边际递减（YouTube 实际更宽松）
-- 阶段 3b 通过率 ≥ 11/12 已经覆盖"绝大多数时间能用"，单点失效由浏览器容错
+**为什么同步测 Google + YouTube**：
+- Jeff 明确要求"用最真实的访问去做"，YouTube 是订阅核心使用场景之一
+- 同步探测耗时 ×2（~6 min 总），但收益覆盖客户端最常用的两个服务
+- 单轮次判定：Google **且** YouTube 都过 → 该轮过；任一失败 → 该轮失败
 
 #### 3.2.2 60s 连续区间密集采样
 
@@ -89,17 +104,23 @@ PROBE_TOTAL_ROUNDS = 12      # 60s / 5s
 PROBE_PASS_THRESHOLD = 11    # 12 次中至少 11 次通过
 
 def probe_60s_stability(proxy_name, ip, port, api_port, proxy_port):
-    """60s 连续区间真实页面稳定性测试"""
+    """60s 连续区间真实页面稳定性测试 (Google + YouTube 同步探测)"""
     passed = 0
     failed_rounds = []
     for round_idx in range(PROBE_TOTAL_ROUNDS):
         if round_idx > 0:
             time.sleep(PROBE_INTERVAL_SEC)
-        result = probe_real_google_page(proxy_name, ip, port, api_port, timeout_ms=5000)
-        if result.ok:
+        # 同步探测: Google 和 YouTube 都过才算该轮过
+        google_ok = probe_real_google_page(proxy_name, ip, port, api_port, timeout_ms=5000).ok
+        youtube_ok = probe_real_youtube_page(proxy_name, ip, port, api_port, timeout_ms=5000).ok
+        if google_ok and youtube_ok:
             passed += 1
         else:
-            failed_rounds.append((round_idx, result.error))
+            failed_rounds.append({
+                'round': round_idx,
+                'google_ok': google_ok,
+                'youtube_ok': youtube_ok
+            })
     return {
         'passed': passed,
         'total': PROBE_TOTAL_ROUNDS,
@@ -174,7 +195,7 @@ def probe_real_google_page(proxy_name, ip, port, api_port, timeout_ms=5000):
 60s 区间跑完 → 通过节点数:
 ├── ≥ 15 → 取前 15 进入阶段 4
 ├── 12-14 → 全部进入阶段 4（接受略少于 15）
-├── 8-11 → 触发降级 1：30s 区间 / 3s 间隔 / 10 探重测
+├── 8-11 → 触发降级 1：30s 区间 / 3s 间隔 / 10 探重测 (Google + YouTube 同步)
 │   ├── 重测后 ≥ 12 → 取满进入阶段 4
 │   └── 重测后仍 < 12 → 走 2 次取并集
 ├── 4-7 → 触发降级 2：降级回原 204 探测快速筛
@@ -182,6 +203,13 @@ def probe_real_google_page(proxy_name, ip, port, api_port, timeout_ms=5000):
 │   └── 204 通过 < 15 → 报错退出
 └── < 4 → 触发降级 3：报错"上游严重劣化",不输出 best_us.txt,推送 STATUS=no_quality
 ```
+
+**超时保护**：
+- 阶段 3 整体执行超过 **10 分钟** 主动中断
+- 中断时取当前已通过节点数
+- < 15 节点走降级 2（30s 重测）
+- ≥ 15 节点直接进入阶段 4
+- 防止上游劣化时脚本卡死
 
 降级 1 设计目的：避免"18 节点过 60s 探测剩 10 个"的常见情况被一刀切。
 降级 2 设计目的：避免节点池暂时枯竭导致脚本整个失败，至少还能输出 204 通过的兜底。
@@ -254,12 +282,18 @@ def probe_real_google_page(proxy_name, ip, port, api_port, timeout_ms=5000):
 
 | 阶段 | 现状耗时 | v2 耗时 | 增量 |
 |---|---|---|---|
-| 阶段 3 整体 | ~30-60s | ~150-300s (3-5 min) | +120-240s |
+| 阶段 3 整体 | ~30-60s | ~300-420s (5-7 min) | +240-360s |
 | 阶段 4 吞吐测速 | ~150-300s | ~150-300s | 0 |
 | 阶段 1/2/5 | ~30s | ~30s | 0 |
-| **总耗时** | **~5-8 min** | **~7-12 min** | **+2-4 min** |
+| **总耗时** | **~5-8 min** | **~8-12 min** | **+3-5 min** |
 
-预算可接受（cron 凌晨 04:30 跑，有充足时间）。
+注：阶段 3 v2 耗时拆解：
+- 3a 真实页面快速探针 18 节点 / 10 并发 = ~5s
+- 3b 60s 区间密集采样 18 节点 / 10 并发 = 2 批 × 60s = ~120-180s（含双 URL 探测 ×2）
+- 3c ip.sb 出口探测 = ~10s
+- 缓冲与降级开销 = ~60s
+
+预算可接受（cron 凌晨 04:30 跑，有充足时间）。10 分钟超时保护触发降级。
 
 ### 3.8 风险与缓解
 
@@ -303,12 +337,14 @@ def probe_real_google_page(proxy_name, ip, port, api_port, timeout_ms=5000):
 | 不破坏现有 | 阶段 1/2/4/5 行为不变，best_us.txt 节点行格式不变 |
 | 推送 | 强化 runner (f22ce74/d0a89a7) 继续生效，git push 必成功 |
 
-## 7. 待确认
+## 7. 已确认决策
 
-- [ ] Google `<title>` 字符串当前是 "Google" 还是要兼容其他变体（"Google Search" 等）？
-- [ ] 真实页面探测是否要测 YouTube（增加耗时）？
-- [ ] 降级 1 触发条件用 8-11 还是 6-11？
-- [ ] 阶段 3 整体超过 10 分钟是否要主动中断？
+| # | 决策点 | Jeff 选择 | 落地 |
+|---|---|---|---|
+| 1 | Google `<title>` 兼容 | 多模式匹配（Google / Google Search / 谷歌搜索 / 包含 Google 或 谷歌） | §3.2.1 |
+| 2 | 是否测 YouTube | **同步**测 Google + YouTube | §3.2.1 |
+| 3 | 降级 1 触发阈值 | 60s 区间跑完剩余 8-11 节点时触发 30s 重测 | §3.3 |
+| 4 | 阶段 3 超时保护 | 整体超过 10 分钟主动中断，触发降级 2 | §3.3 |
 
 ## 8. 关联
 
