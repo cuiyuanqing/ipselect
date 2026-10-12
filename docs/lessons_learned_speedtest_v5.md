@@ -694,3 +694,33 @@ elif res["status"] not in ("ok", "ok_rate_limited_in_retry") and res["speed"] > 
 > **本次排障 ID**：IPSELECT-NO-DATA-2026-10-12
 > **最终版本**：v5（2026-10-12 09:38:48 部署）
 > **下次审查触发条件**：连续 3 天 best_us.txt 速度覆盖率 < 60%，或收到 CF/OVH 域名变化告警。
+
+
+## 五、阶段 3 真实质量门 v2 (2026-10-12)
+
+### 5.1 旧版 (v1) 痛点
+- 阶段 3 只测 `generate_204` 探针：单次快照 + 极轻量
+- 客户端浏览器打开 google.com 远比 204 探测复杂
+- 节点质量时间漂移（"前 1 分钟能 下一秒不能"）完全捕捉不到
+
+### 5.2 v2 改进
+- 真实页面探测：google.com + youtube.com 主页首 256KB + 多模式 title 匹配
+- 60s 连续区间密集采样：5s × 12 探，同步双 URL，通过率 ≥ 11/12
+- 三级降级链路：8-11 节点 → 30s 重测；4-7 节点 → 204 兜底；<4 节点 → 不输出
+- 10min 超时保护 + v4 强制上下文
+
+### 5.3 设计权衡
+- 256KB 而非 1MB：HTML 主体可达已足够，子资源由浏览器处理
+- 同步双 URL 而非 12+12：单轮判定双边都过，避免单边阻塞
+- 5s 间隔：平衡冷启动开销与抖动捕捉粒度
+- 11/12 阈值：容许 1 次瞬时抖动，2 次失败 = 10s 不可用 = 客户端无法容忍
+
+### 5.4 性能预算
+- 阶段 3 整体: 5-7 min (vs 旧 30-60s)
+- 总脚本: 8-12 min (vs 旧 5-8 min)
+- cron 凌晨 04:30 跑时间充裕
+
+### 5.5 推送 gate 兼容
+- `STATUS=success` + `GIT_STATUS=pushed` → 联动 OpenClash (v1 行为)
+- `STATUS=quality_downgraded` + `GIT_STATUS=pushed` → 联动 OpenClash (v2 新增, 走 204 兜底仍可信)
+- `STATUS=no_quality` → 拒绝推送, 拒绝 OpenClash 联动
