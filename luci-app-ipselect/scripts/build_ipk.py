@@ -15,9 +15,25 @@ import tarfile
 import time
 from pathlib import Path
 
+def _get_pkg_version() -> tuple[str, str]:
+    makefile = Path(__file__).resolve().parent.parent / "Makefile"
+    if makefile.exists():
+        try:
+            content = makefile.read_text(encoding="utf-8")
+            import re
+            v = re.search(r"^PKG_VERSION:=([^\r\n]+)", content, re.M)
+            r = re.search(r"^PKG_RELEASE:=([^\r\n]+)", content, re.M)
+            if v and r:
+                return v.group(1).strip(), r.group(1).strip()
+        except Exception:
+            pass
+    return "1.4.0", "1"
+
+
 PKG_NAME = "luci-app-ipselect"
-PKG_VERSION = "1.2.0"
-PKG_RELEASE = "1"
+_v, _r = _get_pkg_version()
+PKG_VERSION = _v
+PKG_RELEASE = _r
 PKG_FULL_VERSION = f"{PKG_VERSION}-{PKG_RELEASE}"
 PKG_ARCH = "all"
 PKG_MAINTAINER = "JeffSmith"
