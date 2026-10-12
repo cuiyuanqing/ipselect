@@ -133,10 +133,10 @@ run_task() {
     VLESS_UUID=$(get_config "vless_uuid" "e295e2a9-13ad-4251-baa8-28ee1b5aeae9")
     VLESS_PATH=$(get_config "vless_path" "/")
     VLESS_PORT=$(get_config "vless_port" "443")
-    TARGET_COUNTRY=$(get_config "target_country" "US")
+    TARGET_COUNTRY=$(get_config "target_country" "AUTO")
     RANDOM_CF_COUNT=$(get_config "random_cf_count" "1500")
     STAGE2_ENTRY_LIMIT=$(get_config "stage2_entry_limit" "75")
-    STAGE4_SPEED_LIMIT=$(get_config "stage4_speed_limit" "30")
+    STAGE4_SPEED_LIMIT=$(get_config "stage4_speed_limit" "45")
 
     export SANDBOX_ENABLE VLESS_SNI VLESS_UUID VLESS_PATH VLESS_PORT TARGET_COUNTRY RANDOM_CF_COUNT STAGE2_ENTRY_LIMIT STAGE4_SPEED_LIMIT SPEED_TEST_DURATION SPEED_TEST_PARALLEL SPEED_TEST_NODE_CONCURRENCY SPEED_TEST_MAX_RETRY SPEED_TEST_MAX_BYTES_PER_IP
 

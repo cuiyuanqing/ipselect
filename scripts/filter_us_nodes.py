@@ -33,12 +33,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 SNI_HOST = "proxy.19940407.xyz"
-TOP_COUNT = 15
+TOP_COUNT = int(os.environ.get("TOP_COUNT", "30"))
 PROBE_TIMEOUT = 2.5
-# 阶段2 → 沙箱入围上限（放大入围数，让更多候选进入全链路实测，稳出 Top 15）
+# 阶段2 → 沙箱入围上限（放大入围数，让更多候选进入全链路实测，保障各区域样本充足）
 STAGE2_ENTRY_LIMIT = int(os.environ.get("STAGE2_ENTRY_LIMIT", "75"))
-# 阶段4 真实微吞吐测速入围上限
-STAGE4_SPEED_LIMIT = int(os.environ.get("STAGE4_SPEED_LIMIT", "30"))
+# 阶段4 真实微吞吐测速入围上限（覆盖各区域配额入围）
+STAGE4_SPEED_LIMIT = int(os.environ.get("STAGE4_SPEED_LIMIT", "45"))
 # 随机采样 Cloudflare Anycast 候选数（edgetunnel 在线优选同机制，用于扩充到数千候选）
 RANDOM_CF_COUNT = int(os.environ.get("RANDOM_CF_COUNT", "1500"))
 SPEED_TEST_DURATION = int(os.environ.get("SPEED_TEST_DURATION", "5"))
@@ -98,13 +98,71 @@ US_OTHER_DCS = {'DFW', 'ORD', 'IAD', 'ATL', 'MIA', 'EWR', 'JFK', 'DEN', 'IAH', '
 ALL_US_DCS = US_WEST_DCS | US_OTHER_DCS
 US_DATA_CENTERS = ALL_US_DCS
 
+# 亚太各区域直连机房定义
+HK_DCS = {'HKG'}
+TW_DCS = {'TPE'}
+JP_DCS = {'NRT', 'HND', 'KIX'}
+SG_DCS = {'SIN'}
+
 # 亚太极速直连机房（对大陆网络延迟极低 30ms~80ms）
-APAC_FAST_DCS = {'HKG', 'NRT', 'HND', 'KIX', 'SIN', 'TPE', 'ICN', 'BKK', 'MNL', 'KUL'}
+APAC_FAST_DCS = HK_DCS | TW_DCS | JP_DCS | SG_DCS | {'ICN', 'BKK', 'MNL', 'KUL'}
 # 全球顶级入口直连机房（亚太低延迟 POP + 美西核心 POP）
 TOP_INGRESS_DCS = APAC_FAST_DCS | US_WEST_DCS
 
+# 默认分区域配额：亚太各 5 个，美区 10 个（用于解锁 AI 大模型）
+DEFAULT_REGION_QUOTAS = {
+    'HK': 5,
+    'TW': 5,
+    'JP': 5,
+    'SG': 5,
+    'US': 10,
+}
+
 EXCLUDE_CITIES = {'Toronto', 'Montreal', 'Vancouver', 'Calgary', 'Ottawa'}
 EXCLUDE_DCS = {'YYZ', 'YVR', 'YUL', 'YYC'}
+
+
+def detect_node_region(colo: str, remark: str = "", ip_or_domain: str = "") -> str:
+    """智能识别节点的地域归属 (HK, TW, JP, SG, US 等)"""
+    rem_u = (remark or "").upper()
+    # 优先根据明确的备注地域标识进行归类 (例如社区种子 HK-AWS, TW-HiNet 等)
+    for r in ('HK', 'TW', 'JP', 'SG'):
+        if re.search(rf"(^|[^A-Z]){r}([^A-Z]|$)", rem_u):
+            return r
+    if '香港' in remark:
+        return 'HK'
+    if '台湾' in remark or '臺' in remark or '台北' in remark:
+        return 'TW'
+    if '日本' in remark or '东京' in remark or '大阪' in remark:
+        return 'JP'
+    if '新加坡' in remark or '狮城' in remark:
+        return 'SG'
+
+    # 其次根据 cf-ray 实际机房代码判定
+    colo_u = (colo or "").upper()
+    if colo_u in HK_DCS:
+        return 'HK'
+    if colo_u in TW_DCS:
+        return 'TW'
+    if colo_u in JP_DCS:
+        return 'JP'
+    if colo_u in SG_DCS:
+        return 'SG'
+    if colo_u in ALL_US_DCS:
+        return 'US'
+
+    if re.search(r"(^|[^A-Z])US([^A-Z]|$)", rem_u):
+        return 'US'
+    if '美国' in remark or '美西' in remark:
+        return 'US'
+
+    # 检查 ip_or_domain 域名特征
+    domain_u = (ip_or_domain or "").upper()
+    for r in ('HK', 'TW', 'JP', 'SG', 'US'):
+        if re.search(rf"(^|[^A-Z]){r}([^A-Z]|$)", domain_u):
+            return r
+
+    return 'US'
 
 
 def parse_colo_from_headers(raw_headers_str):
@@ -450,11 +508,12 @@ def probe_ip_sb_exit(proxy_port: int = 19998, timeout: float = 3.5, mock_exit: d
     通过本地沙箱的代理端口探测真实出口 IP 与落地国家归属。
     返回 (is_target_country, country_code, exit_ip)
     """
-    target = (target_country or "US").upper()
+    target = (target_country or "AUTO").upper()
     if mock_exit is not None:
         cc = mock_exit.get('country_code', '').upper()
         ip = mock_exit.get('ip', '')
-        return (cc == target if target else True), cc, ip
+        is_match = bool(cc) if target in ('AUTO', 'ALL', '') else (cc == target)
+        return is_match, cc, ip
 
     proxy_url = f"http://127.0.0.1:{proxy_port}"
     proxy_handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
@@ -469,7 +528,7 @@ def probe_ip_sb_exit(proxy_port: int = 19998, timeout: float = 3.5, mock_exit: d
                     data = json.loads(res.read().decode('utf-8'))
                     country = (data.get('country_code') or data.get('countryCode') or '').upper()
                     exit_ip = data.get('ip') or data.get('query') or ''
-                    is_match = (country == target if target else True)
+                    is_match = bool(country) if target in ('AUTO', 'ALL', '') else (country == target)
                     return is_match, country, exit_ip
         except Exception:
             continue
@@ -618,6 +677,29 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
         (f"node_{idx:02d}", item) for idx, item in enumerate(topN_candidates, 1)
     ]
 
+    # mock 模式快速直通 (用于单元测试毫秒级完成)
+    if getattr(sandbox, 'mock_mode', False):
+        print(f"[*] [阶段 3 v2] 检测到沙箱为 mock 模式，快速直通真实质量门...")
+        e2e_results = []
+        for name, item in candidates_with_name:
+            e2e_results.append({
+                'proxy_name': name,
+                'ip': item[0],
+                'port': item[1],
+                'colo': item[3] if len(item) > 3 else 'CF',
+                'e2e_avg_rtt': item[4] if len(item) > 4 else 180.0,
+                'e2e_jitter': 5.0,
+                'youtube_rtt': item[4] if len(item) > 4 else 180.0,
+                'exit_ip': '1.1.1.1',
+                'exit_country': target_country if (target_country and target_country not in ('AUTO', 'ALL')) else 'US',
+                'quality_gate_version': 2,
+                'real_page_pass_rate': 1.0,
+                'real_page_failed_rounds': [],
+                'stability_window_sec': 60,
+                'remark': item[5] if len(item) > 5 else ''
+            })
+        return e2e_results, "success"
+
     # ===== 60s 区间预跑 =====
     print(f"\n[*] [阶段 3 v2] 启动 60s 区间真实质量门 (Google+YouTube 同步, 入围 {len(candidates_with_name)} 节点)...")
     stability_map: dict = {}
@@ -696,7 +778,13 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
         stage3_status = "no_quality"
 
     # ===== 拼装 e2e_results =====
-    for name, (ip, port, sp, colo, tls_rtt) in chosen:
+    for name, item_tuple in chosen:
+        ip = item_tuple[0]
+        port = item_tuple[1]
+        sp = item_tuple[2]
+        colo = item_tuple[3] if len(item_tuple) > 3 else "CF"
+        tls_rtt = item_tuple[4] if len(item_tuple) > 4 else 200.0
+        rem = item_tuple[5] if len(item_tuple) > 5 else ""
         stab = stability_map.get(name)
         if stab is None:
             # 降级 2 路径: 没有 stability_result, 用 stub
@@ -713,6 +801,8 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
             target_country=target_country, stability_result=stab,
         )
         if result:
+            result['remark'] = rem
+            result['region'] = detect_node_region(colo, rem, ip)
             e2e_results.append(result)
 
     print(f"\n[+] 阶段 3 v2 完成: 通过 {len(e2e_results)} 节点, 状态={stage3_status}, 耗时 {int(time.time() - stage_start)}s")
@@ -798,7 +888,7 @@ def calculate_e2e_score(e2e_rtt: float, jitter: float, speed_mb_s: float, colo: 
 
     # 4. 核心机房加权 (权重 10%)
     colo_upper = (colo or "").upper()
-    if colo_upper in {"SJC", "LAX"}:
+    if colo_upper in {"SJC", "LAX"} or colo_upper in APAC_FAST_DCS:
         s_colo = 10.0
     elif colo_upper in US_WEST_DCS:
         s_colo = 8.5
@@ -812,12 +902,14 @@ def calculate_e2e_score(e2e_rtt: float, jitter: float, speed_mb_s: float, colo: 
     return round(final_score, 1)
 
 
-def format_node_line(ip: str, port: int, score: float, rank: int, tag: str, speed_mb_s: float, colo: str = "") -> str:
+def format_node_line(ip: str, port: int, score: float, rank: int, tag: str, speed_mb_s: float, colo: str = "", region: str = None) -> str:
     """
     格式化为标准 OpenClash 订阅优选节点配置行：
-    <ip>:<port>#US-<tag>-<rank>-<speed>MB/s
+    <ip>:<port>#<region>-<tag>-<rank>-<speed>MB/s
     """
-    return f"{ip}:{port}#US-{tag}-{rank:02d}-{speed_mb_s:.2f}MB/s"
+    if not region:
+        region = detect_node_region(colo, "", ip)
+    return f"{ip}:{port}#{region}-{tag}-{rank:02d}-{speed_mb_s:.2f}MB/s"
 
 
 def infer_environment_from_ips(ip_list):
@@ -1010,17 +1102,68 @@ def fetch_candidates():
 
     # 4. 补充备用高可用 Anycast IP 池
     for ip in BACKUP_CF_IPS:
-        candidates.append((ip, 443, 0.0))
-        candidates.append((ip, 8443, 0.0))
+        candidates.append((ip, 443, 0.0, "CF-Anycast备用"))
+        candidates.append((ip, 8443, 0.0, "CF-Anycast备用"))
+
+    # 5. 加载社区精选种子与活跃优选器反代 IP 池
+    try:
+        from community_seeds import COMMUNITY_SEEDS, COMMUNITY_OPTIMIZER_DOMAINS
+        print(f"[*] 注入精选反代种子库 ({len(COMMUNITY_SEEDS)} 个高质量种子)...")
+        for item in COMMUNITY_SEEDS:
+            c_ip = item[0]
+            c_port = int(item[1])
+            c_rem = item[2] if len(item) > 2 else ""
+            candidates.append((c_ip, c_port, 0.0, c_rem))
+
+        def _fetch_optimizer_nodes(dom):
+            results = []
+            try:
+                opt_url = f"https://{dom}/auto"
+                req = urllib.request.Request(opt_url, headers={'User-Agent': 'v2rayN'})
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(req, timeout=3.5, context=ctx) as r:
+                    raw = r.read().decode('utf-8', errors='ignore')
+                    if raw:
+                        text = base64.b64decode(raw).decode('utf-8', errors='ignore') if ('\n' not in raw and len(raw) > 30) else raw
+                        for line in text.splitlines():
+                            m = re.search(r'@([^:]+):(\d+)', line)
+                            rem_m = re.search(r'#(.*)$', line)
+                            if m:
+                                e_ip = m.group(1).strip()
+                                e_port = int(m.group(2).strip())
+                                e_rem = urllib.parse.unquote(rem_m.group(1)) if rem_m else ''
+                                results.append((e_ip, e_port, 0.0, e_rem))
+            except Exception:
+                pass
+            return results
+
+        print(f"[*] 并发拉取活跃社区优选器动态节点...")
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            fut_map = [executor.submit(_fetch_optimizer_nodes, d) for d in COMMUNITY_OPTIMIZER_DOMAINS]
+            for f in as_completed(fut_map):
+                try:
+                    res_nodes = f.result()
+                    if res_nodes:
+                        candidates.extend(res_nodes)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[-] 加载社区优选源提示: {e}")
 
     # 去重
     seen = set()
     unique_candidates = []
-    for ip, port, sp in candidates:
+    for item in candidates:
+        ip = item[0]
+        port = item[1]
+        sp = item[2]
+        rem = item[3] if len(item) > 3 else ""
         key = (ip, port)
         if key not in seen:
             seen.add(key)
-            unique_candidates.append((ip, port, sp))
+            unique_candidates.append((ip, port, sp, rem))
 
     print(f"[+] 累计汇总待测候选节点数: {len(unique_candidates)}")
     return unique_candidates
@@ -1515,10 +1658,12 @@ def calculate_rigorous_score(node_data):
         spd_score = max(0.1, min(0.5, speed))
 
     # 3. 真实延迟分 (最高 2.5 分)
-    if rtt <= 100.0:
+    if rtt <= 60.0:
         lat_score = 2.5
+    elif rtt <= 100.0:
+        lat_score = 2.45
     elif rtt <= 185.0:
-        lat_score = 2.5 - ((rtt - 100.0) / 85.0) * 0.3
+        lat_score = 2.4 - ((rtt - 100.0) / 85.0) * 0.3
     elif rtt <= 240.0:
         lat_score = 2.2 - ((rtt - 185.0) / 55.0) * 0.7
     elif rtt <= 300.0:
@@ -1538,7 +1683,7 @@ def calculate_rigorous_score(node_data):
 
     # 5. 机房与官方加成
     colo_bonus = 0.5 if (is_top or is_us_west or is_apac) else 0.0
-    cf_penalty = 0.0 if is_cf else -2.0
+    cf_penalty = 0.0  # 废除对第三方优质反代节点的惩罚扣分
 
     total_score = base_score + spd_score + lat_score + jit_score + colo_bonus + cf_penalty
     return round(min(10.0, max(1.0, total_score)), 1)
@@ -1559,7 +1704,7 @@ def probe_node_multidimensional(candidate):
 
 def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=None, mock_mode=False, mock_candidates=None,
                           vless_sni=None, vless_uuid=None, vless_path=None, vless_port=None,
-                          target_country="US", sandbox_enable=True):
+                          target_country="AUTO", sandbox_enable=True):
     """
     五阶漏斗端到端严选引擎：
     1. 阶段 1：快速 TCP 并发探针 (快速初筛死节点)
@@ -1609,7 +1754,19 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     stage2_survivors = []
     if mock_mode:
         for idx, c in enumerate(stage1_survivors):
-            stage2_survivors.append((c[0], c[1], c[2], "SJC" if idx % 2 == 0 else "LAX", 180.0 + idx * 5.0))
+            rem = c[3] if len(c) > 3 else ""
+            if len(c) > 4 and c[4]:
+                colo = c[4]
+            elif rem and any(k in rem.upper() for k in ('HK', 'TW', 'JP', 'SG')):
+                if 'HK' in rem.upper(): colo = 'HKG'
+                elif 'TW' in rem.upper(): colo = 'TPE'
+                elif 'JP' in rem.upper(): colo = 'NRT'
+                elif 'SG' in rem.upper(): colo = 'SIN'
+                else: colo = 'SJC'
+            else:
+                colo = "SJC" if idx % 2 == 0 else "LAX"
+            rtt = 180.0 + idx * 5.0
+            stage2_survivors.append((c[0], c[1], c[2], colo, rtt, rem))
     else:
         with ThreadPoolExecutor(max_workers=25) as executor:
             future_map = {executor.submit(probe_tls_colo, c[0], c[1]): c for c in stage1_survivors}
@@ -1617,7 +1774,8 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                 c = future_map[future]
                 is_valid, colo, rtt = future.result()
                 if is_valid:
-                    stage2_survivors.append((c[0], c[1], c[2], colo, rtt if rtt else 200.0))
+                    rem = c[3] if len(c) > 3 else ""
+                    stage2_survivors.append((c[0], c[1], c[2], colo, rtt if rtt else 200.0, rem))
 
     print(f"[+] [阶段 2/5] 机房质检完毕，存活有效 Cloudflare 边缘节点数: {len(stage2_survivors)}")
 
@@ -1625,38 +1783,51 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         print("[!] 提示: 严选节点较少，启动平滑容灾降级模式。")
         for c in stage1_survivors:
             if not any(s[0] == c[0] and s[1] == c[1] for s in stage2_survivors):
-                stage2_survivors.append((c[0], c[1], c[2], "CF", 200.0))
+                rem = c[3] if len(c) > 3 else ""
+                stage2_survivors.append((c[0], c[1], c[2], "CF", 200.0, rem))
 
-    # 候选节点智能分层入围策略：兼顾美西直连高稳定机房 (SJC/LAX/SFO 等) 与亚太低延迟机房
-    us_candidates = [c for c in stage2_survivors if is_us_west_colo(c[3]) or is_us_colo(c[3]) or c[3] in ('SJC', 'LAX', 'SFO', 'SEA', 'PDX')]
-    apac_candidates = [c for c in stage2_survivors if is_apac_colo(c[3]) or c[3] in ('HKG', 'NRT', 'SIN', 'KIX')]
-    other_candidates = [c for c in stage2_survivors if c not in us_candidates and c not in apac_candidates]
+    # 候选节点区域分层入围策略：兼顾亚太各区 (HK, TW, JP, SG) 与美区 (US)
+    region_buckets = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'US': [], 'OTHER': []}
+    for c in stage2_survivors:
+        colo = c[3]
+        rem = c[5] if len(c) > 5 else ""
+        ip = c[0]
+        r = detect_node_region(colo, rem, ip)
+        if r in region_buckets:
+            region_buckets[r].append(c)
+        else:
+            region_buckets['OTHER'].append(c)
 
-    us_candidates.sort(key=lambda x: (x[4] if x[4] else 999.0))
-    apac_candidates.sort(key=lambda x: (x[4] if x[4] else 999.0))
-    other_candidates.sort(key=lambda x: (x[4] if x[4] else 999.0))
+    for r in region_buckets:
+        region_buckets[r].sort(key=lambda x: (x[4] if x[4] else 999.0))
 
-    # 放大入围上限：美西 50% / 亚太 33% / 其他 17% 分层 + 按 RTT 补齐
-    limit = STAGE2_ENTRY_LIMIT
-    us_budget = int(limit * 0.5)
-    apac_budget = int(limit * 0.33)
-    other_budget = limit - us_budget - apac_budget
-
+    # 沙箱入围配额：亚太各区分配 12 个名额，美区分配 20 个名额，保障各区域样本充足
+    stage2_budgets = {'HK': 12, 'TW': 12, 'JP': 12, 'SG': 12, 'US': 20}
     chosen = []
-    chosen.extend(us_candidates[:us_budget])
-    chosen.extend(apac_candidates[:apac_budget])
-    chosen.extend(other_candidates[:other_budget])
+    for r, b_quota in stage2_budgets.items():
+        chosen.extend(region_buckets[r][:b_quota])
 
+    limit = STAGE2_ENTRY_LIMIT
     if len(chosen) < limit:
-        stage2_survivors.sort(key=lambda x: (x[4] if x[4] else 999.0))
-        for c in stage2_survivors:
-            if c not in chosen:
-                chosen.append(c)
+        remaining = [c for c in stage2_survivors if c not in chosen]
+        remaining.sort(key=lambda x: (x[4] if x[4] else 999.0))
+        for c in remaining:
+            chosen.append(c)
             if len(chosen) >= limit:
                 break
 
     topN_candidates = chosen
-    print(f"[+] [阶段 2/5] 分层入围结果: 美西 {len(us_candidates)} / 亚太 {len(apac_candidates)} / 其他 {len(other_candidates)}，进入沙箱 {len(topN_candidates)} 个")
+    hk_in = sum(1 for c in topN_candidates if detect_node_region(c[3], c[5] if len(c)>5 else '', c[0]) == 'HK')
+    tw_in = sum(1 for c in topN_candidates if detect_node_region(c[3], c[5] if len(c)>5 else '', c[0]) == 'TW')
+    jp_in = sum(1 for c in topN_candidates if detect_node_region(c[3], c[5] if len(c)>5 else '', c[0]) == 'JP')
+    sg_in = sum(1 for c in topN_candidates if detect_node_region(c[3], c[5] if len(c)>5 else '', c[0]) == 'SG')
+    us_in = sum(1 for c in topN_candidates if detect_node_region(c[3], c[5] if len(c)>5 else '', c[0]) == 'US')
+    print(f"[+] [阶段 2/5] 区域分层入围沙箱结果: HK={len(region_buckets['HK'])}个(选{hk_in}) "
+          f"TW={len(region_buckets['TW'])}个(选{tw_in}) "
+          f"JP={len(region_buckets['JP'])}个(选{jp_in}) "
+          f"SG={len(region_buckets['SG'])}个(选{sg_in}) "
+          f"US={len(region_buckets['US'])}个(选{us_in}) "
+          f"(共 {len(topN_candidates)} 个进入沙箱测试)")
 
     # ================= 阶段 3 v2：真实质量门 =================
     sandbox = None
@@ -1702,6 +1873,9 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
             for future in as_completed(future_map):
                 res = future.result()
                 if res:
+                    c = future_map[future]
+                    rem = c[5] if len(c) > 5 else ""
+                    reg = detect_node_region(res['colo'], rem, res['ip'])
                     e2e_results.append({
                         'ip': res['ip'],
                         'port': res['port'],
@@ -1709,9 +1883,11 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                         'e2e_avg_rtt': res['avg_rtt'],
                         'e2e_jitter': res['jitter'],
                         'youtube_rtt': res['median_rtt'],
-                        'exit_country': target_country or 'US',
+                        'exit_country': target_country or 'AUTO',
                         'exit_ip': 'Anycast',
                         'quality_gate_version': 1,  # 标记为旧版直连兜底
+                        'remark': rem,
+                        'region': reg
                     })
 
     print(f"[+] [阶段 3/5] 全链路真实可用性检测完毕，通过严格质检节点数: {len(e2e_results)} / {len(topN_candidates)}")
@@ -1721,9 +1897,35 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
             sandbox.stop()
         return
 
-    # 按全链路 RTT 排序，取前 N 名进行真实微吞吐测速（放大入围数，确保测速后仍足量凑满 Top 15）
-    e2e_results.sort(key=lambda x: (x['e2e_avg_rtt'], x['e2e_jitter']))
-    candidates_for_speed = e2e_results[:STAGE4_SPEED_LIMIT]
+    # 阶段 4 测速入围分层：确保 HK/TW/JP/SG/US 各区域足额进入吞吐测速
+    for node in e2e_results:
+        if 'region' not in node:
+            node['region'] = detect_node_region(node.get('colo', ''), node.get('remark', ''), node.get('ip', ''))
+
+    stage4_region_budgets = {'HK': 7, 'TW': 7, 'JP': 7, 'SG': 7, 'US': 15}
+    speed_buckets = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'US': [], 'OTHER': []}
+    for node in e2e_results:
+        r = node.get('region', 'US')
+        if r in speed_buckets:
+            speed_buckets[r].append(node)
+        else:
+            speed_buckets['OTHER'].append(node)
+
+    for r in speed_buckets:
+        speed_buckets[r].sort(key=lambda x: (x['e2e_avg_rtt'], x['e2e_jitter']))
+
+    candidates_for_speed = []
+    for r, b_quota in stage4_region_budgets.items():
+        candidates_for_speed.extend(speed_buckets[r][:b_quota])
+
+    # 若仍有剩余测速配额，按端到端 RTT 择优补齐
+    if len(candidates_for_speed) < STAGE4_SPEED_LIMIT:
+        remaining_speed = [n for n in e2e_results if n not in candidates_for_speed]
+        remaining_speed.sort(key=lambda x: (x['e2e_avg_rtt'], x['e2e_jitter']))
+        for n in remaining_speed:
+            candidates_for_speed.append(n)
+            if len(candidates_for_speed) >= STAGE4_SPEED_LIMIT:
+                break
 
     # ================= 阶段 4：过隧道真实吞吐测速（方向 A） =================
     print(f"\n[+] [阶段 4/5] 启动过隧道真实吞吐测速 (时长 {SPEED_TEST_DURATION}s×2轮 / 并发 {SPEED_TEST_PARALLEL} / 入围 {len(candidates_for_speed)} 节点)...")
@@ -1831,25 +2033,57 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         if sandbox is not None:
             sandbox.stop()
 
-    # ================= 阶段 5：综合评分排序并导出 Top 15 =================
-    candidates_for_speed.sort(key=lambda x: (-x['score'], x['e2e_avg_rtt'], -x['speed']))
-    selected_nodes = candidates_for_speed[:TOP_COUNT]
+    # ================= 阶段 5：分区域配额综合评分严选与导出 =================
+    region_candidates = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'US': [], 'OTHER': []}
+    for node in candidates_for_speed:
+        reg = node.get('region') or detect_node_region(node.get('colo', ''), node.get('remark', ''), node.get('ip', ''))
+        node['region'] = reg
+        if reg in region_candidates:
+            region_candidates[reg].append(node)
+        else:
+            region_candidates['OTHER'].append(node)
 
-    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质全链路真优选节点 ({tag}专属 / 全链路Google+YouTube实测+美区出口):")
+    for reg in region_candidates:
+        region_candidates[reg].sort(key=lambda x: (-x['score'], x['e2e_avg_rtt'], -x['speed']))
+
+    # 按照 HK:5, TW:5, JP:5, SG:5, US:10 顺序提取各区域专属优质节点
+    selected_nodes = []
+    for reg, quota in DEFAULT_REGION_QUOTAS.items():
+        chosen_reg = region_candidates[reg][:quota]
+        selected_nodes.extend(chosen_reg)
+
+    # 若特定区域候选不足导致总数未达目标上限 (默认 30)，从剩余候选节点中全局择优补齐
+    total_quota_target = sum(DEFAULT_REGION_QUOTAS.values())
+    if len(selected_nodes) < total_quota_target:
+        remaining_pool = [n for n in candidates_for_speed if n not in selected_nodes]
+        remaining_pool.sort(key=lambda x: (-x['score'], x['e2e_avg_rtt'], -x['speed']))
+        for n in remaining_pool:
+            selected_nodes.append(n)
+            if len(selected_nodes) >= total_quota_target:
+                break
+
+    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质全链路多区域优选节点 ({tag}专属 / 全链路Google+YouTube实测 / 配额 HK:5 TW:5 JP:5 SG:5 US:10):")
     output_lines = []
     detail_nodes = []
     update_time_str = time.strftime('%Y-%m-%d %H:%M:%S')
 
+    region_rank_counter = {}
     for idx, node in enumerate(selected_nodes, 1):
         colo_str = node.get('colo') or 'CF'
-        line = format_node_line(node['ip'], node['port'], node['score'], idx, tag, node['speed'], colo_str)
+        reg = node.get('region') or detect_node_region(colo_str, node.get('remark', ''), node['ip'])
+        region_rank_counter[reg] = region_rank_counter.get(reg, 0) + 1
+        reg_rank = region_rank_counter[reg]
+
+        line = format_node_line(node['ip'], node['port'], node['score'], reg_rank, tag, node['speed'], colo_str, region=reg)
         output_lines.append(line)
-        cf_flag = "CF官方" if node.get('is_cf', True) else "第三方"
+        cf_flag = "CF官方" if node.get('is_cf', True) else "第三方反代"
         print(f"  [{idx:02d}] {line} | 评分: {node['score']:.1f} | 机房: {colo_str} | 端到端RTT: {node['e2e_avg_rtt']:.0f}ms | 抖动: {node['e2e_jitter']:.0f}ms ({cf_flag})")
 
-        remark_str = line.split('#', 1)[1] if '#' in line else f"US-{tag}-{idx:02d}-{node['speed']:.2f}MB/s"
+        remark_str = line.split('#', 1)[1] if '#' in line else f"{reg}-{tag}-{reg_rank:02d}-{node['speed']:.2f}MB/s"
         detail_nodes.append({
             'index': idx,
+            'region': reg,
+            'region_rank': reg_rank,
             'ip': node['ip'],
             'port': str(node['port']),
             'colo': colo_str,
@@ -1863,7 +2097,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
             'e2e_jitter': round(float(node.get('e2e_jitter', 0.0)), 1),
             'youtube_rtt': round(float(node.get('youtube_rtt', 0.0)), 1),
             'youtube_status': 'ok' if (node.get('youtube_rtt') and node.get('youtube_rtt') > 0) else 'fail',
-            'exit_country': node.get('exit_country') or (target_country or 'US'),
+            'exit_country': node.get('exit_country') or (target_country or 'AUTO'),
             'exit_ip': node.get('exit_ip') or 'Anycast',
             'is_cf': bool(node.get('is_cf', True)),
             'remark': remark_str
@@ -1883,25 +2117,28 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
 
     # 生成结构化 JSON 详情文件供 LuCI 界面展示
     detail_path = os.path.splitext(target_path)[0] + "_detail.json"
+    region_dist = {r: sum(1 for n in detail_nodes if n.get('region') == r) for r in DEFAULT_REGION_QUOTAS}
     detail_data = {
         'file': os.path.basename(target_path),
         'tag': tag,
         'update_time': update_time_str,
         'count': len(detail_nodes),
+        'region_distribution': region_dist,
         'sandbox_config': {
             'enabled': bool(sandbox_enable),
             'sni': vless_tpl.get('sni', DEFAULT_VLESS_SNI),
             'uuid': vless_tpl.get('uuid', DEFAULT_VLESS_UUID),
             'path': vless_tpl.get('path', DEFAULT_VLESS_PATH),
             'port': str(vless_tpl.get('port', '443')),
-            'target_country': target_country or 'US'
+            'target_country': target_country or 'AUTO'
         },
         'nodes': detail_nodes
     }
     with open(detail_path, 'w', encoding='utf-8') as f:
         json.dump(detail_data, f, ensure_ascii=False, indent=2)
 
-    print(f"\n[+] 优选结果已写入: {target_path}")
+    print(f"\n[+] 优选完成！各区域节点分布: " + ", ".join(f"{r}={c}" for r, c in region_dist.items()))
+    print(f"[+] 优选结果已写入: {target_path}")
     print(f"[+] 优选详情已写入: {detail_path}")
 
 
@@ -1914,7 +2151,7 @@ def main():
     parser.add_argument("--uuid", default=os.environ.get("VLESS_UUID", None), help="VLESS UUID")
     parser.add_argument("--path", default=os.environ.get("VLESS_PATH", None), help="VLESS WebSocket 路径")
     parser.add_argument("--port", default=os.environ.get("VLESS_PORT", "443"), help="VLESS 端口")
-    parser.add_argument("--target-country", default=os.environ.get("TARGET_COUNTRY", "US"), help="期望落地出口国家 (默认 US)")
+    parser.add_argument("--target-country", default=os.environ.get("TARGET_COUNTRY", "AUTO"), help="期望落地出口国家 (默认 AUTO 自动就近，支持 AUTO/US/HK/TW/JP/SG)")
     parser.add_argument("--sandbox", default=os.environ.get("SANDBOX_ENABLE", "1"), help="是否启用沙箱质检 (1 或 0)")
 
     args = parser.parse_args()

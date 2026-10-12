@@ -1024,9 +1024,9 @@ return view.extend({
 		o.placeholder = '443';
 		o.depends('sandbox_enable', '1');
 
-		o = s.option(form.Value, 'target_country', _('目标出口落地国家'), _('质检时要求真实出口落地所属的国家代码 (如 US、HK、JP，不匹配将一票否决)'));
-		o.default = 'US';
-		o.placeholder = 'US';
+		o = s.option(form.Value, 'target_country', _('目标出口落地国家'), _('质检时要求真实出口落地所属的国家代码 (填 AUTO 自动就近匹配亚太与美区出口；也可填指定国家如 US、HK 等)'));
+		o.default = 'AUTO';
+		o.placeholder = 'AUTO';
 		o.depends('sandbox_enable', '1');
 
 		o = s.option(form.Value, 'random_cf_count', _('随机采样 CF 节点数'), _('除数据源外，从 Cloudflare Anycast 网段随机撒点生成的候选节点数 (edgetunnel 在线优选同机制，默认 1500；数值越大候选池越大，耗时越长)'));
@@ -1039,9 +1039,9 @@ return view.extend({
 		o.placeholder = '75';
 		o.rmempty = true;
 
-		o = s.option(form.Value, 'stage4_speed_limit', _('测速入围上限'), _('阶段4 真实微吞吐测速的节点数上限 (默认 30)'));
-		o.default = '30';
-		o.placeholder = '30';
+		o = s.option(form.Value, 'stage4_speed_limit', _('测速入围上限'), _('阶段4 真实微吞吐测速的节点数上限 (默认 45，保障各区域配额充足)'));
+		o.default = '45';
+		o.placeholder = '45';
 		o.rmempty = true;
 
 		/* v1.4.0+ 阶段 4 改为过隧道 + 时长 + 并发测速；speed_test_* 参数决定测速精度与耗时。 */
