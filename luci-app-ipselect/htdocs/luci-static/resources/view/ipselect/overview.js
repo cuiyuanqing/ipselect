@@ -355,10 +355,14 @@ return view.extend({
 						_('更新时间：'),
 						E('strong', {}, [updateTime])
 					]),
-					E('span', {}, [
+					E('span', { 'style': 'margin-right:16px;' }, [
 						_('有效质检节点数：'),
 						E('strong', { 'style': 'color:#28a745;' }, [count + ' ' + _('个')])
-					])
+					]),
+					(res.min_speed_threshold != null ? E('span', {}, [
+						_('保底速率门槛：'),
+						E('strong', { 'style': 'color:#0072c6;' }, ['≥ ' + res.min_speed_threshold + ' MB/s'])
+					]) : '')
 				]),
 				E('div', {}, [
 					E('button', {
@@ -1068,6 +1072,16 @@ return view.extend({
 		o = s.option(form.Value, 'speed_test_max_bytes_per_ip', _('单 IP 累计下载上限(MB)'), _('节点测速累计下载字节上限；远低于任何 edge 反爬阈值 (默认 80)'));
 		o.default = '80';
 		o.placeholder = '80';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'min_speed_threshold', _('保底下载速率门槛(MB/s)'), _('全区域入选节点的硬性最低带宽门槛，低于此速率的节点坚决不予保留导出 (默认 3.0，建议 2.5-5.0)'));
+		o.default = '3.0';
+		o.placeholder = '3.0';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'max_refill_rounds', _('达标不足最大补位轮数'), _('当达标节点不足目标配额时，自动从备选池增量补测的重试轮次上限 (默认 2，建议 1-3)'));
+		o.default = '2';
+		o.placeholder = '2';
 		o.rmempty = true;
 
 		var tabSettings = E('div', {

@@ -793,17 +793,17 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
         else:
             tier1_buckets['OTHER'].append(cand)
 
-    tier2_budgets = {'HK': 6, 'TW': 6, 'JP': 6, 'SG': 6, 'KR': 6, 'US': 10}
+    tier2_budgets = {'HK': 10, 'TW': 10, 'JP': 10, 'SG': 10, 'KR': 8, 'US': 22}
     tier2_candidates = []
     for reg, b_quota in tier2_budgets.items():
         tier2_candidates.extend(tier1_buckets[reg][:b_quota])
 
-    if len(tier2_candidates) < 25:
+    if len(tier2_candidates) < 35:
         remaining_t1 = [c for c in tier1_alive if c not in tier2_candidates]
         remaining_t1.sort(key=lambda x: (x['avg_rtt'], x['jitter']))
         for c in remaining_t1:
             tier2_candidates.append(c)
-            if len(tier2_candidates) >= 25:
+            if len(tier2_candidates) >= 35:
                 break
 
     if not tier2_candidates:
@@ -1452,6 +1452,9 @@ SPEED_TEST_SOURCES_DEFAULT = (
 )
 
 
+_SPEED_SOURCE_INDEX = {}
+
+
 def get_speed_sources_for_region(region: str) -> tuple:
     reg = (region or "").upper()
     if reg in ("HK", "TW", "SG"):
@@ -1461,6 +1464,18 @@ def get_speed_sources_for_region(region: str) -> tuple:
     elif reg == "US":
         return SPEED_TEST_SOURCES_US
     return SPEED_TEST_SOURCES_DEFAULT
+
+
+def get_speed_sources_for_region_rr(region: str) -> tuple:
+    """获取指定区域的测速源，按全局轮询指针交替轮转首选测速源 (避免节点连续请求同一源)"""
+    sources = list(get_speed_sources_for_region(region))
+    if not sources:
+        return SPEED_TEST_SOURCES_DEFAULT
+    reg_key = (region or "DEFAULT").upper()
+    curr_idx = _SPEED_SOURCE_INDEX.get(reg_key, 0)
+    _SPEED_SOURCE_INDEX[reg_key] = (curr_idx + 1) % len(sources)
+    rotated = sources[curr_idx:] + sources[:curr_idx]
+    return tuple(rotated)
 
 
 def probe_throughput_speed(
@@ -1524,10 +1539,11 @@ def probe_throughput_speed(
             return 5
 
     def _single_download(url: str) -> tuple:
-        """跑一个 duration 秒时间窗的单个 HTTPS GET，返回 (bytes, elapsed, hit_429)"""
+        """跑一个 duration 秒时间窗的单个 HTTPS GET，返回 (bytes, elapsed, hit_429, is_tunnel_broken)"""
         received = 0
         start_t = time.time()
         hit_429 = False
+        is_tunnel_broken = False
         try:
             with opener.open(_build_request(url), timeout=duration + 1.0) as res:
                 while True:
@@ -1552,33 +1568,44 @@ def probe_throughput_speed(
                       f"after_received_bytes={received} retry_after={retry_after}s "
                       f"headers={dict(getattr(e, 'headers', {})) if getattr(e, 'headers', None) else '{}'}")
             else:
-                print(f"[DBG-NO-DATA] _single_download HTTPError code={e.code} url={url} via Mihomo:19998 "
+                print(f"[DBG-NO-DATA] _single_download HTTPError code={e.code} url={url} via Mihomo:{proxy_port} "
                       f"reason={getattr(e, 'reason', '?')} headers={dict(getattr(e, 'headers', {})) if getattr(e, 'headers', None) else '{}'}")
         except Exception as e:
-            # [DEBUG-NO-DATA] 关键日志：捕获所有非 HTTPError 异常（连接超时/被代理拒绝等）
-            print(f"[DBG-NO-DATA] _single_download Exception type={type(e).__name__} msg={str(e)[:150]} "
-                  f"url={url} via Mihomo:19998 after_received_bytes={received}")
+            err_name = type(e).__name__
+            err_msg = str(e)
+            print(f"[DBG-NO-DATA] _single_download Exception type={err_name} msg={err_msg[:150]} "
+                  f"url={url} via Mihomo:{proxy_port} after_received_bytes={received}")
+            if any(term in err_msg or term in err_name for term in (
+                "RemoteDisconnected", "UNEXPECTED_EOF", "ConnectionReset", "ConnectionRefused",
+                "ConnectionAborted", "BrokenPipe", "The handshake operation timed out", "timed out"
+            )):
+                is_tunnel_broken = True
+            elif received == 0:
+                is_tunnel_broken = True
         elapsed = max(0.05, time.time() - start_t)
-        return received, elapsed, hit_429
+        return received, elapsed, hit_429, is_tunnel_broken
 
     def _run_parallel_round(src_url: str, workers: int) -> tuple:
         """并发启动 workers 个下载，全部命中 src_url (单源限流控制清晰)。
-        返回 (total_bytes, wall_clock_elapsed, hit_429)"""
+        返回 (total_bytes, wall_clock_elapsed, hit_429, any_tunnel_broken)"""
         wall_start = time.time()
         total_bytes = 0
         hit_429 = False
+        any_tunnel_broken = False
         with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
             futures = [executor.submit(_single_download, src_url) for _ in range(max(1, workers))]
             for fut in as_completed(futures):
                 try:
-                    got_bytes, _worker_elapsed, got_429 = fut.result()
+                    got_bytes, _worker_elapsed, got_429, got_broken = fut.result()
                 except Exception:
-                    got_bytes, _worker_elapsed, got_429 = 0, duration, False
+                    got_bytes, _worker_elapsed, got_429, got_broken = 0, duration, False, True
                 total_bytes += got_bytes
                 if got_429:
                     hit_429 = True
+                if got_broken:
+                    any_tunnel_broken = True
         elapsed = max(0.05, time.time() - wall_start)
-        return total_bytes, elapsed, hit_429
+        return total_bytes, elapsed, hit_429, any_tunnel_broken
 
     samples = []
     retries = 0
@@ -1593,17 +1620,26 @@ def probe_throughput_speed(
         if not src_pool:
             break
         curr_url = src_pool[src_idx % len(src_pool)]
-        bytes_done, elapsed, hit_429 = _run_parallel_round(curr_url, parallel)
+        bytes_done, elapsed, hit_429, tunnel_broken = _run_parallel_round(curr_url, parallel)
 
-        # 故障转移：如果该源返回 429 或下载数据 < 10KB (说明该源被限速或失效)，立即无缝切换到下一提供商源
-        if (hit_429 or bytes_done < 10240) and retries < max_retry and len(src_pool) > 1:
+        # 快速熔断：如果节点代理隧道断连/不可达且无数据，说明是节点本身断流，立即放弃该节点，绝不触发测速源切换
+        if tunnel_broken and bytes_done == 0:
+            print(f"[DBG-NO-DATA] 节点代理隧道断连/不可达 (tunnel_broken=True, bytes=0)，直接快速熔断标记失败，跳过无效故障转移")
+            status = "no_data"
+            break
+
+        # 故障转移：仅当测速源返回 429 或下载受限 (且非代理隧道断连) 时，才切换到下一提供商源
+        if (hit_429 or (bytes_done < 10240 and not tunnel_broken)) and retries < max_retry and len(src_pool) > 1:
             retries += 1
             src_idx += 1
             next_url = src_pool[src_idx % len(src_pool)]
             print(f"[DBG-NO-DATA] 测速源故障转移轮换: {curr_url} (hit_429={hit_429}, bytes={bytes_done}) -> {next_url}")
             time.sleep(0.5 + random.uniform(0, 0.5))
-            bytes_done, elapsed, hit_429 = _run_parallel_round(next_url, parallel)
+            bytes_done, elapsed, hit_429, tunnel_broken = _run_parallel_round(next_url, parallel)
             curr_url = next_url
+            if tunnel_broken and bytes_done == 0:
+                status = "no_data"
+                break
 
         if hit_429:
             # [修复] 保留已收集的合法 samples（hit_429 只标记本轮 retry 后仍受限，不丢弃上轮真实数据）
@@ -1858,16 +1894,223 @@ def probe_node_multidimensional(candidate):
     return stab
 
 
+def run_stage3_and_stage4_batch(
+    batch_candidates,
+    vless_tpl,
+    target_country="AUTO",
+    sandbox_enable=True,
+    mock_mode=False,
+    round_idx=1
+) -> list:
+    """
+    单批次执行阶段 3 (真实质量门) 与阶段 4 (真实吞吐测速)。
+    返回本批次测试完成的候选节点列表 (包含 speed, score, region 等维度)。
+    """
+    if not batch_candidates:
+        return []
+
+    candidate_name_map = {(c[0], c[1]): f"node_{idx:02d}" for idx, c in enumerate(batch_candidates, 1)}
+    sandbox = None
+    e2e_results = []
+    use_sandbox = bool(sandbox_enable) and (mock_mode or (find_clash_core() is not None))
+
+    if use_sandbox:
+        print(f"[*] [批次 {round_idx}] 加载 VLESS 代理模板: SNI={vless_tpl.get('sni')}, UUID={vless_tpl.get('uuid', '')[:8]}..., 目标国家={target_country}")
+        sandbox = MihomoSandbox(
+            candidates=batch_candidates,
+            vless_template=vless_tpl,
+            work_dir="/tmp/ipselect_sandbox" if not mock_mode else tempfile.mkdtemp(prefix="mock_sb_"),
+            api_port=19098,
+            proxy_port=19998,
+            mock_mode=mock_mode
+        )
+        if sandbox.start():
+            print(f"[+] [批次 {round_idx}] 隔离沙箱启动成功 (外部控制端口: 19098, 本地代理端口: 19998, GID=65534 直连)")
+            try:
+                e2e_results, stage3_status = run_stage3_real_quality_gate(
+                    batch_candidates, sandbox, target_country,
+                    api_port=19098, proxy_port=19998, max_duration_sec=600,
+                )
+                globals()['_STAGE3_STATUS'] = stage3_status
+            except Exception as _sb_e:
+                print(f"[!] [批次 {round_idx}] 阶段 3 沙箱执行异常: {_sb_e}")
+                sandbox.stop()
+                raise
+        else:
+            print(f"[!] [批次 {round_idx}] 沙箱启动失败，平滑回退至直连稳定性测定")
+    else:
+        if not sandbox_enable:
+            print(f"[*] [批次 {round_idx}] 沙箱严选配置已停用，使用直连 TLS 稳定性测定模式")
+        else:
+            print(f"[!] [批次 {round_idx}] 当前系统未安装 clash_meta 内核，平滑回级至传统直连 TLS 稳定性测定")
+
+    # 沙箱未启动 / 未产出结果 → 沿用直连兜底
+    if not e2e_results:
+        print(f"[!] [批次 {round_idx}] 启动直连稳定性深测回退兜底模式...")
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_map = {executor.submit(probe_stability, c[0], c[1]): c for c in batch_candidates}
+            for future in as_completed(future_map):
+                res = future.result()
+                if res:
+                    c = future_map[future]
+                    rem = c[5] if len(c) > 5 else ""
+                    reg = detect_node_region(res['colo'], rem, res['ip'])
+                    p_name = candidate_name_map.get((res['ip'], res['port']), "node_01")
+                    e2e_results.append({
+                        'proxy_name': p_name,
+                        'ip': res['ip'],
+                        'port': res['port'],
+                        'colo': res['colo'],
+                        'e2e_avg_rtt': res['avg_rtt'],
+                        'e2e_jitter': res['jitter'],
+                        'youtube_rtt': res['median_rtt'],
+                        'exit_country': target_country or 'AUTO',
+                        'exit_ip': 'Anycast',
+                        'quality_gate_version': 1,
+                        'remark': rem,
+                        'region': reg
+                    })
+
+    print(f"[+] [阶段 3/5 批次 {round_idx}] 全链路真实可用性检测完毕，通过严格质检节点数: {len(e2e_results)} / {len(batch_candidates)}")
+    if not e2e_results:
+        if sandbox is not None:
+            sandbox.stop()
+        return []
+
+    # 阶段 4 测速入围分层
+    for node in e2e_results:
+        if 'region' not in node:
+            node['region'] = detect_node_region(node.get('colo', ''), node.get('remark', ''), node.get('ip', ''))
+
+    stage4_region_budgets = {'HK': 10, 'TW': 10, 'JP': 10, 'SG': 10, 'KR': 6, 'US': 24}
+    speed_buckets = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'KR': [], 'US': [], 'OTHER': []}
+    for node in e2e_results:
+        r = node.get('region', 'US')
+        if r in speed_buckets:
+            speed_buckets[r].append(node)
+        else:
+            speed_buckets['OTHER'].append(node)
+
+    for r in speed_buckets:
+        speed_buckets[r].sort(key=lambda x: (x['e2e_avg_rtt'], x['e2e_jitter']))
+
+    candidates_for_speed = []
+    for r, b_quota in stage4_region_budgets.items():
+        candidates_for_speed.extend(speed_buckets[r][:b_quota])
+
+    if len(candidates_for_speed) < STAGE4_SPEED_LIMIT:
+        remaining_speed = [n for n in e2e_results if n not in candidates_for_speed]
+        remaining_speed.sort(key=lambda x: (x['e2e_avg_rtt'], x['e2e_jitter']))
+        for n in remaining_speed:
+            candidates_for_speed.append(n)
+            if len(candidates_for_speed) >= STAGE4_SPEED_LIMIT:
+                break
+
+    print(f"\n[+] [阶段 4/5 批次 {round_idx}] 启动过隧道真实吞吐测速 (时长 {SPEED_TEST_DURATION}s×2轮 / 并发 {SPEED_TEST_PARALLEL} / 入围 {len(candidates_for_speed)} 节点)...")
+
+    def _probe_one_node(node, mock_speed_value):
+        if not mock_mode and sandbox is not None and sandbox.is_ready():
+            proxy_name = node.get("proxy_name")
+            if not proxy_name or proxy_name == "node_??":
+                proxy_name = candidate_name_map.get((node.get("ip"), node.get("port")), "node_01")
+                node["proxy_name"] = proxy_name
+            switched = sandbox.switch_proxy(proxy_name)
+            if not switched:
+                print(f"[DBG-NO-DATA] _probe_one_node switch_proxy FAILED ip={node['ip']}:{node['port']} proxy_name={proxy_name}")
+                node["speed"] = 0.0
+                node["speed_p90"] = 0.0
+                node["speed_stddev"] = 0.0
+                node["speed_samples"] = []
+                node["speed_status"] = "switch_failed"
+                node["score"] = 0.0
+                return
+
+        node_region = node.get("region") or detect_node_region(node.get("colo", ""), node.get("remark", ""), node["ip"])
+        sources_to_use = get_speed_sources_for_region_rr(node_region)
+
+        if mock_mode:
+            res = probe_throughput_speed(
+                ip=node["ip"], port=node["port"],
+                mock_speed=mock_speed_value,
+                duration=SPEED_TEST_DURATION,
+                parallel=SPEED_TEST_PARALLEL,
+                max_retry=SPEED_TEST_MAX_RETRY,
+                max_bytes_per_ip=SPEED_TEST_MAX_BYTES_MB * 1024 * 1024,
+                sources=sources_to_use,
+            )
+        else:
+            res = probe_throughput_speed(
+                ip=node["ip"], port=node["port"],
+                duration=SPEED_TEST_DURATION,
+                parallel=SPEED_TEST_PARALLEL,
+                max_retry=2,
+                max_bytes_per_ip=SPEED_TEST_MAX_BYTES_MB * 1024 * 1024,
+                sources=sources_to_use,
+                proxy_port=19998,
+            )
+        node["speed"] = res["speed"]
+        node["speed_p90"] = res["p90"]
+        node["speed_stddev"] = res["stddev"]
+        node["speed_samples"] = res["samples"]
+        node["speed_status"] = res["status"]
+
+        if res["status"] != "ok":
+            print(f"[DBG-NO-DATA] _probe_one_node NON-OK ip={node['ip']}:{node['port']} "
+                  f"speed={res['speed']} status={res['status']} bytes={res.get('bytes_downloaded', 0)} "
+                  f"retries={res.get('retries', 0)} samples={res.get('samples', [])}")
+        if res["status"] not in ("ok", "ok_rate_limited_in_retry") and res["speed"] <= 0:
+            node["speed"] = 0.0
+
+        base_score = calculate_e2e_score(node["e2e_avg_rtt"], node["e2e_jitter"], node["speed"], node.get("colo"))
+        if res["stddev"] > 3.0:
+            base_score = max(0.0, base_score - 0.5)
+        node["score"] = base_score
+        node["is_cf"] = is_official_cloudflare_ip(node["ip"])
+
+    try:
+        if mock_mode:
+            for idx, node in enumerate(candidates_for_speed, 1):
+                # 默认模拟速度设在 3.6 MB/s ~ 8.0 MB/s，确保优质 mock 节点能达标
+                _probe_one_node(node, mock_speed_value=3.6 + idx * 0.2)
+        else:
+            consecutive_429 = 0
+            for idx, node in enumerate(candidates_for_speed, 1):
+                if idx > 1:
+                    base_jitter = random.uniform(1.0, 2.5)
+                    penalty_jitter = min(10.0, consecutive_429 * 1.5)
+                    time.sleep(base_jitter + penalty_jitter)
+                _probe_one_node(node, None)
+                last_status = node.get("speed_status", "")
+                if last_status in ("rate_limited", "no_data") and node.get("speed", 0) <= 0:
+                    consecutive_429 += 1
+                else:
+                    consecutive_429 = 0
+                if consecutive_429 >= 3:
+                    backoff_seconds = 30 + random.uniform(0, 10)
+                    print(f"[DBG-NO-DATA] [阶段 4/5 批次 {round_idx}] adaptive backoff: 连续 {consecutive_429} 个测速失败，暂停 {backoff_seconds:.1f}s")
+                    time.sleep(backoff_seconds)
+                    consecutive_429 = 0
+                if idx % 5 == 0:
+                    print(f"[DBG-NO-DATA] [阶段 4/5 批次 {round_idx}] 进度 {idx}/{len(candidates_for_speed)} 完成")
+    finally:
+        if sandbox is not None:
+            sandbox.stop()
+
+    return candidates_for_speed
+
+
 def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=None, mock_mode=False, mock_candidates=None,
                           vless_sni=None, vless_uuid=None, vless_path=None, vless_port=None,
-                          target_country="AUTO", sandbox_enable=True):
+                          target_country="AUTO", sandbox_enable=True,
+                          min_speed=None, max_refill_rounds=None):
     """
-    五阶漏斗端到端严选引擎：
+    五阶漏斗端到端严选引擎 (支持保底速率与动态分批补位流水线)：
     1. 阶段 1：快速 TCP 并发探针 (快速初筛死节点)
-    2. 阶段 2：TLS 握手与 cf-ray 机房质检 (Anycast POP 粗滤，入围 Top 25)
+    2. 阶段 2：TLS 握手与 cf-ray 机房质检 (Anycast POP 粗滤，保留全部存活池)
     3. 阶段 3：沙箱全链路真机实测 (直连绕过代理，VLESS 隧道并发探测 Google 204, YouTube 204 及 ip.sb 落地美国)
-    4. 阶段 4：真实微吞吐测速 (通过代理隧道测量 1MB 真实下载带宽)
-    5. 阶段 5：四维综合质量打分与降序导出 Top 15
+    4. 阶段 4：真实微吞吐测速 (通过代理隧道测量真实下载带宽，全局 Round-Robin 测速源 + 断流快速熔断)
+    5. 补位闭环：若达标 (speed >= min_speed) 节点不足目标配额，自动从阶段 2 备选池拉取批次补测
+    6. 阶段 5：硬性速率保底 (严格 >= min_speed) 与四维综合质量打分降序导出
     """
     try:
         if hasattr(sys.stdout, 'reconfigure'):
@@ -1875,12 +2118,24 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     except Exception:
         pass
 
+    if min_speed is None:
+        try:
+            min_speed = float(os.environ.get("MIN_SPEED_THRESHOLD", "3.0"))
+        except Exception:
+            min_speed = 3.0
+
+    if max_refill_rounds is None:
+        try:
+            max_refill_rounds = int(os.environ.get("MAX_REFILL_ROUNDS", "2"))
+        except Exception:
+            max_refill_rounds = 2
+
     if mock_mode and mock_candidates:
         candidates = mock_candidates
     else:
         candidates = fetch_candidates()
 
-    print(f"[*] 启动五阶漏斗全链路严选引擎 (环境标识: {tag}, 导出目标: {output_file})...")
+    print(f"[*] 启动五阶漏斗全链路严选引擎 (环境标识: {tag}, 导出目标: {output_file}, 速率保底门槛: {min_speed:.2f} MB/s, 最大补位轮数: {max_refill_rounds})...")
 
     # 数据源拉取就绪后，启动底层直连网络绕过（设置 GID=65534 绕过代理，直接测速真实延迟）
     if not mock_mode:
@@ -1942,7 +2197,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                 rem = c[3] if len(c) > 3 else ""
                 stage2_survivors.append((c[0], c[1], c[2], "CF", 200.0, rem))
 
-    # 候选节点区域分层入围策略：兼顾亚太各区 (HK, TW, JP, SG, KR) 与美区 (US)
+    # 候选节点区域分层待测队列：兼顾亚太各区 (HK, TW, JP, SG, KR) 与美区 (US)
     region_buckets = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'KR': [], 'US': [], 'OTHER': []}
     for c in stage2_survivors:
         colo = c[3]
@@ -1957,258 +2212,104 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     for r in region_buckets:
         region_buckets[r].sort(key=lambda x: (x[4] if x[4] else 999.0))
 
-    # 沙箱入围配额：亚太各区分配 12 个名额，美区分配 20 个名额，韩国分配 10 个名额，保障各区域样本充足
-    stage2_budgets = {'HK': 12, 'TW': 12, 'JP': 12, 'SG': 12, 'KR': 10, 'US': 20}
-    chosen = []
-    for r, b_quota in stage2_budgets.items():
-        chosen.extend(region_buckets[r][:b_quota])
+    # 缓存阶段 2 结果集供排查与复用
+    stage2_cache_file = "/tmp/ipselect_stage2_cache.json" if not mock_mode else os.path.join(tempfile.gettempdir(), "ipselect_stage2_cache.json")
+    try:
+        cache_data = {
+            r: [{"ip": c[0], "port": c[1], "colo": c[3], "rtt": c[4], "remark": c[5] if len(c) > 5 else ""} for c in region_buckets[r]]
+            for r in region_buckets
+        }
+        with open(stage2_cache_file, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False)
+        print(f"[*] 阶段 2 存活候选池已保存至缓存: {stage2_cache_file}")
+    except Exception:
+        pass
+
+    untested_candidates = {r: list(region_buckets[r]) for r in region_buckets}
+    tested_keys = set()
+    all_tested_nodes = []
+
+    # 初始批次抽取规划 (美区分配 22 个名额，亚太各 10 个，韩国 6 个)
+    initial_budgets = {'HK': 10, 'TW': 10, 'JP': 10, 'SG': 10, 'KR': 6, 'US': 22}
+    current_batch = []
+    for r, b_quota in initial_budgets.items():
+        pulled = untested_candidates[r][:b_quota]
+        current_batch.extend(pulled)
+        for c in pulled:
+            tested_keys.add((c[0], c[1]))
 
     limit = STAGE2_ENTRY_LIMIT
-    if len(chosen) < limit:
-        remaining = [c for c in stage2_survivors if c not in chosen]
+    if len(current_batch) < limit:
+        remaining = [c for c in stage2_survivors if (c[0], c[1]) not in tested_keys]
         remaining.sort(key=lambda x: (x[4] if x[4] else 999.0))
         for c in remaining:
-            chosen.append(c)
-            if len(chosen) >= limit:
+            current_batch.append(c)
+            tested_keys.add((c[0], c[1]))
+            if len(current_batch) >= limit:
                 break
 
-    topN_candidates = chosen
-    candidate_name_map = {(c[0], c[1]): f"node_{idx:02d}" for idx, c in enumerate(topN_candidates, 1)}
-    hk_in = sum(1 for c in topN_candidates if detect_node_region(c[3], c[5] if len(c)>5 else '', c[0]) == 'HK')
-    tw_in = sum(1 for c in topN_candidates if detect_node_region(c[3], c[5] if len(c)>5 else '', c[0]) == 'TW')
-    jp_in = sum(1 for c in topN_candidates if detect_node_region(c[3], c[5] if len(c)>5 else '', c[0]) == 'JP')
-    sg_in = sum(1 for c in topN_candidates if detect_node_region(c[3], c[5] if len(c)>5 else '', c[0]) == 'SG')
-    us_in = sum(1 for c in topN_candidates if detect_node_region(c[3], c[5] if len(c)>5 else '', c[0]) == 'US')
-    print(f"[+] [阶段 2/5] 区域分层入围沙箱结果: HK={len(region_buckets['HK'])}个(选{hk_in}) "
-          f"TW={len(region_buckets['TW'])}个(选{tw_in}) "
-          f"JP={len(region_buckets['JP'])}个(选{jp_in}) "
-          f"SG={len(region_buckets['SG'])}个(选{sg_in}) "
-          f"US={len(region_buckets['US'])}个(选{us_in}) "
-          f"(共 {len(topN_candidates)} 个进入沙箱测试)")
-
-    # ================= 阶段 3 v2：真实质量门 =================
-    sandbox = None
-    e2e_results = []
-    use_sandbox = bool(sandbox_enable) and (mock_mode or (find_clash_core() is not None))
     vless_tpl = detect_vless_template(cli_sni=vless_sni, cli_uuid=vless_uuid, cli_path=vless_path, cli_port=vless_port)
+    total_rounds = 1 + max_refill_rounds
+    round_idx = 1
 
-    if use_sandbox:
-        print(f"[*] 加载 VLESS 代理模板: SNI={vless_tpl['sni']}, UUID={vless_tpl['uuid'][:8]}..., PATH={vless_tpl['path']}, 目标国家={target_country}")
-        sandbox = MihomoSandbox(
-            candidates=topN_candidates,
-            vless_template=vless_tpl,
-            work_dir="/tmp/ipselect_sandbox" if not mock_mode else tempfile.mkdtemp(prefix="mock_sb_"),
-            api_port=19098,
-            proxy_port=19998,
-            mock_mode=mock_mode
+    while round_idx <= total_rounds and current_batch:
+        print(f"\n==================== 启动批次测试 [第 {round_idx}/{total_rounds} 轮] (待测节点: {len(current_batch)}, 速度门槛: {min_speed:.2f} MB/s) ====================")
+        batch_results = run_stage3_and_stage4_batch(
+            batch_candidates=current_batch,
+            vless_tpl=vless_tpl,
+            target_country=target_country,
+            sandbox_enable=sandbox_enable,
+            mock_mode=mock_mode,
+            round_idx=round_idx
         )
-        if sandbox.start():
-            print(f"[+] 隔离沙箱启动成功 (外部控制端口: 19098, 本地代理端口: 19998, GID=65534 直连)")
-            try:
-                e2e_results, stage3_status = run_stage3_real_quality_gate(
-                    topN_candidates, sandbox, target_country,
-                    api_port=19098, proxy_port=19998, max_duration_sec=600,
-                )
-                globals()['_STAGE3_STATUS'] = stage3_status
-            except Exception as _sb_e:
-                print(f"[!] 阶段 3 v2 沙箱执行异常: {_sb_e}")
-                sandbox.stop()
-                raise
-        else:
-            print("[!] 沙箱启动失败，平滑回退至直连稳定性测定")
-    else:
-        if not sandbox_enable:
-            print("[*] 沙箱严选配置已停用，使用直连 TLS 稳定性测定模式")
-        else:
-            print("[!] 当前系统未安装 clash_meta 内核，平滑回级至传统直连 TLS 稳定性测定")
+        all_tested_nodes.extend(batch_results)
 
-    # 沙箱未启动 / 未产出结果 → 沿用直连兜底
-    if not e2e_results:
-        print("[!] 启动直连稳定性深测回退兜底模式...")
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_map = {executor.submit(probe_stability, c[0], c[1]): c for c in topN_candidates}
-            for future in as_completed(future_map):
-                res = future.result()
-                if res:
-                    c = future_map[future]
-                    rem = c[5] if len(c) > 5 else ""
-                    reg = detect_node_region(res['colo'], rem, res['ip'])
-                    p_name = candidate_name_map.get((res['ip'], res['port']), "node_01")
-                    e2e_results.append({
-                        'proxy_name': p_name,
-                        'ip': res['ip'],
-                        'port': res['port'],
-                        'colo': res['colo'],
-                        'e2e_avg_rtt': res['avg_rtt'],
-                        'e2e_jitter': res['jitter'],
-                        'youtube_rtt': res['median_rtt'],
-                        'exit_country': target_country or 'AUTO',
-                        'exit_ip': 'Anycast',
-                        'quality_gate_version': 1,  # 标记为旧版直连兜底
-                        'remark': rem,
-                        'region': reg
-                    })
+        # 统计达标节点 (speed >= min_speed)
+        qualified_pool = [n for n in all_tested_nodes if n.get('speed', 0.0) >= min_speed]
+        qualified_by_reg = {r: sum(1 for n in qualified_pool if n.get('region') == r) for r in DEFAULT_REGION_QUOTAS}
 
-    print(f"[+] [阶段 3/5] 全链路真实可用性检测完毕，通过严格质检节点数: {len(e2e_results)} / {len(topN_candidates)}")
-    if not e2e_results:
-        print("[-] 错误: 无任何节点通过全链路真实代理考核。")
-        if sandbox is not None:
-            sandbox.stop()
-        return
+        print(f"\n[+] [轮次 {round_idx} 完毕] 达标节点统计 (门槛 >= {min_speed:.2f} MB/s): " +
+              ", ".join(f"{r}={qualified_by_reg.get(r, 0)}/{DEFAULT_REGION_QUOTAS[r]}" for r in DEFAULT_REGION_QUOTAS))
 
-    # 阶段 4 测速入围分层：确保 HK/TW/JP/SG/US 各区域足额进入吞吐测速
-    for node in e2e_results:
-        if 'region' not in node:
-            node['region'] = detect_node_region(node.get('colo', ''), node.get('remark', ''), node.get('ip', ''))
+        deficits = {r: max(0, DEFAULT_REGION_QUOTAS[r] - qualified_by_reg.get(r, 0)) for r in DEFAULT_REGION_QUOTAS}
+        total_deficit = sum(deficits.values())
 
-    stage4_region_budgets = {'HK': 7, 'TW': 7, 'JP': 7, 'SG': 7, 'KR': 5, 'US': 15}
-    speed_buckets = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'KR': [], 'US': [], 'OTHER': []}
-    for node in e2e_results:
-        r = node.get('region', 'US')
-        if r in speed_buckets:
-            speed_buckets[r].append(node)
-        else:
-            speed_buckets['OTHER'].append(node)
+        if total_deficit == 0:
+            print(f"[+] 目标达成！所有区域达标节点数均已满足配额要求 (门槛 >= {min_speed:.2f} MB/s)。")
+            break
 
-    for r in speed_buckets:
-        speed_buckets[r].sort(key=lambda x: (x['e2e_avg_rtt'], x['e2e_jitter']))
+        if round_idx >= total_rounds:
+            print(f"[!] 已达到最大补位轮次上限 ({max_refill_rounds} 轮)，停止补位测试。")
+            break
 
-    candidates_for_speed = []
-    for r, b_quota in stage4_region_budgets.items():
-        candidates_for_speed.extend(speed_buckets[r][:b_quota])
+        next_batch = []
+        for r, def_cnt in deficits.items():
+            if def_cnt > 0:
+                avail = [c for c in untested_candidates[r] if (c[0], c[1]) not in tested_keys]
+                pull_cnt = min(len(avail), max(def_cnt * 2, 8))
+                pulled = avail[:pull_cnt]
+                for c in pulled:
+                    tested_keys.add((c[0], c[1]))
+                next_batch.extend(pulled)
+                if pulled:
+                    print(f"  [*] 区域 {r} 缺口 {def_cnt} 个，从备选池追加抽取 {len(pulled)} 个优质节点进入下一轮补测")
 
-    # 若仍有剩余测速配额，按端到端 RTT 择优补齐
-    if len(candidates_for_speed) < STAGE4_SPEED_LIMIT:
-        remaining_speed = [n for n in e2e_results if n not in candidates_for_speed]
-        remaining_speed.sort(key=lambda x: (x['e2e_avg_rtt'], x['e2e_jitter']))
-        for n in remaining_speed:
-            candidates_for_speed.append(n)
-            if len(candidates_for_speed) >= STAGE4_SPEED_LIMIT:
-                break
+        if not next_batch:
+            print(f"[!] 备选池中已无更多未测节点，结束补位。")
+            break
 
-    # ================= 阶段 4：过隧道真实吞吐测速（方向 A） =================
-    print(f"\n[+] [阶段 4/5] 启动过隧道真实吞吐测速 (时长 {SPEED_TEST_DURATION}s×2轮 / 并发 {SPEED_TEST_PARALLEL} / 入围 {len(candidates_for_speed)} 节点)...")
-
-    # [DEBUG-NO-DATA] 关键日志：阶段 4 启动前打印沙箱存活状态与 Mihomo 当前 GLOBAL 代理指向，定位为何所有节点 no_data
-    if sandbox is not None:
-        sb_ready = sandbox.is_ready()
-        print(f"[DBG-NO-DATA] [阶段 4/5] sandbox.is_ready()={sb_ready} mock_mode={sandbox.mock_mode}")
-        if not sb_ready and not sandbox.mock_mode:
-            print(f"[DBG-NO-DATA] [阶段 4/5] 警告：沙箱未存活，所有过 19998 端口的 HTTP 代理请求都将失败 → no_data 根因")
-        if not sandbox.mock_mode and sb_ready:
-            try:
-                _gp = urllib.request.Request("http://127.0.0.1:19098/proxies/GLOBAL", headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(_gp, timeout=1.0) as _gr:
-                    _gstate = json.loads(_gr.read().decode('utf-8'))
-                    print(f"[DBG-NO-DATA] [阶段 4/5] Mihomo GLOBAL 当前指向: {_gstate}")
-            except Exception as _ge:
-                print(f"[DBG-NO-DATA] [阶段 4/5] 无法查询 Mihomo GLOBAL 当前指向: {type(_ge).__name__}: {_ge}")
-    else:
-        print(f"[DBG-NO-DATA] [阶段 4/5] 警告：sandbox 为 None，19998 端口上无代理提供下载转发，bytes_done 必然为 0")
-
-    def _probe_one_node(node, mock_speed_value):
-        # [per-node] 测速前先切 sandbox GLOBAL 到本节点，让每个节点测自己真实带宽（不影响生产 mihomo）
-        if not mock_mode and sandbox is not None and sandbox.is_ready():
-            proxy_name = node.get("proxy_name")
-            if not proxy_name or proxy_name == "node_??":
-                proxy_name = candidate_name_map.get((node.get("ip"), node.get("port")), "node_01")
-                node["proxy_name"] = proxy_name
-            switched = sandbox.switch_proxy(proxy_name)
-            if not switched:
-                print(f"[DBG-NO-DATA] _probe_one_node switch_proxy FAILED ip={node['ip']}:{node['port']} proxy_name={proxy_name}")
-                node["speed"] = 0.0
-                node["speed_p90"] = 0.0
-                node["speed_stddev"] = 0.0
-                node["speed_samples"] = []
-                node["speed_status"] = "switch_failed"
-                node["score"] = 0.0
-                return
-        # [per-node] 区域智能就近测速源 + 多源自动故障转移
-        node_region = node.get("region") or detect_node_region(node.get("colo", ""), node.get("remark", ""), node["ip"])
-        candidate_sources = list(get_speed_sources_for_region(node_region))
-        random.shuffle(candidate_sources)
-        sources_to_use = tuple(candidate_sources)
-
-        if mock_mode:
-            res = probe_throughput_speed(
-                ip=node["ip"], port=node["port"],
-                mock_speed=mock_speed_value,
-                duration=SPEED_TEST_DURATION,
-                parallel=SPEED_TEST_PARALLEL,
-                max_retry=SPEED_TEST_MAX_RETRY,
-                max_bytes_per_ip=SPEED_TEST_MAX_BYTES_MB * 1024 * 1024,
-                sources=sources_to_use,
-            )
-        else:
-            res = probe_throughput_speed(
-                ip=node["ip"], port=node["port"],
-                duration=SPEED_TEST_DURATION,
-                parallel=SPEED_TEST_PARALLEL,
-                max_retry=2,  # 允许至少 2 次不同源 failover
-                max_bytes_per_ip=SPEED_TEST_MAX_BYTES_MB * 1024 * 1024,
-                sources=sources_to_use,
-                proxy_port=19998,
-            )
-        node["speed"] = res["speed"]
-        node["speed_p90"] = res["p90"]
-        node["speed_stddev"] = res["stddev"]
-        node["speed_samples"] = res["samples"]
-        node["speed_status"] = res["status"]
-        # [修复] 仅在真正无数据时才把 speed 归零；有合法 samples（speed>0）时即使后续 round 被标记 no_data/rate_limited 也保留真实速度
-        if res["status"] != "ok":
-            # [DEBUG-NO-DATA] 关键日志：每个节点测速结束时若非 ok 状态立即打印
-            print(f"[DBG-NO-DATA] _probe_one_node NON-OK ip={node['ip']}:{node['port']} "
-                  f"speed={res['speed']} status={res['status']} bytes={res.get('bytes_downloaded', 0)} "
-                  f"retries={res.get('retries', 0)} samples={res.get('samples', [])}")
-        if res["status"] not in ("ok", "ok_rate_limited_in_retry") and res["speed"] <= 0:
-            # 真正没数据：speed 保持 0.0
-            node["speed"] = 0.0
-        elif res["status"] not in ("ok", "ok_rate_limited_in_retry") and res["speed"] > 0:
-            # 部分数据（如 round0 拿到速度，round1 限速导致最终 status=no_data）：保留 res["speed"]
-            # 因为 probe_throughput_speed 已经基于 samples 计算了 median_speed
-            pass
-        base_score = calculate_e2e_score(node["e2e_avg_rtt"], node["e2e_jitter"], node["speed"], node.get("colo"))
-        if res["stddev"] > 3.0:
-            base_score = max(0.0, base_score - 0.5)
-        node["score"] = base_score
-        node["is_cf"] = is_official_cloudflare_ip(node["ip"])
-
-    try:
-        if mock_mode:
-            for idx, node in enumerate(candidates_for_speed, 1):
-                _probe_one_node(node, mock_speed_value=2.5 + idx * 0.3)
-        else:
-            # [激进优化] 顺序测速避免多线程争抢 Mihomo GLOBAL selector 互相覆盖
-            # [激进优化] adaptive backoff：连续 3 个 rate_limited 自动暂停 30s + jitter（拉长节流窗口）
-            # [激进优化] jitter 拉宽 1-3s，让上游测速服务有更充分喘息时间
-            consecutive_429 = 0
-            for idx, node in enumerate(candidates_for_speed, 1):
-                if idx > 1:
-                    base_jitter = random.uniform(1.0, 3.0)
-                    penalty_jitter = min(10.0, consecutive_429 * 1.5)
-                    time.sleep(base_jitter + penalty_jitter)
-                _probe_one_node(node, None)
-                # 跟踪连续 rate_limited 数
-                last_status = node.get("speed_status", "")
-                if last_status in ("rate_limited", "no_data") and node.get("speed", 0) <= 0:
-                    consecutive_429 += 1
-                else:
-                    consecutive_429 = 0
-                if consecutive_429 >= 3:
-                    backoff_seconds = 30 + random.uniform(0, 10)
-                    print(f"[DBG-NO-DATA] [阶段 4/5] adaptive backoff: 连续 {consecutive_429} 个测速失败，暂停 {backoff_seconds:.1f}s 等待上游测速服务恢复")
-                    time.sleep(backoff_seconds)
-                    consecutive_429 = 0
-                if idx % 5 == 0:
-                    print(f"[DBG-NO-DATA] [阶段 4/5] 进度 {idx}/{len(candidates_for_speed)} 完成")
-    finally:
-        # 沙箱进程已无后续使用，主动释放（修复: 之前在阶段 3 finally 中提前 stop 导致阶段 4 speed=0）
-        if sandbox is not None:
-            sandbox.stop()
+        current_batch = next_batch
+        round_idx += 1
 
     # ================= 阶段 5：分区域配额综合评分严选与导出 =================
+    # 严格门槛过滤：仅保留 speed >= min_speed 的节点 (保底质量，宁缺毋滥)
+    qualified_pool = [n for n in all_tested_nodes if n.get('speed', 0.0) >= min_speed]
+    if not qualified_pool and all_tested_nodes:
+        print(f"[!] 警告: 全量测试节点中无任何节点达到 {min_speed:.2f} MB/s 门槛，启用安全降级模式 (保留测速最高者)")
+        qualified_pool = sorted(all_tested_nodes, key=lambda x: -x.get('speed', 0.0))[:sum(DEFAULT_REGION_QUOTAS.values())]
+
     region_candidates = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'KR': [], 'US': [], 'OTHER': []}
-    for node in candidates_for_speed:
+    for node in qualified_pool:
         reg = node.get('region') or detect_node_region(node.get('colo', ''), node.get('remark', ''), node.get('ip', ''))
         node['region'] = reg
         if reg in region_candidates:
@@ -2219,23 +2320,25 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     for reg in region_candidates:
         region_candidates[reg].sort(key=lambda x: (-x['score'], x['e2e_avg_rtt'], -x['speed']))
 
-    # 按照 HK:5, TW:5, JP:5, SG:5, US:10 顺序提取各区域专属优质节点
+    # 按照 HK:5, TW:5, JP:5, SG:5, US:10 顺序提取各区域专属优质达标节点
     selected_nodes = []
     for reg, quota in DEFAULT_REGION_QUOTAS.items():
         chosen_reg = region_candidates[reg][:quota]
         selected_nodes.extend(chosen_reg)
+        if len(chosen_reg) < quota:
+            print(f"[!] 提示: 区域 {reg} 满足 >= {min_speed:.2f} MB/s 的达标节点为 {len(chosen_reg)} 个 (目标 {quota} 个)")
 
-    # 若特定区域候选不足导致总数未达目标上限 (默认 30)，从剩余候选节点中全局择优补齐
+    # 仅在全量达标候选池中有多余达标节点时进行全局补齐 (绝不引入低于 min_speed 的劣质节点凑数)
     total_quota_target = sum(DEFAULT_REGION_QUOTAS.values())
     if len(selected_nodes) < total_quota_target:
-        remaining_pool = [n for n in candidates_for_speed if n not in selected_nodes]
+        remaining_pool = [n for n in qualified_pool if n not in selected_nodes]
         remaining_pool.sort(key=lambda x: (-x['score'], x['e2e_avg_rtt'], -x['speed']))
         for n in remaining_pool:
             selected_nodes.append(n)
             if len(selected_nodes) >= total_quota_target:
                 break
 
-    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质全链路多区域优选节点 ({tag}专属 / 全链路Google+YouTube实测 / 配额 HK:5 TW:5 JP:5 SG:5 US:10):")
+    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质全链路多区域达标优选节点 ({tag}专属 / 全链路实测 / 速率保底 >= {min_speed:.2f} MB/s):")
     output_lines = []
     detail_nodes = []
     update_time_str = time.strftime('%Y-%m-%d %H:%M:%S')
@@ -2255,7 +2358,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         remark_str = line.split('#', 1)[1] if '#' in line else f"{reg}-{tag}-{reg_rank:02d}-{node['speed']:.2f}MB/s"
         detail_nodes.append({
             'index': idx,
-            'proxy_name': node.get('proxy_name') or candidate_name_map.get((node['ip'], node['port']), f"node_{idx:02d}"),
+            'proxy_name': node.get('proxy_name') or f"node_{idx:02d}",
             'region': reg,
             'region_rank': reg_rank,
             'ip': node['ip'],
@@ -2297,6 +2400,8 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         'tag': tag,
         'update_time': update_time_str,
         'count': len(detail_nodes),
+        'min_speed_threshold': min_speed,
+        'refill_rounds_executed': round_idx,
         'region_distribution': region_dist,
         'sandbox_config': {
             'enabled': bool(sandbox_enable),
@@ -2327,6 +2432,8 @@ def main():
     parser.add_argument("--port", default=os.environ.get("VLESS_PORT", "443"), help="VLESS 端口")
     parser.add_argument("--target-country", default=os.environ.get("TARGET_COUNTRY", "AUTO"), help="期望落地出口国家 (默认 AUTO 自动就近，支持 AUTO/US/HK/TW/JP/SG)")
     parser.add_argument("--sandbox", default=os.environ.get("SANDBOX_ENABLE", "1"), help="是否启用沙箱质检 (1 或 0)")
+    parser.add_argument("--min-speed", type=float, default=None, help="最低保留下载带宽门槛 (MB/s, 默认 3.0)")
+    parser.add_argument("--max-refill-rounds", type=int, default=None, help="节点不足时的最大补位重试轮数 (默认 2)")
 
     args = parser.parse_args()
     tag, output_file = detect_network_environment(cli_tag=args.tag, cli_output=args.output)
@@ -2341,7 +2448,9 @@ def main():
         vless_path=args.path,
         vless_port=args.port,
         target_country=args.target_country,
-        sandbox_enable=sandbox_flag
+        sandbox_enable=sandbox_flag,
+        min_speed=args.min_speed,
+        max_refill_rounds=args.max_refill_rounds
     )
 
 
