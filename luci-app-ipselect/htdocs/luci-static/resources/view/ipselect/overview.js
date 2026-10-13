@@ -596,6 +596,27 @@ return view.extend({
 		s.anonymous = false;
 		s.addremove = false;
 
+		function addCardHeader(sec, key, title, desc, icon, color) {
+			var dummyCls = form.DummyValue || form.Value;
+			var h = sec.option(dummyCls, '_card_hdr_' + key);
+			h.rawhtml = true;
+			h.renderWidget = function() {
+				return E('div', {
+					'style': 'margin-top:24px; margin-bottom:14px; padding:12px 16px; background:#f8fafc; border-left:5px solid ' + (color || '#0072c6') + '; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,0.06); border-top:1px solid #e2e8f0; border-right:1px solid #e2e8f0; border-bottom:1px solid #e2e8f0;'
+				}, [
+					E('div', { 'style': 'font-size:15px; font-weight:bold; color:#0f172a; display:flex; align-items:center;' }, [
+						E('span', { 'style': 'margin-right:8px; font-size:18px;' }, [icon || '📌']),
+						E('span', {}, [title])
+					]),
+					desc ? E('div', { 'style': 'font-size:12px; color:#64748b; margin-top:4px; line-height:1.4;' }, [desc]) : ''
+				]);
+			};
+			return h;
+		}
+
+		/* ==================== 卡片 1: 基础常规与运行环境设置 ==================== */
+		addCardHeader(s, 'general', _('基础常规与运行环境设置'), _('配置优选服务的运行总开关、执行目录、网络标签与出站网卡接口'), '🏷️', '#0072c6');
+
 		var o;
 
 		/* 1. enabled */
@@ -630,9 +651,273 @@ return view.extend({
 		o.default = 'br-lan';
 		o.rmempty = false;
 
+		/* ==================== 卡片 2: 速率保底门槛与流水线补位 ==================== */
+		addCardHeader(s, 'speed', _('速率保底门槛与流水线补位'), _('配置入选节点的硬性保底流速过滤，以及达标不足时的智能分批增量补测流水线'), '🚀', '#10b981');
+
+		o = s.option(form.Value, 'min_speed_threshold', _('保底下载速率门槛(MB/s)'), _('全区域入选节点的硬性最低带宽门槛，低于此速率的节点坚决不予保留导出 (默认 3.0，建议 2.5-5.0)'));
+		o.default = '3.0';
+		o.placeholder = '3.0';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'max_refill_rounds', _('达标不足最大补位轮数'), _('当达标节点不足目标配额时，自动从备选池增量补测的重试轮次上限 (默认 2，建议 1-3)'));
+		o.default = '2';
+		o.placeholder = '2';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'speed_test_duration', _('单节点测速时长(秒)'), _('单节点 5 秒时间窗 × 2 轮取中位；越大越准但任务耗时变长 (默认 5，建议 3-8)'));
+		o.default = '5';
+		o.placeholder = '5';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'speed_test_parallel', _('单节点并发下载数'), _('节点内并发 HTTP GET 数；贴 YouTube 实际连接数 (默认 3，建议 2-4)'));
+		o.default = '3';
+		o.placeholder = '3';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'speed_test_node_concurrency', _('同时测速节点数'), _('阶段 4 同时并行测速的节点数；CPU 受限可调低 (默认 4)'));
+		o.default = '4';
+		o.placeholder = '4';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'speed_test_max_bytes_per_ip', _('单 IP 累计下载上限(MB)'), _('节点测速累计下载字节上限；远低于任何 edge 反爬阈值 (默认 80)'));
+		o.default = '80';
+		o.placeholder = '80';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'speed_test_max_retry', _('429/1020 重试次数'), _('节点测速命中 Cloudflare 限流时的重试次数；超过即弃用该节点 (默认 1)'));
+		o.default = '1';
+		o.placeholder = '1';
+		o.rmempty = true;
+
+		/* ==================== 卡片 3: 隔离沙箱全链路质检代理 ==================== */
+		addCardHeader(s, 'sandbox', _('隔离沙箱全链路质检代理'), _('基于轻量 Mihomo 隔离沙箱与 Linux GID 直连技术，穿透质检 Google、YouTube 与真实出口落地归属'), '🛡️', '#6366f1');
+
+		o = s.option(form.Flag, 'sandbox_enable', _('启用沙箱全链路质检'), _('穿透测试 Google 204、YouTube 204 及真实出口 IP 归属，杜绝虚假与死节点'));
+		o.default = '1';
+
+		o = s.option(form.Value, 'vless_sni', _('VLESS 服务域名 / SNI'), _('Cloudflare Worker 或 edgetunnel 的加速域名/SNI (如 proxy.19940407.xyz)'));
+		o.default = 'proxy.19940407.xyz';
+		o.placeholder = 'proxy.19940407.xyz';
+		o.depends('sandbox_enable', '1');
+
+		o = s.option(form.Value, 'vless_uuid', _('VLESS 节点 UUID'), _('与 Worker / edgetunnel 对应的用户身份 UUID'));
+		o.default = 'e295e2a9-13ad-4251-baa8-28ee1b5aeae9';
+		o.placeholder = 'e295e2a9-13ad-4251-baa8-28ee1b5aeae9';
+		o.depends('sandbox_enable', '1');
+
+		o = s.option(form.Value, 'vless_path', _('WebSocket 请求路径'), _('VLESS WebSocket 传输协议路径 (默认为 /)'));
+		o.default = '/';
+		o.placeholder = '/';
+		o.depends('sandbox_enable', '1');
+
+		o = s.option(form.Value, 'vless_port', _('VLESS 服务端口'), _('VLESS 远程连接端口 (默认为 443)'));
+		o.default = '443';
+		o.placeholder = '443';
+		o.depends('sandbox_enable', '1');
+
+		o = s.option(form.Value, 'target_country', _('目标出口落地国家'), _('质检时要求真实出口落地所属的国家代码 (填 AUTO 自动就近匹配亚太与美区出口；也可填指定国家如 US、HK 等)'));
+		o.default = 'AUTO';
+		o.placeholder = 'AUTO';
+		o.depends('sandbox_enable', '1');
+
+		o = s.option(form.Value, 'random_cf_count', _('随机采样 CF 节点数'), _('除数据源外，从 Cloudflare Anycast 网段随机撒点生成的候选节点数 (默认 1500)'));
+		o.default = '1500';
+		o.placeholder = '1500';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'stage2_entry_limit', _('沙箱入围上限'), _('阶段2 分层入围后进入沙箱全链路实测的节点数上限 (默认 75)'));
+		o.default = '75';
+		o.placeholder = '75';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'stage4_speed_limit', _('测速入围上限'), _('阶段4 真实微吞吐测速的节点数上限 (默认 45)'));
+		o.default = '45';
+		o.placeholder = '45';
+		o.rmempty = true;
+
+		/* ==================== 卡片 4: 自动化运维消息通知 (Telegram / 飞书) ==================== */
+		addCardHeader(s, 'notify', _('自动化运维消息通知 (Telegram / 飞书)'), _('任务完成时，自动将测速报告推送到 Telegram 频道或飞书群聊机器人'), '✈️', '#0ea5e9');
+
+		/* --- 4.1 Telegram 频道 / 机器人 --- */
+		o = s.option(form.Flag, 'telegram_enabled', _('启用 Telegram 通知'), _('优选任务维护完成后，自动推送到指定的 Telegram 频道或聊天'));
+		o.default = '0';
+
+		o = s.option(form.Value, 'telegram_bot_token', _('Telegram Bot Token'), _('由 @BotFather 创建生成的机器人令牌，例如：123456789:ABCdefGhI...'));
+		o.password = true;
+		o.placeholder = '123456789:ABCdefGhI...';
+		o.depends('telegram_enabled', '1');
+
+		o = s.option(form.Value, 'telegram_chat_id', _('Telegram 频道或 Chat ID'), _('目标频道的公开用户名 (如 @my_speedtest_channel，需先将 Bot 设为管理员) 或频道数字 ID (如 -1001234567890) 或个人 ID'));
+		o.placeholder = '@my_channel 或 -1001234567890';
+		o.depends('telegram_enabled', '1');
+
+		o = s.option(form.TextValue, 'telegram_template', _('Telegram 消息模板'), _('留空将使用内置精美模板。支持宏变量：{datetime} (更新时间), {tag} (线路标签), {tested_count} (测速数量), {colo_summary} (机房概览), {min_speed} (保底门槛), {regions_badge} (各区域节点统计)'));
+		o.placeholder = '留空使用内置默认模板';
+		o.rows = 5;
+		o.depends('telegram_enabled', '1');
+
+		var btnCls = form.DummyValue || form.Button || form.Value;
+		var testTgBtn = s.option(btnCls, '_test_telegram', _('测试 Telegram 推送'), _('发送一条测试消息至目标 Telegram 频道/聊天以验证配置'));
+		testTgBtn.depends('telegram_enabled', '1');
+		testTgBtn.renderWidget = function(section_id) {
+			var btn = E('button', {
+				'type': 'button',
+				'class': 'btn cbi-button cbi-button-action',
+				'style': 'padding:4px 14px; font-size:13px; cursor:pointer;'
+			}, ['📢 ' + _('测试发送 Telegram 消息')]);
+			var statusInline = E('span', { 'style': 'margin-left:12px; font-size:13px; vertical-align:middle; display:none;' });
+			var resultBox = E('div', { 'style': 'margin-top:10px; display:none; padding:10px 14px; border-radius:4px; font-size:13px; line-height:1.5; border:1px solid #ced4da; word-break:break-all;' });
+
+			btn.addEventListener('click', function() {
+				btn.disabled = true;
+				btn.textContent = '⏳ ' + _('正在发送...');
+				statusInline.style.display = 'inline-block';
+				statusInline.style.color = '#0ea5e9';
+				statusInline.textContent = '⏳ ' + _('正在向 Telegram API 请求发送...');
+
+				var tokenEl = document.querySelector('input[id*="telegram_bot_token"]') || document.querySelector('input[name*="telegram_bot_token"]');
+				var chatEl = document.querySelector('input[id*="telegram_chat_id"]') || document.querySelector('input[name*="telegram_chat_id"]');
+				var token = (tokenEl ? tokenEl.value : '') || uci.get('ipselect', 'config', 'telegram_bot_token') || '';
+				var chat = (chatEl ? chatEl.value : '') || uci.get('ipselect', 'config', 'telegram_chat_id') || '';
+
+				request.post(getApiUrl('test_telegram'), { token: token, chat_id: chat }).then(function(res) {
+					btn.disabled = false;
+					btn.textContent = '📢 ' + _('测试发送 Telegram 消息');
+					var body = res.json();
+					resultBox.style.display = 'block';
+					if (body && body.success) {
+						statusInline.style.color = '#28a745';
+						statusInline.textContent = '✅ ' + _('发送成功');
+						resultBox.style.background = '#d4edda';
+						resultBox.style.borderColor = '#c3e6cb';
+						resultBox.style.color = '#155724';
+						dom.content(resultBox, E('div', {}, [
+							E('div', { 'style': 'font-weight:bold;' }, ['✅ ' + _('Telegram 消息发送成功！')]),
+							E('div', {}, [body.message || _('请前往 Telegram 目标频道或聊天查看。')])
+						]));
+					} else {
+						statusInline.style.color = '#dc3545';
+						statusInline.textContent = '❌ ' + _('发送失败');
+						resultBox.style.background = '#f8d7da';
+						resultBox.style.borderColor = '#f5c6cb';
+						resultBox.style.color = '#721c24';
+						dom.content(resultBox, E('div', {}, [
+							E('div', { 'style': 'font-weight:bold;' }, ['❌ ' + _('Telegram 发送失败')]),
+							E('div', {}, [body.message || _('请检查 Bot Token 与 频道/Chat ID，若发往频道请确认已将 Bot 设为管理员。')])
+						]));
+					}
+				}).catch(function(err) {
+					btn.disabled = false;
+					btn.textContent = '📢 ' + _('测试发送 Telegram 消息');
+					statusInline.style.color = '#dc3545';
+					statusInline.textContent = '❌ ' + _('请求异常');
+					resultBox.style.display = 'block';
+					resultBox.style.background = '#f8d7da';
+					resultBox.style.borderColor = '#f5c6cb';
+					resultBox.style.color = '#721c24';
+					dom.content(resultBox, E('div', {}, [err.message || String(err)]));
+				});
+			});
+
+			return E('div', { 'class': 'cbi-value-field' }, [
+				E('div', { 'style': 'display:flex; align-items:center; flex-wrap:wrap; gap:8px;' }, [btn, statusInline]),
+				resultBox
+			]);
+		};
+
+		/* --- 4.2 飞书群机器人 --- */
+		o = s.option(form.Flag, 'feishu_enabled', _('启用飞书机器人通知'), _('优选任务维护完成后，自动推送到飞书群自定义机器人 Webhook'));
+		o.default = '0';
+
+		o = s.option(form.Value, 'feishu_webhook_url', _('飞书 Webhook 地址'), _('飞书群聊添加自定义机器人后生成的 Webhook 地址 (https://open.feishu.cn/...)'));
+		o.placeholder = 'https://open.feishu.cn/open-apis/bot/v2/hook/...';
+		o.depends('feishu_enabled', '1');
+
+		o = s.option(form.Value, 'feishu_secret', _('飞书加签密钥 (可选)'), _('若在飞书机器人安全设置中勾选了“签名校验”，请在此填入密钥 Secret'));
+		o.password = true;
+		o.placeholder = '留空表示不开启签名校验';
+		o.depends('feishu_enabled', '1');
+
+		o = s.option(form.TextValue, 'feishu_template', _('飞书消息模板'), _('留空将使用内置精美模板。支持宏变量：{datetime}, {tag}, {tested_count}, {colo_summary}, {min_speed}, {regions_badge}'));
+		o.placeholder = '留空使用内置默认模板';
+		o.rows = 5;
+		o.depends('feishu_enabled', '1');
+
+		var testFsBtn = s.option(btnCls, '_test_feishu', _('测试飞书推送'), _('发送一条测试消息至飞书群机器人 Webhook 以验证配置'));
+		testFsBtn.depends('feishu_enabled', '1');
+		testFsBtn.renderWidget = function(section_id) {
+			var btn = E('button', {
+				'type': 'button',
+				'class': 'btn cbi-button cbi-button-action',
+				'style': 'padding:4px 14px; font-size:13px; cursor:pointer;'
+			}, ['📢 ' + _('测试发送飞书消息')]);
+			var statusInline = E('span', { 'style': 'margin-left:12px; font-size:13px; vertical-align:middle; display:none;' });
+			var resultBox = E('div', { 'style': 'margin-top:10px; display:none; padding:10px 14px; border-radius:4px; font-size:13px; line-height:1.5; border:1px solid #ced4da; word-break:break-all;' });
+
+			btn.addEventListener('click', function() {
+				btn.disabled = true;
+				btn.textContent = '⏳ ' + _('正在发送...');
+				statusInline.style.display = 'inline-block';
+				statusInline.style.color = '#0ea5e9';
+				statusInline.textContent = '⏳ ' + _('正在向飞书 Webhook 请求发送...');
+
+				var hookEl = document.querySelector('input[id*="feishu_webhook_url"]') || document.querySelector('input[name*="feishu_webhook_url"]');
+				var secEl = document.querySelector('input[id*="feishu_secret"]') || document.querySelector('input[name*="feishu_secret"]');
+				var webhook = (hookEl ? hookEl.value : '') || uci.get('ipselect', 'config', 'feishu_webhook_url') || '';
+				var secret = (secEl ? secEl.value : '') || uci.get('ipselect', 'config', 'feishu_secret') || '';
+
+				request.post(getApiUrl('test_feishu'), { webhook: webhook, secret: secret }).then(function(res) {
+					btn.disabled = false;
+					btn.textContent = '📢 ' + _('测试发送飞书消息');
+					var body = res.json();
+					resultBox.style.display = 'block';
+					if (body && body.success) {
+						statusInline.style.color = '#28a745';
+						statusInline.textContent = '✅ ' + _('发送成功');
+						resultBox.style.background = '#d4edda';
+						resultBox.style.borderColor = '#c3e6cb';
+						resultBox.style.color = '#155724';
+						dom.content(resultBox, E('div', {}, [
+							E('div', { 'style': 'font-weight:bold;' }, ['✅ ' + _('飞书机器人消息发送成功！')]),
+							E('div', {}, [body.message || _('请前往对应飞书群聊查看。')])
+						]));
+					} else {
+						statusInline.style.color = '#dc3545';
+						statusInline.textContent = '❌ ' + _('发送失败');
+						resultBox.style.background = '#f8d7da';
+						resultBox.style.borderColor = '#f5c6cb';
+						resultBox.style.color = '#721c24';
+						dom.content(resultBox, E('div', {}, [
+							E('div', { 'style': 'font-weight:bold;' }, ['❌ ' + _('飞书推送失败')]),
+							E('div', {}, [body.message || _('请检查 Webhook 地址或签名密钥。')])
+						]));
+					}
+				}).catch(function(err) {
+					btn.disabled = false;
+					btn.textContent = '📢 ' + _('测试发送飞书消息');
+					statusInline.style.color = '#dc3545';
+					statusInline.textContent = '❌ ' + _('请求异常');
+					resultBox.style.display = 'block';
+					resultBox.style.background = '#f8d7da';
+					resultBox.style.borderColor = '#f5c6cb';
+					resultBox.style.color = '#721c24';
+					dom.content(resultBox, E('div', {}, [err.message || String(err)]));
+				});
+			});
+
+			return E('div', { 'class': 'cbi-value-field' }, [
+				E('div', { 'style': 'display:flex; align-items:center; flex-wrap:wrap; gap:8px;' }, [btn, statusInline]),
+				resultBox
+			]);
+		};
+
+		/* ==================== 卡片 5: 远端同步、订阅联动与定时计划 ==================== */
+		addCardHeader(s, 'sync', _('远端同步、订阅联动与定时计划'), _('自动推送到 GitHub 远端分支、联动刷新 OpenClash 节点提供者以及 Crontab 定时调度计划'), '🔄', '#f59e0b');
+
 		/* 6. auto_push */
 		o = s.option(form.Flag, 'auto_push', _('自动推送到 GitHub'), _('测速完成且节点文件有变动时，自动提交并 push 到远端仓库'));
 		o.default = '1';
+
 
 		/* 6.1 github_repo */
 		o = s.option(form.Value, 'github_repo', _('GitHub 仓库名'), _('格式为：用户名/仓库名，例如 cuiyuanqing/ipselect'));
@@ -1004,85 +1289,6 @@ return view.extend({
 		cronExprOpt.rmempty = false;
 		cronExprOpt.depends('cron_enabled', '1');
 
-		/* ==================== 全链路沙箱严选与线路检测代理参数 ==================== */
-		o = s.option(form.Flag, 'sandbox_enable', _('启用沙箱全链路质检'), _('基于轻量 Mihomo 隔离沙箱与 Linux GID 65534 物理直连，穿透测试 Google 204、YouTube 204 及真实出口 IP 归属，杜绝虚假与死节点'));
-		o.default = '1';
-
-		o = s.option(form.Value, 'vless_sni', _('VLESS 服务域名 / SNI'), _('Cloudflare Worker 或 edgetunnel 的加速域名/SNI (如 proxy.19940407.xyz)'));
-		o.default = 'proxy.19940407.xyz';
-		o.placeholder = 'proxy.19940407.xyz';
-		o.depends('sandbox_enable', '1');
-
-		o = s.option(form.Value, 'vless_uuid', _('VLESS 节点 UUID'), _('与 Worker / edgetunnel 对应的用户身份 UUID'));
-		o.default = 'e295e2a9-13ad-4251-baa8-28ee1b5aeae9';
-		o.placeholder = 'e295e2a9-13ad-4251-baa8-28ee1b5aeae9';
-		o.depends('sandbox_enable', '1');
-
-		o = s.option(form.Value, 'vless_path', _('WebSocket 请求路径'), _('VLESS WebSocket 传输协议路径 (默认为 /)'));
-		o.default = '/';
-		o.placeholder = '/';
-		o.depends('sandbox_enable', '1');
-
-		o = s.option(form.Value, 'vless_port', _('VLESS 服务端口'), _('VLESS 远程连接端口 (默认为 443)'));
-		o.default = '443';
-		o.placeholder = '443';
-		o.depends('sandbox_enable', '1');
-
-		o = s.option(form.Value, 'target_country', _('目标出口落地国家'), _('质检时要求真实出口落地所属的国家代码 (填 AUTO 自动就近匹配亚太与美区出口；也可填指定国家如 US、HK 等)'));
-		o.default = 'AUTO';
-		o.placeholder = 'AUTO';
-		o.depends('sandbox_enable', '1');
-
-		o = s.option(form.Value, 'random_cf_count', _('随机采样 CF 节点数'), _('除数据源外，从 Cloudflare Anycast 网段随机撒点生成的候选节点数 (edgetunnel 在线优选同机制，默认 1500；数值越大候选池越大，耗时越长)'));
-		o.default = '1500';
-		o.placeholder = '1500';
-		o.rmempty = true;
-
-		o = s.option(form.Value, 'stage2_entry_limit', _('沙箱入围上限'), _('阶段2 分层入围后进入沙箱全链路实测的节点数上限 (默认 75，越大越稳但耗时越长)'));
-		o.default = '75';
-		o.placeholder = '75';
-		o.rmempty = true;
-
-		o = s.option(form.Value, 'stage4_speed_limit', _('测速入围上限'), _('阶段4 真实微吞吐测速的节点数上限 (默认 45，保障各区域配额充足)'));
-		o.default = '45';
-		o.placeholder = '45';
-		o.rmempty = true;
-
-		/* v1.4.0+ 阶段 4 改为过隧道 + 时长 + 并发测速；speed_test_* 参数决定测速精度与耗时。 */
-		o = s.option(form.Value, 'speed_test_duration', _('单节点测速时长(秒)'), _('单节点 5 秒时间窗 × 2 轮取中位；越大越准但任务耗时变长 (默认 5，建议 3-8)'));
-		o.default = '5';
-		o.placeholder = '5';
-		o.rmempty = true;
-
-		o = s.option(form.Value, 'speed_test_parallel', _('单节点并发下载数'), _('节点内并发 HTTP GET 数；贴 YouTube 实际连接数 (默认 3，建议 2-4)'));
-		o.default = '3';
-		o.placeholder = '3';
-		o.rmempty = true;
-
-		o = s.option(form.Value, 'speed_test_node_concurrency', _('同时测速节点数'), _('阶段 4 同时并行测速的节点数；CPU 受限可调低 (默认 4)'));
-		o.default = '4';
-		o.placeholder = '4';
-		o.rmempty = true;
-
-		o = s.option(form.Value, 'speed_test_max_retry', _('429/1020 重试次数'), _('节点测速命中 Cloudflare 限流时的重试次数；超过即弃用该节点 (默认 1)'));
-		o.default = '1';
-		o.placeholder = '1';
-		o.rmempty = true;
-
-		o = s.option(form.Value, 'speed_test_max_bytes_per_ip', _('单 IP 累计下载上限(MB)'), _('节点测速累计下载字节上限；远低于任何 edge 反爬阈值 (默认 80)'));
-		o.default = '80';
-		o.placeholder = '80';
-		o.rmempty = true;
-
-		o = s.option(form.Value, 'min_speed_threshold', _('保底下载速率门槛(MB/s)'), _('全区域入选节点的硬性最低带宽门槛，低于此速率的节点坚决不予保留导出 (默认 3.0，建议 2.5-5.0)'));
-		o.default = '3.0';
-		o.placeholder = '3.0';
-		o.rmempty = true;
-
-		o = s.option(form.Value, 'max_refill_rounds', _('达标不足最大补位轮数'), _('当达标节点不足目标配额时，自动从备选池增量补测的重试轮次上限 (默认 2，建议 1-3)'));
-		o.default = '2';
-		o.placeholder = '2';
-		o.rmempty = true;
 
 		var tabSettings = E('div', {
 			'data-tab': 'settings',

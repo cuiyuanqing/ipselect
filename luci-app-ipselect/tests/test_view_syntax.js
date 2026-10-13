@@ -72,7 +72,9 @@ const expectedEndpoints = [
 	'get_results',
 	'get_history',
 	'get_history_log',
-	'test_github'
+	'test_github',
+	'test_telegram',
+	'test_feishu'
 ];
 
 expectedEndpoints.forEach(ep => {
@@ -467,7 +469,11 @@ console.log('\n[5/5] 执行 load() 与 render() 数据流，验证 4 大选项�
 		'vless_uuid',
 		'vless_path',
 		'vless_port',
-		'target_country'
+		'target_country',
+		'min_speed_threshold',
+		'max_refill_rounds',
+		'telegram_enabled',
+		'feishu_enabled'
 	];
 
 	expectedUciOptions.forEach(optName => {

@@ -346,6 +346,38 @@ EOF
         else
             echo "[*] $OC_HOOK 不存在，跳过联动" >> "$LOG_FILE"
             OC_STATUS="skipped"
+    # 消息通知推送 (Telegram / 飞书)
+    TG_ENABLED=$(get_config "telegram_enabled" "0")
+    TG_TOKEN=$(get_config "telegram_bot_token" "")
+    TG_CHAT_ID=$(get_config "telegram_chat_id" "")
+    TG_TEMPLATE=$(get_config "telegram_template" "")
+
+    FS_ENABLED=$(get_config "feishu_enabled" "0")
+    FS_WEBHOOK=$(get_config "feishu_webhook_url" "")
+    FS_SECRET=$(get_config "feishu_secret" "")
+    FS_TEMPLATE=$(get_config "feishu_template" "")
+
+    if { [ "$STATUS" = "success" ] || [ "$STATUS" = "quality_downgraded" ]; }; then
+        if [ "$TG_ENABLED" = "1" ] && [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            echo "[*] 正在向 Telegram 频道/Bot 推送任务完成通知..." >> "$LOG_FILE"
+            python3 scripts/notify.py --channel telegram \
+                --telegram-token "$TG_TOKEN" \
+                --telegram-chat-id "$TG_CHAT_ID" \
+                --telegram-template "$TG_TEMPLATE" \
+                --txt-file "$OUTPUT_FILE" \
+                --detail-file "${OUTPUT_FILE%.txt}_detail.json" \
+                --tag "$ENV_TAG" >> "$LOG_FILE" 2>&1 || echo "[!] Telegram 通知发送失败" >> "$LOG_FILE"
+        fi
+
+        if [ "$FS_ENABLED" = "1" ] && [ -n "$FS_WEBHOOK" ]; then
+            echo "[*] 正在向飞书群机器人 Webhook 推送任务完成通知..." >> "$LOG_FILE"
+            python3 scripts/notify.py --channel feishu \
+                --feishu-webhook "$FS_WEBHOOK" \
+                --feishu-secret "$FS_SECRET" \
+                --feishu-template "$FS_TEMPLATE" \
+                --txt-file "$OUTPUT_FILE" \
+                --detail-file "${OUTPUT_FILE%.txt}_detail.json" \
+                --tag "$ENV_TAG" >> "$LOG_FILE" 2>&1 || echo "[!] 飞书通知发送失败" >> "$LOG_FILE"
         fi
     fi
 
@@ -575,8 +607,46 @@ print(json.dumps({'file': '$OUTPUT_FILE', 'update_time': mtime, 'count': len(nod
         fi
         ;;
 
+    test-telegram)
+        TOKEN="${2:-$(get_config "telegram_bot_token" "")}"
+        CHAT_ID="${3:-$(get_config "telegram_chat_id" "")}"
+        if [ -z "$TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo '{"success": false, "message": "未配置 Telegram Bot Token 或 Chat ID"}'
+            exit 0
+        fi
+        WORKDIR=$(get_config "workdir" "/root/ipselect")
+        [ -d "$WORKDIR" ] && cd "$WORKDIR"
+        TEST_MSG="🚀 [iStoreOS 节点优选] Telegram 推送测试成功！\n时间: $(date '+%Y-%m-%d %H:%M:%S')\n本通知由用户手动触发连通性校验。"
+        RES=$(python3 scripts/notify.py --channel telegram --telegram-token "$TOKEN" --telegram-chat-id "$CHAT_ID" --text "$TEST_MSG" 2>&1)
+        if echo "$RES" | grep -q 'ok=True'; then
+            echo '{"success": true, "message": "Telegram 消息推送测试成功！已成功发送至指定频道/聊天。"}'
+        else
+            SAFE_RES=$(echo "$RES" | tr '\r\n' ' ' | sed 's/"/\\"/g' | sed 's/^[ \t]*//;s/[ \t]*$//')
+            echo "{\"success\": false, \"message\": \"Telegram 推送失败: ${SAFE_RES}\"}"
+        fi
+        ;;
+
+    test-feishu)
+        WEBHOOK="${2:-$(get_config "feishu_webhook_url" "")}"
+        SECRET="${3:-$(get_config "feishu_secret" "")}"
+        if [ -z "$WEBHOOK" ]; then
+            echo '{"success": false, "message": "未配置飞书 Webhook URL"}'
+            exit 0
+        fi
+        WORKDIR=$(get_config "workdir" "/root/ipselect")
+        [ -d "$WORKDIR" ] && cd "$WORKDIR"
+        TEST_MSG="🚀 [iStoreOS 节点优选] 飞书群机器人 Webhook 推送测试成功！\n时间: $(date '+%Y-%m-%d %H:%M:%S')\n本通知由用户手动触发连通性校验。"
+        RES=$(python3 scripts/notify.py --channel feishu --feishu-webhook "$WEBHOOK" --feishu-secret "$SECRET" --text "$TEST_MSG" 2>&1)
+        if echo "$RES" | grep -q 'ok=True'; then
+            echo '{"success": true, "message": "飞书群机器人推送测试成功！已成功推送至飞书群聊。"}'
+        else
+            SAFE_RES=$(echo "$RES" | tr '\r\n' ' ' | sed 's/"/\\"/g' | sed 's/^[ \t]*//;s/[ \t]*$//')
+            echo "{\"success\": false, \"message\": \"飞书推送失败: ${SAFE_RES}\"}"
+        fi
+        ;;
+
     *)
-        echo "用法: $0 {start|stop|status|log|clear-log|results|history|history-log|test-github}"
+        echo "用法: $0 {start|stop|status|log|clear-log|results|history|history-log|test-github|test-telegram|test-feishu}"
         exit 1
         ;;
 esac

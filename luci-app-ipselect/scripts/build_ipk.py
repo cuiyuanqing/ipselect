@@ -157,11 +157,14 @@ def build_control_tar_gz(
     postinst_bytes = _normalize_text_bytes(POSTINST_SCRIPT.encode("utf-8"))
     postrm_bytes = _normalize_text_bytes(POSTRM_SCRIPT.encode("utf-8"))
 
+    conffiles_bytes = b"/etc/config/ipselect\n"
+
     entries = [
         {"name": "./", "data": None, "mode": 0o755, "is_dir": True},
         {"name": "./control", "data": control_bytes, "mode": 0o644, "is_dir": False},
         {"name": "./postinst", "data": postinst_bytes, "mode": 0o755, "is_dir": False},
         {"name": "./postrm", "data": postrm_bytes, "mode": 0o755, "is_dir": False},
+        {"name": "./conffiles", "data": conffiles_bytes, "mode": 0o644, "is_dir": False},
     ]
     return create_tar_gz_bytes(entries, base_time=base_time)
 
@@ -336,7 +339,7 @@ echo "============================================================"
 echo "  🚀 正在为 OpenWrt 25 / iStoreOS 25 安装 luci-app-ipselect"
 echo "============================================================"
 
-# 1. 解压内嵌 Payload 到系统根目录
+# 1. 解压内嵌 Payload 到系统根目录 (保护用户已有配置不被覆盖)
 echo "[1/4] 释放插件核心文件到系统目录 (/etc, /usr, /www) ..."
 ARCHIVE_LINE=$(awk '/^__PAYLOAD_ARCHIVE_BELOW__/ {print NR + 1; exit 0; }' "$0")
 if [ -z "$ARCHIVE_LINE" ]; then
@@ -344,7 +347,48 @@ if [ -z "$ARCHIVE_LINE" ]; then
     exit 1
 fi
 
+# 若已有配置文件，先进行安全备份以防被默认模板覆盖
+BACKUP_CFG="/tmp/ipselect_config.bak"
+rm -f "$BACKUP_CFG" 2>/dev/null || true
+if [ -f "/etc/config/ipselect" ]; then
+    cp -f "/etc/config/ipselect" "$BACKUP_CFG"
+fi
+
 tail -n +"$ARCHIVE_LINE" "$0" | tar -xz -C /
+
+# 恢复用户已有配置并智能增量补齐新版本新增字段
+if [ -f "$BACKUP_CFG" ]; then
+    mv -f "/etc/config/ipselect" "/tmp/ipselect_new.default" 2>/dev/null || true
+    cp -f "$BACKUP_CFG" "/etc/config/ipselect"
+    rm -f "$BACKUP_CFG"
+    echo "  [+] 已检测并成功保留您原有的 /etc/config/ipselect 自定义配置"
+
+    if [ -f "/tmp/ipselect_new.default" ]; then
+        python3 -c "
+import re
+old_p = '/etc/config/ipselect'
+new_p = '/tmp/ipselect_new.default'
+try:
+    with open(old_p, 'r', encoding='utf-8') as f: old_txt = f.read()
+    with open(new_p, 'r', encoding='utf-8') as f: new_txt = f.read()
+    old_opts = set(re.findall(r'option\\s+([a-zA-Z0-9_]+)', old_txt))
+    to_add = []
+    for line in new_txt.splitlines():
+        m = re.match(r'^\\s*option\\s+([a-zA-Z0-9_]+)\\s+(.+)$', line)
+        if m and m.group(1) not in old_opts:
+            to_add.append(line.strip())
+            old_opts.add(m.group(1))
+    if to_add:
+        with open(old_p, 'a', encoding='utf-8') as f:
+            f.write('\n\t# 新版本增量默认配置项\n')
+            for l in to_add:
+                f.write('\t' + l + '\n')
+except Exception:
+    pass
+" 2>/dev/null || true
+        rm -f "/tmp/ipselect_new.default" 2>/dev/null || true
+    fi
+fi
 
 # 2. 设置 POSIX 执行权限
 echo "[2/4] 设置组件执行权限 (chmod 755) ..."
@@ -425,7 +469,15 @@ def build_openwrt25_packages(
     tar_gz_bundle_path = output_dir / f"luci-app-ipselect_{pkg_version}_openwrt25.tar.gz"
     install_script_bytes = (
         """#!/bin/sh\nset -e\nDIR="$(cd "$(dirname "$0")" && pwd)"\n"""
+        """BACKUP_CFG="/tmp/ipselect_config.bak"\n"""
+        """rm -f "$BACKUP_CFG" 2>/dev/null || true\n"""
+        """[ -f "/etc/config/ipselect" ] && cp -f "/etc/config/ipselect" "$BACKUP_CFG"\n"""
         """tar -xzf "$DIR/data.tar.gz" -C /\n"""
+        """if [ -f "$BACKUP_CFG" ]; then\n"""
+        """  mv -f "/etc/config/ipselect" "/tmp/ipselect_new.default" 2>/dev/null || true\n"""
+        """  cp -f "$BACKUP_CFG" "/etc/config/ipselect"\n"""
+        """  rm -f "$BACKUP_CFG"\n"""
+        """fi\n"""
         """chmod 755 /usr/bin/ipselect-runner /etc/init.d/ipselect\n"""
         """/etc/init.d/ipselect enable\n/etc/init.d/ipselect restart\n"""
         """rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* /var/luci-indexcache* 2>/dev/null || true\n"""

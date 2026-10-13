@@ -22,6 +22,8 @@ function index()
 	entry({"admin", "services", "ipselect", "get_history"}, call("action_get_history")).leaf = true
 	entry({"admin", "services", "ipselect", "get_history_log"}, call("action_get_history_log")).leaf = true
 	entry({"admin", "services", "ipselect", "test_github"}, call("action_test_github")).leaf = true
+	entry({"admin", "services", "ipselect", "test_telegram"}, call("action_test_telegram")).leaf = true
+	entry({"admin", "services", "ipselect", "test_feishu"}, call("action_test_feishu")).leaf = true
 end
 
 local function exec_cmd(cmd)
@@ -85,4 +87,18 @@ end
 function action_test_github()
 	luci.http.prepare_content("application/json")
 	luci.http.write(exec_cmd("/usr/bin/ipselect-runner test-github"))
+end
+
+function action_test_telegram()
+	local token = luci.http.formvalue("token") or ""
+	local chat_id = luci.http.formvalue("chat_id") or ""
+	luci.http.prepare_content("application/json")
+	luci.http.write(exec_cmd(string.format('/usr/bin/ipselect-runner test-telegram %q %q', token, chat_id)))
+end
+
+function action_test_feishu()
+	local webhook = luci.http.formvalue("webhook") or ""
+	local secret = luci.http.formvalue("secret") or ""
+	luci.http.prepare_content("application/json")
+	luci.http.write(exec_cmd(string.format('/usr/bin/ipselect-runner test-feishu %q %q', webhook, secret)))
 end
