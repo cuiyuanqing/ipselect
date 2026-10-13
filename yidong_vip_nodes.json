@@ -1,76 +1,116 @@
 {
-  "updated_at": "2026-10-13 22:50:04",
+  "updated_at": "2026-10-14 05:58:16",
   "vip_threshold": 8.0,
   "nodes": [
     {
-      "ip": "3.37.58.69",
+      "ip": "3.113.232.245",
       "port": 443,
-      "speed": 24.8,
-      "exit_country": "KR",
-      "colo": "ICN",
-      "score": 6.7,
-      "e2e_avg_rtt": 1367.0,
-      "last_tested": "2026-10-13 22:50:04"
+      "speed": 25.74,
+      "exit_country": "JP",
+      "colo": "NRT",
+      "score": 4.6,
+      "e2e_avg_rtt": 1730.5,
+      "last_tested": "2026-10-14 05:58:16"
     },
     {
-      "ip": "18.142.4.29",
+      "ip": "176.34.12.152",
+      "port": 8443,
+      "speed": 24.13,
+      "exit_country": "JP",
+      "colo": "NRT",
+      "score": 4.6,
+      "e2e_avg_rtt": 1271.5,
+      "last_tested": "2026-10-14 05:58:16"
+    },
+    {
+      "ip": "140.235.37.72",
       "port": 443,
-      "speed": 21.44,
-      "exit_country": "SG",
-      "colo": "SIN",
-      "score": 3.9,
-      "e2e_avg_rtt": 2144.0,
-      "last_tested": "2026-10-13 22:50:04"
+      "speed": 23.39,
+      "exit_country": "JP",
+      "colo": "NRT",
+      "score": 6.0,
+      "e2e_avg_rtt": 1353.5,
+      "last_tested": "2026-10-14 05:58:16"
     },
     {
       "ip": "172.105.241.119",
       "port": 1916,
-      "speed": 21.14,
+      "speed": 22.96,
       "exit_country": "US",
-      "colo": "SEA",
-      "score": 5.7,
-      "e2e_avg_rtt": 1761.5,
-      "last_tested": "2026-10-13 22:50:04"
+      "colo": "LAX",
+      "score": 4.7,
+      "e2e_avg_rtt": 1907.0,
+      "last_tested": "2026-10-14 05:58:16"
+    },
+    {
+      "ip": "47.131.186.184",
+      "port": 443,
+      "speed": 21.45,
+      "exit_country": "SG",
+      "colo": "SIN",
+      "score": 4.4,
+      "e2e_avg_rtt": 2001.0,
+      "last_tested": "2026-10-14 05:58:16"
+    },
+    {
+      "ip": "18.138.10.11",
+      "port": 443,
+      "speed": 20.99,
+      "exit_country": "SG",
+      "colo": "SIN",
+      "score": 4.4,
+      "e2e_avg_rtt": 1963.5,
+      "last_tested": "2026-10-14 05:58:16"
+    },
+    {
+      "ip": "104.17.163.19",
+      "port": 8443,
+      "speed": 20.8,
+      "exit_country": "HK",
+      "colo": "HKG",
+      "score": 6.6,
+      "e2e_avg_rtt": 1031.0,
+      "last_tested": "2026-10-14 05:58:16"
     },
     {
       "ip": "18.139.160.115",
       "port": 443,
-      "speed": 21.09,
+      "speed": 19.54,
       "exit_country": "SG",
       "colo": "SIN",
-      "score": 3.9,
-      "e2e_avg_rtt": 1874.0,
-      "last_tested": "2026-10-13 22:50:04"
+      "score": 6.6,
+      "e2e_avg_rtt": 1941.0,
+      "last_tested": "2026-10-14 05:58:16"
+    },
+    {
+      "ip": "3.37.58.69",
+      "port": 443,
+      "speed": 19.16,
+      "exit_country": "KR",
+      "colo": "ICN",
+      "score": 4.4,
+      "e2e_avg_rtt": 1637.5,
+      "last_tested": "2026-10-14 05:58:16"
     },
     {
       "ip": "18.136.135.61",
       "port": 443,
-      "speed": 18.29,
+      "speed": 17.34,
       "exit_country": "SG",
       "colo": "SIN",
-      "score": 4.3,
-      "e2e_avg_rtt": 1845.5,
-      "last_tested": "2026-10-13 22:50:04"
-    },
-    {
-      "ip": "157.119.103.52",
-      "port": 443,
-      "speed": 16.03,
-      "exit_country": "US",
-      "colo": "LAX",
       "score": 4.2,
-      "e2e_avg_rtt": 2250.5,
-      "last_tested": "2026-10-13 22:50:04"
+      "e2e_avg_rtt": 1780.5,
+      "last_tested": "2026-10-14 05:58:16"
     },
     {
-      "ip": "13.125.9.223",
+      "ip": "18.142.4.29",
       "port": 443,
-      "speed": 15.22,
-      "exit_country": "KR",
-      "colo": "ICN",
-      "score": 3.6,
-      "e2e_avg_rtt": 1480.0,
-      "last_tested": "2026-10-13 22:50:04"
+      "speed": 16.67,
+      "exit_country": "SG",
+      "colo": "SIN",
+      "score": 5.8,
+      "e2e_avg_rtt": 1980.0,
+      "last_tested": "2026-10-14 05:58:16"
     },
     {
       "ip": "85.211.251.172",
@@ -83,24 +123,34 @@
       "last_tested": "2026-10-13 22:50:04"
     },
     {
-      "ip": "176.34.12.152",
-      "port": 8443,
-      "speed": 13.39,
+      "ip": "142.248.139.25",
+      "port": 443,
+      "speed": 13.81,
       "exit_country": "JP",
       "colo": "NRT",
-      "score": 4.6,
-      "e2e_avg_rtt": 1469.0,
-      "last_tested": "2026-10-13 22:50:04"
+      "score": 6.1,
+      "e2e_avg_rtt": 1387.0,
+      "last_tested": "2026-10-14 05:58:16"
     },
     {
-      "ip": "18.138.10.11",
-      "port": 443,
-      "speed": 12.96,
-      "exit_country": "SG",
-      "colo": "SIN",
-      "score": 6.2,
-      "e2e_avg_rtt": 1649.5,
-      "last_tested": "2026-10-13 22:50:04"
+      "ip": "207.57.132.189",
+      "port": 8443,
+      "speed": 13.06,
+      "exit_country": "HK",
+      "colo": "HKG",
+      "score": 4.0,
+      "e2e_avg_rtt": 1070.0,
+      "last_tested": "2026-10-14 05:58:16"
+    },
+    {
+      "ip": "149.118.155.105",
+      "port": 8443,
+      "speed": 13.02,
+      "exit_country": "MY",
+      "colo": "KUL",
+      "score": 4.0,
+      "e2e_avg_rtt": 1659.5,
+      "last_tested": "2026-10-14 05:58:16"
     },
     {
       "ip": "47.245.131.215",
@@ -113,6 +163,26 @@
       "last_tested": "2026-10-13 22:50:04"
     },
     {
+      "ip": "104.17.98.113",
+      "port": 443,
+      "speed": 12.02,
+      "exit_country": "HK",
+      "colo": "HKG",
+      "score": 5.0,
+      "e2e_avg_rtt": 1043.0,
+      "last_tested": "2026-10-14 05:58:16"
+    },
+    {
+      "ip": "3.38.190.222",
+      "port": 443,
+      "speed": 11.86,
+      "exit_country": "KR",
+      "colo": "ICN",
+      "score": 6.0,
+      "e2e_avg_rtt": 1278.5,
+      "last_tested": "2026-10-14 05:58:16"
+    },
+    {
       "ip": "18.136.57.18",
       "port": 443,
       "speed": 11.27,
@@ -123,64 +193,44 @@
       "last_tested": "2026-10-13 22:50:04"
     },
     {
-      "ip": "142.248.139.25",
+      "ip": "103.38.236.248",
       "port": 443,
-      "speed": 11.01,
-      "exit_country": "JP",
-      "colo": "NRT",
-      "score": 3.4,
-      "e2e_avg_rtt": 1248.0,
-      "last_tested": "2026-10-13 22:50:04"
+      "speed": 10.75,
+      "exit_country": "HK",
+      "colo": "SIN",
+      "score": 5.9,
+      "e2e_avg_rtt": 1740.0,
+      "last_tested": "2026-10-14 05:58:16"
     },
     {
-      "ip": "47.131.186.184",
+      "ip": "13.125.9.223",
       "port": 443,
-      "speed": 10.81,
+      "speed": 9.52,
+      "exit_country": "KR",
+      "colo": "ICN",
+      "score": 4.7,
+      "e2e_avg_rtt": 1635.0,
+      "last_tested": "2026-10-14 05:58:16"
+    },
+    {
+      "ip": "18.136.76.91",
+      "port": 443,
+      "speed": 8.97,
       "exit_country": "SG",
       "colo": "SIN",
-      "score": 3.4,
-      "e2e_avg_rtt": 1995.5,
-      "last_tested": "2026-10-13 22:50:04"
+      "score": 3.2,
+      "e2e_avg_rtt": 1816.5,
+      "last_tested": "2026-10-14 05:58:16"
     },
     {
-      "ip": "88.218.193.200",
+      "ip": "43.170.62.92",
       "port": 443,
-      "speed": 10.2,
-      "exit_country": "DE",
-      "colo": "FRA",
-      "score": 3.4,
-      "e2e_avg_rtt": 2167.5,
-      "last_tested": "2026-10-13 22:50:04"
-    },
-    {
-      "ip": "207.57.132.189",
-      "port": 8443,
-      "speed": 9.82,
-      "exit_country": "HK",
-      "colo": "HKG",
-      "score": 3.8,
-      "e2e_avg_rtt": 1216.0,
-      "last_tested": "2026-10-13 22:50:04"
-    },
-    {
-      "ip": "47.245.134.84",
-      "port": 443,
-      "speed": 9.6,
-      "exit_country": "DE",
-      "colo": "FRA",
-      "score": 5.5,
-      "e2e_avg_rtt": 2279.5,
-      "last_tested": "2026-10-13 22:50:04"
-    },
-    {
-      "ip": "88.218.193.114",
-      "port": 443,
-      "speed": 8.73,
-      "exit_country": "DE",
-      "colo": "FRA",
-      "score": 3.6,
-      "e2e_avg_rtt": 2524.5,
-      "last_tested": "2026-10-13 22:50:04"
+      "speed": 8.6,
+      "exit_country": "NL",
+      "colo": "AMS",
+      "score": 3.2,
+      "e2e_avg_rtt": 2195.5,
+      "last_tested": "2026-10-14 05:58:16"
     },
     {
       "ip": "56.68.92.77",
@@ -193,14 +243,14 @@
       "last_tested": "2026-10-13 22:50:04"
     },
     {
-      "ip": "3.113.232.245",
-      "port": 443,
-      "speed": 8.21,
+      "ip": "154.31.114.46",
+      "port": 12632,
+      "speed": 8.31,
       "exit_country": "JP",
       "colo": "NRT",
-      "score": 3.1,
-      "e2e_avg_rtt": 1653.0,
-      "last_tested": "2026-10-13 22:50:04"
+      "score": 3.6,
+      "e2e_avg_rtt": 1210.0,
+      "last_tested": "2026-10-14 05:58:16"
     },
     {
       "ip": "18.136.144.144",
@@ -211,6 +261,36 @@
       "score": 3.1,
       "e2e_avg_rtt": 1811.5,
       "last_tested": "2026-10-13 22:50:04"
+    },
+    {
+      "ip": "88.218.193.200",
+      "port": 443,
+      "speed": 5.36,
+      "exit_country": "DE",
+      "colo": "FRA",
+      "score": 3.4,
+      "e2e_avg_rtt": 2167.5,
+      "last_tested": "2026-10-14 05:58:16"
+    },
+    {
+      "ip": "157.119.103.52",
+      "port": 443,
+      "speed": 5.33,
+      "exit_country": "US",
+      "colo": "LAX",
+      "score": 4.2,
+      "e2e_avg_rtt": 2250.5,
+      "last_tested": "2026-10-14 05:58:16"
+    },
+    {
+      "ip": "88.218.193.114",
+      "port": 443,
+      "speed": 3.13,
+      "exit_country": "DE",
+      "colo": "FRA",
+      "score": 3.6,
+      "e2e_avg_rtt": 2524.5,
+      "last_tested": "2026-10-14 05:58:16"
     }
   ]
 }
