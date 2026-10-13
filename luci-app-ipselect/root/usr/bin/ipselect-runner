@@ -346,6 +346,9 @@ EOF
         else
             echo "[*] $OC_HOOK 不存在，跳过联动" >> "$LOG_FILE"
             OC_STATUS="skipped"
+        fi
+    fi
+
     # 消息通知推送 (Telegram / 飞书)
     TG_ENABLED=$(get_config "telegram_enabled" "0")
     TG_TOKEN=$(get_config "telegram_bot_token" "")
