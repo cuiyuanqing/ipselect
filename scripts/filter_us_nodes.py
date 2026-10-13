@@ -103,9 +103,10 @@ HK_DCS = {'HKG'}
 TW_DCS = {'TPE'}
 JP_DCS = {'NRT', 'HND', 'KIX'}
 SG_DCS = {'SIN'}
+KR_DCS = {'ICN', 'GMP'}
 
 # 亚太极速直连机房（对大陆网络延迟极低 30ms~80ms）
-APAC_FAST_DCS = HK_DCS | TW_DCS | JP_DCS | SG_DCS | {'ICN', 'BKK', 'MNL', 'KUL'}
+APAC_FAST_DCS = HK_DCS | TW_DCS | JP_DCS | SG_DCS | KR_DCS | {'BKK', 'MNL', 'KUL'}
 # 全球顶级入口直连机房（亚太低延迟 POP + 美西核心 POP）
 TOP_INGRESS_DCS = APAC_FAST_DCS | US_WEST_DCS
 
@@ -123,10 +124,10 @@ EXCLUDE_DCS = {'YYZ', 'YVR', 'YUL', 'YYC'}
 
 
 def detect_node_region(colo: str, remark: str = "", ip_or_domain: str = "") -> str:
-    """智能识别节点的地域归属 (HK, TW, JP, SG, US 等)"""
+    """智能识别节点的地域归属 (HK, TW, JP, SG, KR, US 等)"""
     rem_u = (remark or "").upper()
     # 优先根据明确的备注地域标识进行归类 (例如社区种子 HK-AWS, TW-HiNet 等)
-    for r in ('HK', 'TW', 'JP', 'SG'):
+    for r in ('HK', 'TW', 'JP', 'SG', 'KR'):
         if re.search(rf"(^|[^A-Z]){r}([^A-Z]|$)", rem_u):
             return r
     if '香港' in remark:
@@ -137,6 +138,8 @@ def detect_node_region(colo: str, remark: str = "", ip_or_domain: str = "") -> s
         return 'JP'
     if '新加坡' in remark or '狮城' in remark:
         return 'SG'
+    if '韩国' in remark or '首尔' in remark or '仁川' in remark:
+        return 'KR'
 
     # 其次根据 cf-ray 实际机房代码判定
     colo_u = (colo or "").upper()
@@ -148,6 +151,8 @@ def detect_node_region(colo: str, remark: str = "", ip_or_domain: str = "") -> s
         return 'JP'
     if colo_u in SG_DCS:
         return 'SG'
+    if colo_u in KR_DCS:
+        return 'KR'
     if colo_u in ALL_US_DCS:
         return 'US'
 
@@ -158,7 +163,7 @@ def detect_node_region(colo: str, remark: str = "", ip_or_domain: str = "") -> s
 
     # 检查 ip_or_domain 域名特征
     domain_u = (ip_or_domain or "").upper()
-    for r in ('HK', 'TW', 'JP', 'SG', 'US'):
+    for r in ('HK', 'TW', 'JP', 'SG', 'KR', 'US'):
         if re.search(rf"(^|[^A-Z]){r}([^A-Z]|$)", domain_u):
             return r
 
@@ -478,6 +483,35 @@ def switch_sandbox_proxy(proxy_name: str, api_port: int = 19098) -> bool:
 GOOGLE_204_URL = "http://www.gstatic.com/generate_204"
 YOUTUBE_204_URL = "https://www.youtube.com/generate_204"
 IP_SB_GEOIP_URL = "https://api.ip.sb/geoip"
+GEOIP_PROBE_ENDPOINTS = [
+    "https://api.ip.sb/geoip",
+    "https://ipleak.net/json/",
+    "https://cloudflare.com/cdn-cgi/trace",
+    "http://ip-api.com/json",
+]
+
+
+def parse_geoip_response(target_url: str, raw_content: str) -> tuple:
+    """从不同 GeoIP 服务响应中提取 (country_code, exit_ip)"""
+    if not raw_content:
+        return "", ""
+    if "cdn-cgi/trace" in target_url:
+        country, exit_ip = "", ""
+        for line in raw_content.splitlines():
+            line = line.strip()
+            if line.startswith("loc="):
+                country = line.split("=", 1)[1].strip().upper()
+            elif line.startswith("ip="):
+                exit_ip = line.split("=", 1)[1].strip()
+        return country, exit_ip
+    else:
+        try:
+            data = json.loads(raw_content)
+            country = (data.get('country_code') or data.get('countryCode') or data.get('country') or '').upper()
+            exit_ip = data.get('ip') or data.get('query') or ''
+            return country, exit_ip
+        except Exception:
+            return "", ""
 
 
 def probe_e2e_delay(proxy_name: str, target_url: str, api_port: int = 19098, timeout_ms: int = 2500, mock_delay: int = None):
@@ -506,6 +540,7 @@ def probe_e2e_delay(proxy_name: str, target_url: str, api_port: int = 19098, tim
 def probe_ip_sb_exit(proxy_port: int = 19998, timeout: float = 3.5, mock_exit: dict = None, target_country: str = "US"):
     """
     通过本地沙箱的代理端口探测真实出口 IP 与落地国家归属。
+    支持 api.ip.sb、ipleak.net、cloudflare trace 与 ip-api 多源高可用容灾。
     返回 (is_target_country, country_code, exit_ip)
     """
     target = (target_country or "AUTO").upper()
@@ -519,17 +554,16 @@ def probe_ip_sb_exit(proxy_port: int = 19998, timeout: float = 3.5, mock_exit: d
     proxy_handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
     opener = urllib.request.build_opener(proxy_handler)
 
-    urls = [IP_SB_GEOIP_URL, "http://ip-api.com/json"]
-    for target_url in urls:
+    for target_url in GEOIP_PROBE_ENDPOINTS:
         try:
             req = urllib.request.Request(target_url, headers={'User-Agent': 'Mozilla/5.0'})
             with opener.open(req, timeout=timeout) as res:
                 if res.status == 200:
-                    data = json.loads(res.read().decode('utf-8'))
-                    country = (data.get('country_code') or data.get('countryCode') or '').upper()
-                    exit_ip = data.get('ip') or data.get('query') or ''
-                    is_match = bool(country) if target in ('AUTO', 'ALL', '') else (country == target)
-                    return is_match, country, exit_ip
+                    raw_text = res.read().decode('utf-8', errors='ignore')
+                    country, exit_ip = parse_geoip_response(target_url, raw_text)
+                    if country:
+                        is_match = bool(country) if target in ('AUTO', 'ALL', '') else (country == target)
+                        return is_match, country, exit_ip
         except Exception:
             continue
 
@@ -567,6 +601,7 @@ def evaluate_node_quality_v2(proxy_name: str, ip: str, port: int, colo: str,
 
     # 3. e2e_avg_rtt 估算 (用稳定性测试中 Google 探测的中位耗时)
     avg_rtt = (stability_result.duration_ms / stability_result.total / 2) if stability_result.total else 0.0
+    confirmed_region = exit_country if exit_country else detect_node_region(colo, "", ip)
     return {
         'proxy_name': proxy_name,
         'ip': ip,
@@ -581,6 +616,7 @@ def evaluate_node_quality_v2(proxy_name: str, ip: str, port: int, colo: str,
         'real_page_pass_rate': stability_result.pass_rate,
         'real_page_failed_rounds': stability_result.failed_rounds,
         'stability_window_sec': stability_result.window_sec,
+        'region': confirmed_region,
     }
 
 
@@ -641,6 +677,7 @@ def _evaluate_e2e_candidate_mock(proxy_name, ip, port, colo, api_port, proxy_por
     if not is_match_country:
         return None
 
+    confirmed_region = exit_country if exit_country else detect_node_region(colo, "", ip)
     return {
         'proxy_name': proxy_name,
         'ip': ip,
@@ -652,6 +689,7 @@ def _evaluate_e2e_candidate_mock(proxy_name, ip, port, colo, api_port, proxy_por
         'exit_ip': exit_ip,
         'exit_country': exit_country,
         'quality_gate_version': 1,  # mock 路径仍用 v1 标记
+        'region': confirmed_region,
     }
 
 
@@ -745,8 +783,8 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
     tier1_alive.sort(key=lambda x: (x['avg_rtt'], x['jitter']))
     print(f"[+] [阶段 3/5 Tier 1] 并发隧道探针质检完毕，存活可用节点: {len(tier1_alive)} / {len(candidates_with_name)} (耗时 {time.time()-t0:.1f}s)")
 
-    # 兼顾亚太各区 (HK, TW, JP, SG) 与美区 (US) 代表性
-    tier1_buckets = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'US': [], 'OTHER': []}
+    # 兼顾亚太各区 (HK, TW, JP, SG, KR) 与美区 (US) 代表性
+    tier1_buckets = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'KR': [], 'US': [], 'OTHER': []}
     for cand in tier1_alive:
         item = cand['item']
         reg = detect_node_region(item[3] if len(item) > 3 else 'CF', item[5] if len(item) > 5 else '', item[0])
@@ -755,7 +793,7 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
         else:
             tier1_buckets['OTHER'].append(cand)
 
-    tier2_budgets = {'HK': 6, 'TW': 6, 'JP': 6, 'SG': 6, 'US': 10}
+    tier2_budgets = {'HK': 6, 'TW': 6, 'JP': 6, 'SG': 6, 'KR': 6, 'US': 10}
     tier2_candidates = []
     for reg, b_quota in tier2_budgets.items():
         tier2_candidates.extend(tier1_buckets[reg][:b_quota])
@@ -807,7 +845,8 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
                 print(f"  [-] [{name}] {ip}:{port} Google 真实主页拉取失败 (err={g_err or 'title_not_matched'}), 淘汰")
                 continue
 
-            print(f"  [+] [{name}] {ip}:{port} 出口={exit_country}({exit_ip}) 延迟={cand['avg_rtt']:.1f}ms 真实页面=✓ ({g_title.strip()})")
+            confirmed_region = exit_country if exit_country else detect_node_region(colo, rem, ip)
+            print(f"  [+] [{name}] {ip}:{port} 出口={exit_country}({exit_ip}) 归属={confirmed_region} 延迟={cand['avg_rtt']:.1f}ms 真实页面=✓ ({g_title.strip()})")
             node_res = {
                 'proxy_name': name,
                 'ip': ip,
@@ -823,7 +862,7 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
                 'real_page_failed_rounds': [],
                 'stability_window_sec': 60,
                 'remark': rem,
-                'region': detect_node_region(colo, rem, ip),
+                'region': confirmed_region,
             }
             e2e_results.append(node_res)
 
@@ -848,6 +887,7 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
             if is_match:
                 colo = item[3] if len(item) > 3 else "CF"
                 rem = item[5] if len(item) > 5 else ""
+                confirmed_region = exit_country if exit_country else detect_node_region(colo, rem, item[0])
                 e2e_results.append({
                     'proxy_name': name,
                     'ip': item[0],
@@ -863,7 +903,7 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
                     'real_page_failed_rounds': [],
                     'stability_window_sec': 30,
                     'remark': rem,
-                    'region': detect_node_region(colo, rem, item[0]),
+                    'region': confirmed_region,
                 })
                 existing_keys.add(key)
 
@@ -1902,8 +1942,8 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
                 rem = c[3] if len(c) > 3 else ""
                 stage2_survivors.append((c[0], c[1], c[2], "CF", 200.0, rem))
 
-    # 候选节点区域分层入围策略：兼顾亚太各区 (HK, TW, JP, SG) 与美区 (US)
-    region_buckets = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'US': [], 'OTHER': []}
+    # 候选节点区域分层入围策略：兼顾亚太各区 (HK, TW, JP, SG, KR) 与美区 (US)
+    region_buckets = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'KR': [], 'US': [], 'OTHER': []}
     for c in stage2_survivors:
         colo = c[3]
         rem = c[5] if len(c) > 5 else ""
@@ -1917,8 +1957,8 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     for r in region_buckets:
         region_buckets[r].sort(key=lambda x: (x[4] if x[4] else 999.0))
 
-    # 沙箱入围配额：亚太各区分配 12 个名额，美区分配 20 个名额，保障各区域样本充足
-    stage2_budgets = {'HK': 12, 'TW': 12, 'JP': 12, 'SG': 12, 'US': 20}
+    # 沙箱入围配额：亚太各区分配 12 个名额，美区分配 20 个名额，韩国分配 10 个名额，保障各区域样本充足
+    stage2_budgets = {'HK': 12, 'TW': 12, 'JP': 12, 'SG': 12, 'KR': 10, 'US': 20}
     chosen = []
     for r, b_quota in stage2_budgets.items():
         chosen.extend(region_buckets[r][:b_quota])
@@ -2021,8 +2061,8 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         if 'region' not in node:
             node['region'] = detect_node_region(node.get('colo', ''), node.get('remark', ''), node.get('ip', ''))
 
-    stage4_region_budgets = {'HK': 7, 'TW': 7, 'JP': 7, 'SG': 7, 'US': 15}
-    speed_buckets = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'US': [], 'OTHER': []}
+    stage4_region_budgets = {'HK': 7, 'TW': 7, 'JP': 7, 'SG': 7, 'KR': 5, 'US': 15}
+    speed_buckets = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'KR': [], 'US': [], 'OTHER': []}
     for node in e2e_results:
         r = node.get('region', 'US')
         if r in speed_buckets:
@@ -2167,7 +2207,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
             sandbox.stop()
 
     # ================= 阶段 5：分区域配额综合评分严选与导出 =================
-    region_candidates = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'US': [], 'OTHER': []}
+    region_candidates = {'HK': [], 'TW': [], 'JP': [], 'SG': [], 'KR': [], 'US': [], 'OTHER': []}
     for node in candidates_for_speed:
         reg = node.get('region') or detect_node_region(node.get('colo', ''), node.get('remark', ''), node.get('ip', ''))
         node['region'] = reg

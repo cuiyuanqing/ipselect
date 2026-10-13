@@ -7,7 +7,7 @@ import shutil
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'scripts')))
 
-from filter_us_nodes import detect_node_region, run_filter_and_export, DEFAULT_REGION_QUOTAS
+from filter_us_nodes import detect_node_region, run_filter_and_export, DEFAULT_REGION_QUOTAS, parse_geoip_response
 
 
 class TestMultiRegionSelection(unittest.TestCase):
@@ -25,6 +25,8 @@ class TestMultiRegionSelection(unittest.TestCase):
         self.assertEqual(detect_node_region("NRT"), "JP")
         self.assertEqual(detect_node_region("KIX"), "JP")
         self.assertEqual(detect_node_region("SIN"), "SG")
+        self.assertEqual(detect_node_region("ICN"), "KR")
+        self.assertEqual(detect_node_region("GMP"), "KR")
         self.assertEqual(detect_node_region("SJC"), "US")
         self.assertEqual(detect_node_region("LAX"), "US")
 
@@ -33,6 +35,7 @@ class TestMultiRegionSelection(unittest.TestCase):
         self.assertEqual(detect_node_region("CF", "TW-HiNet中华电信"), "TW")
         self.assertEqual(detect_node_region("CF", "JP-AWS反代"), "JP")
         self.assertEqual(detect_node_region("CF", "SG-CF优选"), "SG")
+        self.assertEqual(detect_node_region("CF", "KR-首尔AWS反代"), "KR")
         self.assertEqual(detect_node_region("CF", "US-SJC-01"), "US")
 
         # 3. 中文地名检测
@@ -40,6 +43,7 @@ class TestMultiRegionSelection(unittest.TestCase):
         self.assertEqual(detect_node_region("CF", "台北HiNet"), "TW")
         self.assertEqual(detect_node_region("CF", "东京AWS机房"), "JP")
         self.assertEqual(detect_node_region("CF", "新加坡狮城节点"), "SG")
+        self.assertEqual(detect_node_region("CF", "韩国仁川机房"), "KR")
         self.assertEqual(detect_node_region("CF", "美西高带宽"), "US")
 
         # 4. 防单词子串误伤 (例如 Host1Plus 不含 US 边界，不应误判)
@@ -116,6 +120,38 @@ class TestMultiRegionSelection(unittest.TestCase):
             'SG': 5,
             'US': 10
         })
+
+    def test_parse_geoip_response(self):
+        # 1. api.ip.sb 风格 JSON
+        c, ip = parse_geoip_response("https://api.ip.sb/geoip", '{"country_code": "KR", "ip": "104.28.162.46"}')
+        self.assertEqual(c, "KR")
+        self.assertEqual(ip, "104.28.162.46")
+
+        # 2. ipleak.net 风格 JSON
+        c, ip = parse_geoip_response("https://ipleak.net/json/", '{"country_code": "US", "ip": "104.28.166.29"}')
+        self.assertEqual(c, "US")
+        self.assertEqual(ip, "104.28.166.29")
+
+        # 3. cloudflare cdn-cgi/trace 纯文本
+        trace_data = "fl=123\nh=cloudflare.com\nip=104.28.157.107\nts=123\nloc=US\nwarp=off\n"
+        c, ip = parse_geoip_response("https://cloudflare.com/cdn-cgi/trace", trace_data)
+        self.assertEqual(c, "US")
+        self.assertEqual(ip, "104.28.157.107")
+
+        # 4. ip-api.com 风格 JSON
+        c, ip = parse_geoip_response("http://ip-api.com/json", '{"countryCode": "JP", "query": "104.28.162.99"}')
+        self.assertEqual(c, "JP")
+        self.assertEqual(ip, "104.28.162.99")
+
+    def test_kr_exit_not_misclassified_as_us(self):
+        # 验证 ICN 节点明确归入 KR，不会被错误冠以 US 标签
+        from filter_us_nodes import format_node_line
+        reg = detect_node_region("ICN", "", "123.111.169.70")
+        self.assertEqual(reg, "KR")
+
+        line = format_node_line("123.111.169.70", 443, 6.5, 1, "联通优选", 7.8, "ICN", region=reg)
+        self.assertIn("#KR-联通优选-01-", line)
+        self.assertNotIn("#US-", line)
 
 
 if __name__ == '__main__':
