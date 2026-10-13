@@ -119,6 +119,10 @@ DEFAULT_REGION_QUOTAS = {
     'US': 10,
 }
 
+# 区域输出聚合优先级 (方案 A：US 永远集中置顶，随后为核心亚太及欧美节点)
+DEFAULT_REGION_PRIORITY = ["US", "HK", "TW", "SG", "JP", "KR", "DE", "IN", "UK", "FR", "CA", "AU"]
+DEFAULT_VIP_FILE = os.environ.get("VIP_FILE", "/etc/ipselect/vip_nodes.json" if os.path.exists("/etc") else os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vip_nodes.json"))
+
 EXCLUDE_CITIES = {'Toronto', 'Montreal', 'Vancouver', 'Calgary', 'Ottawa'}
 EXCLUDE_DCS = {'YYZ', 'YVR', 'YUL', 'YYC'}
 
@@ -1021,6 +1025,219 @@ def format_node_line(ip: str, port: int, score: float, rank: int, tag: str, spee
     return f"{ip}:{port}#{region}-{tag}-{rank:02d}-{speed_mb_s:.2f}MB/s"
 
 
+def sort_qualified_nodes_by_region_and_speed(nodes, env_tag="公司", region_priority=None):
+    """
+    跨批次区域聚合排序优化 (方案 A):
+    1. 区域优先分组：按照 region_priority (默认 US -> HK -> TW -> SG -> JP -> KR ...) 分组
+    2. 组内严格按流速降序 (speed 降序, score 降序, e2e_avg_rtt 升序)
+    3. 组内重新生成连续递增序号 (01, 02, 03...) 与标准 remark 格式 (例如 US-联通优选-01-9.20MB/s)
+    """
+    if region_priority is None:
+        region_priority = DEFAULT_REGION_PRIORITY
+
+    groups = {}
+    for node in nodes:
+        reg = node.get('region') or node.get('exit_country')
+        if not reg or reg == 'AUTO':
+            reg = detect_node_region(node.get('colo', ''), node.get('remark', ''), node.get('ip', ''))
+        if not reg:
+            reg = 'OTHER'
+        reg = str(reg).upper().strip()
+        if reg not in groups:
+            groups[reg] = []
+        groups[reg].append(node)
+
+    def reg_sort_key(r):
+        if r in region_priority:
+            return (0, region_priority.index(r))
+        return (1, r)
+
+    ordered_regs = sorted(groups.keys(), key=reg_sort_key)
+    sorted_nodes = []
+    for reg in ordered_regs:
+        reg_nodes = groups[reg]
+        reg_nodes.sort(key=lambda x: (
+            -float(x.get('speed', 0.0)),
+            -float(x.get('score', 0.0)),
+            float(x.get('e2e_avg_rtt', 999.0))
+        ))
+        for rank, node in enumerate(reg_nodes, 1):
+            node['region'] = reg
+            node['region_rank'] = rank
+            sp = float(node.get('speed', 0.0))
+            node['remark'] = f"{reg}-{env_tag}-{rank:02d}-{sp:.2f}MB/s"
+            sorted_nodes.append(node)
+
+    return sorted_nodes
+
+
+def load_warm_and_vip_seeds(workdir=None, output_file="best_us.txt", vip_file=None):
+    """
+    从 VIP 高价值节点库及上一轮优选生成的结果文件 (best_us.txt / best_us_detail.json) 中读取优质种子，
+    赋予其免采样淘汰特权，直接进入当期筛选候选池
+    """
+    if vip_file is None:
+        vip_file = DEFAULT_VIP_FILE
+
+    seeds = {}
+
+    # 1. 加载 VIP 高价值专库
+    if os.path.exists(vip_file):
+        try:
+            with open(vip_file, 'r', encoding='utf-8') as f:
+                v_data = json.load(f)
+                for item in v_data.get('nodes', []):
+                    ip = item.get('ip')
+                    if not ip:
+                        continue
+                    port = int(item.get('port', 443))
+                    seeds[(ip, port)] = {
+                        'ip': ip,
+                        'port': port,
+                        'speed': float(item.get('speed', 0.0)),
+                        'colo': item.get('colo', ''),
+                        'exit_country': item.get('exit_country', ''),
+                        'remark': item.get('remark', '') or f"VIP种子-{item.get('exit_country') or item.get('colo') or '极速'}"
+                    }
+        except Exception as e:
+            print(f"[-] 读取 VIP 种子库失败 ({vip_file}): {e}")
+
+    # 2. 从上一轮输出的 detail.json 中加载
+    target_path = output_file
+    if not os.path.isabs(target_path):
+        if workdir:
+            target_path = os.path.join(workdir, output_file)
+        else:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            target_path = os.path.join(os.path.dirname(script_dir), output_file)
+
+    detail_path = os.path.splitext(target_path)[0] + "_detail.json"
+    if os.path.exists(detail_path):
+        try:
+            with open(detail_path, 'r', encoding='utf-8') as f:
+                d_data = json.load(f)
+                for item in d_data.get('nodes', []):
+                    ip = item.get('ip')
+                    if not ip:
+                        continue
+                    port = int(item.get('port', 443))
+                    k = (ip, port)
+                    if k not in seeds:
+                        seeds[k] = {
+                            'ip': ip,
+                            'port': port,
+                            'speed': float(item.get('speed', 0.0)),
+                            'colo': item.get('colo', ''),
+                            'exit_country': item.get('exit_country', ''),
+                            'remark': item.get('remark', '')
+                        }
+        except Exception as e:
+            print(f"[-] 读取上一轮 detail.json 失败: {e}")
+
+    # 3. 从上一轮输出的 txt 文件中解析补充
+    if os.path.exists(target_path):
+        try:
+            with open(target_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    rem = ""
+                    if '#' in line:
+                        addr_part, rem = line.split('#', 1)
+                    else:
+                        addr_part = line
+                    if ':' in addr_part:
+                        parts = addr_part.split(':', 1)
+                        ip = parts[0].strip()
+                        try:
+                            port = int(parts[1].strip())
+                        except ValueError:
+                            port = 443
+                    else:
+                        ip = addr_part.strip()
+                        port = 443
+                    k = (ip, port)
+                    if k not in seeds:
+                        seeds[k] = {
+                            'ip': ip,
+                            'port': port,
+                            'speed': 0.0,
+                            'colo': '',
+                            'exit_country': '',
+                            'remark': rem
+                        }
+        except Exception as e:
+            print(f"[-] 读取上一轮 txt 失败: {e}")
+
+    return list(seeds.values())
+
+
+def update_vip_nodes_pool(vip_file=None, tested_nodes=None, vip_threshold=8.0, min_speed_threshold=3.0):
+    """
+    更新高价值 VIP 节点专库 (>= vip_threshold MB/s)，淘汰严重掉速 (< min_speed_threshold) 或失效的节点
+    """
+    if vip_file is None:
+        vip_file = DEFAULT_VIP_FILE
+    if tested_nodes is None:
+        tested_nodes = []
+
+    vip_map = {}
+    if os.path.exists(vip_file):
+        try:
+            with open(vip_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                for item in data.get('nodes', []):
+                    k = (item['ip'], int(item['port']))
+                    vip_map[k] = item
+        except Exception as e:
+            print(f"[-] 读取 VIP 节点库失败 ({vip_file}): {e}")
+
+    now_str = time.strftime('%Y-%m-%d %H:%M:%S')
+
+    for node in tested_nodes:
+        ip = node.get('ip')
+        if not ip:
+            continue
+        port = int(node.get('port', 443))
+        k = (ip, port)
+        sp = float(node.get('speed', 0.0))
+
+        if sp >= vip_threshold:
+            vip_map[k] = {
+                'ip': ip,
+                'port': port,
+                'speed': round(sp, 2),
+                'exit_country': node.get('exit_country') or node.get('region', ''),
+                'colo': node.get('colo', ''),
+                'score': round(float(node.get('score', 0.0)), 1),
+                'e2e_avg_rtt': round(float(node.get('e2e_avg_rtt', 0.0)), 1),
+                'last_tested': now_str
+            }
+        elif k in vip_map:
+            if sp < min_speed_threshold:
+                vip_map.pop(k, None)
+            else:
+                vip_map[k]['speed'] = round(sp, 2)
+                vip_map[k]['last_tested'] = now_str
+
+    saved_nodes = sorted(list(vip_map.values()), key=lambda x: -float(x.get('speed', 0.0)))
+    result_data = {
+        'updated_at': now_str,
+        'vip_threshold': vip_threshold,
+        'nodes': saved_nodes
+    }
+
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(vip_file)), exist_ok=True)
+        with open(vip_file, 'w', encoding='utf-8') as f:
+            json.dump(result_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[-] 保存 VIP 节点库异常 ({vip_file}): {e}")
+
+    return result_data
+
+
 def infer_environment_from_ips(ip_list):
     """
     根据给定的本地 IP 列表智能推断网络环境与输出文件名：
@@ -1119,9 +1336,24 @@ def generate_random_cf_candidates(count, cidrs):
     return out
 
 
-def fetch_candidates():
+def fetch_candidates(workdir=None, output_file=None, reuse_history=True, vip_file=None):
     """从多个渠道获取候选节点列表"""
     candidates = []
+
+    # 0. 优先加载往期优质种子与 VIP 专库种子（保活免初筛通道）
+    if reuse_history:
+        seeds = load_warm_and_vip_seeds(workdir=workdir, output_file=output_file or "best_us.txt", vip_file=vip_file)
+        if seeds:
+            print(f"[*] 优先注入往期优质优选与 VIP 种子 ({len(seeds)} 个优先保活通道)...")
+            for s in seeds:
+                candidates.append((
+                    s['ip'],
+                    int(s['port']),
+                    float(s.get('speed', 0.0)),
+                    s.get('remark', '往期优质种子'),
+                    s.get('colo', ''),
+                    s.get('exit_country', '')
+                ))
 
     # 1. 解析 CSV 数据源 (例如 addressescsv.csv)
     for url in CSV_SOURCES:
@@ -1261,7 +1493,7 @@ def fetch_candidates():
     except Exception as e:
         print(f"[-] 加载社区优选源提示: {e}")
 
-    # 去重
+    # 去重 (优先保留靠前出现的种子携带的机房和区域元数据)
     seen = set()
     unique_candidates = []
     for item in candidates:
@@ -1269,10 +1501,12 @@ def fetch_candidates():
         port = item[1]
         sp = item[2]
         rem = item[3] if len(item) > 3 else ""
+        colo = item[4] if len(item) > 4 else ""
+        exit_c = item[5] if len(item) > 5 else ""
         key = (ip, port)
         if key not in seen:
             seen.add(key)
-            unique_candidates.append((ip, port, sp, rem))
+            unique_candidates.append((ip, port, sp, rem, colo, exit_c))
 
     print(f"[+] 累计汇总待测候选节点数: {len(unique_candidates)}")
     return unique_candidates
@@ -2102,7 +2336,8 @@ def run_stage3_and_stage4_batch(
 def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=None, mock_mode=False, mock_candidates=None,
                           vless_sni=None, vless_uuid=None, vless_path=None, vless_port=None,
                           target_country="AUTO", sandbox_enable=True,
-                          min_speed=None, max_refill_rounds=None):
+                          min_speed=None, max_refill_rounds=None,
+                          reuse_history=None, vip_speed=None, vip_file=None):
     """
     五阶漏斗端到端严选引擎 (支持保底速率与动态分批补位流水线)：
     1. 阶段 1：快速 TCP 并发探针 (快速初筛死节点)
@@ -2130,12 +2365,30 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         except Exception:
             max_refill_rounds = 2
 
+    if reuse_history is None:
+        reuse_history = str(os.environ.get("REUSE_HISTORY", "1")).strip().lower() not in ('0', 'false', 'no')
+
+    if vip_speed is None:
+        try:
+            vip_speed = float(os.environ.get("VIP_SPEED_THRESHOLD", "8.0"))
+        except Exception:
+            vip_speed = 8.0
+
+    if vip_file is None:
+        vip_file = DEFAULT_VIP_FILE
+
     if mock_mode and mock_candidates:
         candidates = mock_candidates
     else:
-        candidates = fetch_candidates()
+        workdir = os.path.dirname(os.path.abspath(output_file)) if os.path.isabs(output_file) else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidates = fetch_candidates(
+            workdir=workdir,
+            output_file=output_file,
+            reuse_history=reuse_history,
+            vip_file=vip_file
+        )
 
-    print(f"[*] 启动五阶漏斗全链路严选引擎 (环境标识: {tag}, 导出目标: {output_file}, 速率保底门槛: {min_speed:.2f} MB/s, 最大补位轮数: {max_refill_rounds})...")
+    print(f"[*] 启动五阶漏斗全链路严选引擎 (环境标识: {tag}, 导出目标: {output_file}, 速率保底门槛: {min_speed:.2f} MB/s, VIP门槛: {vip_speed:.2f} MB/s, 往期复用: {reuse_history}, 最大补位轮数: {max_refill_rounds})...")
 
     # 数据源拉取就绪后，启动底层直连网络绕过（设置 GID=65534 绕过代理，直接测速真实延迟）
     if not mock_mode:
@@ -2338,7 +2591,25 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
             if len(selected_nodes) >= total_quota_target:
                 break
 
-    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质全链路多区域达标优选节点 ({tag}专属 / 全链路实测 / 速率保底 >= {min_speed:.2f} MB/s):")
+    # 方案 A 关键优化：打破批次界限，跨轮次按“核心区域优先级(US置顶) + 组内绝对速度降序”统一排序与重新编号
+    selected_nodes = sort_qualified_nodes_by_region_and_speed(
+        selected_nodes,
+        env_tag=tag,
+        region_priority=DEFAULT_REGION_PRIORITY
+    )
+
+    # 同步沉淀高价值 VIP 节点库 (>= vip_speed，默认 8.0 MB/s)
+    try:
+        update_vip_nodes_pool(
+            vip_file=vip_file,
+            tested_nodes=all_tested_nodes,
+            vip_threshold=vip_speed,
+            min_speed_threshold=min_speed
+        )
+    except Exception as e:
+        print(f"[-] 更新 VIP 节点库异常: {e}")
+
+    print(f"\n[+] 成功精选出 Top {len(selected_nodes)} 个高品质全链路多区域达标优选节点 ({tag}专属 / 全链路实测 / 速率保底 >= {min_speed:.2f} MB/s / US优先置顶):")
     output_lines = []
     detail_nodes = []
     update_time_str = time.strftime('%Y-%m-%d %H:%M:%S')
@@ -2347,15 +2618,18 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     for idx, node in enumerate(selected_nodes, 1):
         colo_str = node.get('colo') or 'CF'
         reg = node.get('region') or detect_node_region(colo_str, node.get('remark', ''), node['ip'])
-        region_rank_counter[reg] = region_rank_counter.get(reg, 0) + 1
-        reg_rank = region_rank_counter[reg]
+        reg_rank = node.get('region_rank')
+        if not reg_rank:
+            region_rank_counter[reg] = region_rank_counter.get(reg, 0) + 1
+            reg_rank = region_rank_counter[reg]
+            node['region_rank'] = reg_rank
 
         line = format_node_line(node['ip'], node['port'], node['score'], reg_rank, tag, node['speed'], colo_str, region=reg)
         output_lines.append(line)
         cf_flag = "CF官方" if node.get('is_cf', True) else "第三方反代"
         print(f"  [{idx:02d}] {line} | 评分: {node['score']:.1f} | 机房: {colo_str} | 端到端RTT: {node['e2e_avg_rtt']:.0f}ms | 抖动: {node['e2e_jitter']:.0f}ms ({cf_flag})")
 
-        remark_str = line.split('#', 1)[1] if '#' in line else f"{reg}-{tag}-{reg_rank:02d}-{node['speed']:.2f}MB/s"
+        remark_str = line.split('#', 1)[1] if '#' in line else node.get('remark', f"{reg}-{tag}-{reg_rank:02d}-{node['speed']:.2f}MB/s")
         detail_nodes.append({
             'index': idx,
             'proxy_name': node.get('proxy_name') or f"node_{idx:02d}",
@@ -2401,6 +2675,8 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         'update_time': update_time_str,
         'count': len(detail_nodes),
         'min_speed_threshold': min_speed,
+        'vip_speed_threshold': vip_speed,
+        'reuse_history': reuse_history,
         'refill_rounds_executed': round_idx,
         'region_distribution': region_dist,
         'sandbox_config': {
@@ -2434,11 +2710,15 @@ def main():
     parser.add_argument("--sandbox", default=os.environ.get("SANDBOX_ENABLE", "1"), help="是否启用沙箱质检 (1 或 0)")
     parser.add_argument("--min-speed", type=float, default=None, help="最低保留下载带宽门槛 (MB/s, 默认 3.0)")
     parser.add_argument("--max-refill-rounds", type=int, default=None, help="节点不足时的最大补位重试轮数 (默认 2)")
+    parser.add_argument("--reuse-history", default=os.environ.get("REUSE_HISTORY", "1"), help="是否优先复用往期优选与 VIP 种子 (1 或 0)")
+    parser.add_argument("--vip-speed", type=float, default=None, help="高价值 VIP 节点留存门槛 (MB/s, 默认 8.0)")
+    parser.add_argument("--vip-file", default=os.environ.get("VIP_FILE", None), help="VIP 节点专库持久化文件路径")
 
     args = parser.parse_args()
     tag, output_file = detect_network_environment(cli_tag=args.tag, cli_output=args.output)
     print(f"[*] 环境自动感知检测结果: 位置=[{tag}], 输出文件=[{output_file}]")
     sandbox_flag = str(args.sandbox).strip() not in ('0', 'false', 'False', 'no')
+    reuse_flag = str(args.reuse_history).strip() not in ('0', 'false', 'False', 'no')
     run_filter_and_export(
         tag=tag,
         output_file=output_file,
@@ -2450,7 +2730,10 @@ def main():
         target_country=args.target_country,
         sandbox_enable=sandbox_flag,
         min_speed=args.min_speed,
-        max_refill_rounds=args.max_refill_rounds
+        max_refill_rounds=args.max_refill_rounds,
+        reuse_history=reuse_flag,
+        vip_speed=args.vip_speed,
+        vip_file=args.vip_file
     )
 
 

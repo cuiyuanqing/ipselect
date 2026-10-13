@@ -139,8 +139,10 @@ run_task() {
     STAGE4_SPEED_LIMIT=$(get_config "stage4_speed_limit" "45")
     MIN_SPEED_THRESHOLD=$(get_config "min_speed_threshold" "3.0")
     MAX_REFILL_ROUNDS=$(get_config "max_refill_rounds" "2")
+    REUSE_HISTORY=$(get_config "reuse_history" "1")
+    VIP_SPEED_THRESHOLD=$(get_config "vip_speed_threshold" "8.0")
 
-    export SANDBOX_ENABLE VLESS_SNI VLESS_UUID VLESS_PATH VLESS_PORT TARGET_COUNTRY RANDOM_CF_COUNT STAGE2_ENTRY_LIMIT STAGE4_SPEED_LIMIT SPEED_TEST_DURATION SPEED_TEST_PARALLEL SPEED_TEST_NODE_CONCURRENCY SPEED_TEST_MAX_RETRY SPEED_TEST_MAX_BYTES_PER_IP MIN_SPEED_THRESHOLD MAX_REFILL_ROUNDS
+    export SANDBOX_ENABLE VLESS_SNI VLESS_UUID VLESS_PATH VLESS_PORT TARGET_COUNTRY RANDOM_CF_COUNT STAGE2_ENTRY_LIMIT STAGE4_SPEED_LIMIT SPEED_TEST_DURATION SPEED_TEST_PARALLEL SPEED_TEST_NODE_CONCURRENCY SPEED_TEST_MAX_RETRY SPEED_TEST_MAX_BYTES_PER_IP MIN_SPEED_THRESHOLD MAX_REFILL_ROUNDS REUSE_HISTORY VIP_SPEED_THRESHOLD
 
     # 保存当前任务上下文供 stop 中断时获取
     cat << EOF > "$INFO_FILE"
@@ -235,8 +237,8 @@ EOF
             fi
         fi
 
-        echo "[*] 开始执行节点筛选测速: --tag ${ENV_TAG} --output ${OUTPUT_FILE} --interface ${INTERFACE} --sni ${VLESS_SNI} --target-country ${TARGET_COUNTRY} --sandbox ${SANDBOX_ENABLE} --min-speed ${MIN_SPEED_THRESHOLD} --max-refill-rounds ${MAX_REFILL_ROUNDS}..." >> "$LOG_FILE"
-        if python3 scripts/filter_us_nodes.py --tag "$ENV_TAG" --output "$OUTPUT_FILE" --interface "$INTERFACE" --sni "$VLESS_SNI" --uuid "$VLESS_UUID" --path "$VLESS_PATH" --port "$VLESS_PORT" --target-country "$TARGET_COUNTRY" --sandbox "$SANDBOX_ENABLE" --min-speed "$MIN_SPEED_THRESHOLD" --max-refill-rounds "$MAX_REFILL_ROUNDS" >> "$LOG_FILE" 2>&1; then
+        echo "[*] 开始执行节点筛选测速: --tag ${ENV_TAG} --output ${OUTPUT_FILE} --interface ${INTERFACE} --sni ${VLESS_SNI} --target-country ${TARGET_COUNTRY} --sandbox ${SANDBOX_ENABLE} --min-speed ${MIN_SPEED_THRESHOLD} --max-refill-rounds ${MAX_REFILL_ROUNDS} --reuse-history ${REUSE_HISTORY} --vip-speed ${VIP_SPEED_THRESHOLD}..." >> "$LOG_FILE"
+        if python3 scripts/filter_us_nodes.py --tag "$ENV_TAG" --output "$OUTPUT_FILE" --interface "$INTERFACE" --sni "$VLESS_SNI" --uuid "$VLESS_UUID" --path "$VLESS_PATH" --port "$VLESS_PORT" --target-country "$TARGET_COUNTRY" --sandbox "$SANDBOX_ENABLE" --min-speed "$MIN_SPEED_THRESHOLD" --max-refill-rounds "$MAX_REFILL_ROUNDS" --reuse-history "$REUSE_HISTORY" --vip-speed "$VIP_SPEED_THRESHOLD" >> "$LOG_FILE" 2>&1; then
             echo "[+] 节点筛选测速完成！" >> "$LOG_FILE"
             if [ -f "$OUTPUT_FILE" ]; then
                 NODE_COUNT=$(grep -v '^#' "$OUTPUT_FILE" 2>/dev/null | grep -c ':' 2>/dev/null || true)

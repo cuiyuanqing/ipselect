@@ -359,9 +359,13 @@ return view.extend({
 						_('有效质检节点数：'),
 						E('strong', { 'style': 'color:#28a745;' }, [count + ' ' + _('个')])
 					]),
-					(res.min_speed_threshold != null ? E('span', {}, [
+					(res.min_speed_threshold != null ? E('span', { 'style': 'margin-right:16px;' }, [
 						_('保底速率门槛：'),
 						E('strong', { 'style': 'color:#0072c6;' }, ['≥ ' + res.min_speed_threshold + ' MB/s'])
+					]) : ''),
+					(res.vip_speed_threshold != null ? E('span', {}, [
+						_('VIP留存门槛：'),
+						E('strong', { 'style': 'color:#d97706;' }, ['≥ ' + res.vip_speed_threshold + ' MB/s'])
 					]) : '')
 				]),
 				E('div', {}, [
@@ -662,6 +666,17 @@ return view.extend({
 		o = s.option(form.Value, 'max_refill_rounds', _('达标不足最大补位轮数'), _('当达标节点不足目标配额时，自动从备选池增量补测的重试轮次上限 (默认 2，建议 1-3)'));
 		o.default = '2';
 		o.placeholder = '2';
+		o.rmempty = true;
+
+		/* 往期优质节点复用 */
+		o = s.option(form.Flag, 'reuse_history', _('往期筛选结果复用'), _('优先将上一轮优选生成的优质节点直接纳入当期候选池，保障历史极速节点可被持续沿用'));
+		o.default = '1';
+		o.rmempty = false;
+
+		/* VIP 极速节点留存门槛 */
+		o = s.option(form.Value, 'vip_speed_threshold', _('高价值节点留存门槛(MB/s)'), _('测速达标此速率的高质量节点将作为核心资产持久化存入专库，启动新一轮时优先复核录用 (默认 8.0)'));
+		o.default = '8.0';
+		o.placeholder = '8.0';
 		o.rmempty = true;
 
 		o = s.option(form.Value, 'speed_test_duration', _('单节点测速时长(秒)'), _('单节点 5 秒时间窗 × 2 轮取中位；越大越准但任务耗时变长 (默认 5，建议 3-8)'));
