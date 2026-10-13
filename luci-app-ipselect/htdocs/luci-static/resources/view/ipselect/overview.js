@@ -363,9 +363,13 @@ return view.extend({
 						_('保底速率门槛：'),
 						E('strong', { 'style': 'color:#0072c6;' }, ['≥ ' + res.min_speed_threshold + ' MB/s'])
 					]) : ''),
-					(res.vip_speed_threshold != null ? E('span', {}, [
+					(res.vip_speed_threshold != null ? E('span', { 'style': 'margin-right:16px;' }, [
 						_('VIP留存门槛：'),
 						E('strong', { 'style': 'color:#d97706;' }, ['≥ ' + res.vip_speed_threshold + ' MB/s'])
+					]) : ''),
+					(res.vip_file ? E('span', {}, [
+						_('VIP专库：'),
+						E('strong', { 'style': 'color:#7c3aed;' }, [res.vip_file])
 					]) : '')
 				]),
 				E('div', {}, [
@@ -677,6 +681,12 @@ return view.extend({
 		o = s.option(form.Value, 'vip_speed_threshold', _('高价值节点留存门槛(MB/s)'), _('测速达标此速率的高质量节点将作为核心资产持久化存入专库，启动新一轮时优先复核录用 (默认 8.0)'));
 		o.default = '8.0';
 		o.placeholder = '8.0';
+		o.rmempty = true;
+
+		/* VIP 极速节点库文件名 (由 Git 统一管理与跨端同步) */
+		o = s.option(form.Value, 'vip_file', _('高价值节点专库文件名'), _('高价值节点持久化文件名 (保存在工作目录根下并由 Git 跟踪提交，如 vip_nodes.json 或 vip_home.json)'));
+		o.default = 'vip_nodes.json';
+		o.placeholder = 'vip_nodes.json';
 		o.rmempty = true;
 
 		o = s.option(form.Value, 'speed_test_duration', _('单节点测速时长(秒)'), _('单节点 5 秒时间窗 × 2 轮取中位；越大越准但任务耗时变长 (默认 5，建议 3-8)'));

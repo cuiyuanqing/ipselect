@@ -141,8 +141,9 @@ run_task() {
     MAX_REFILL_ROUNDS=$(get_config "max_refill_rounds" "2")
     REUSE_HISTORY=$(get_config "reuse_history" "1")
     VIP_SPEED_THRESHOLD=$(get_config "vip_speed_threshold" "8.0")
+    VIP_FILE=$(get_config "vip_file" "vip_nodes.json")
 
-    export SANDBOX_ENABLE VLESS_SNI VLESS_UUID VLESS_PATH VLESS_PORT TARGET_COUNTRY RANDOM_CF_COUNT STAGE2_ENTRY_LIMIT STAGE4_SPEED_LIMIT SPEED_TEST_DURATION SPEED_TEST_PARALLEL SPEED_TEST_NODE_CONCURRENCY SPEED_TEST_MAX_RETRY SPEED_TEST_MAX_BYTES_PER_IP MIN_SPEED_THRESHOLD MAX_REFILL_ROUNDS REUSE_HISTORY VIP_SPEED_THRESHOLD
+    export SANDBOX_ENABLE VLESS_SNI VLESS_UUID VLESS_PATH VLESS_PORT TARGET_COUNTRY RANDOM_CF_COUNT STAGE2_ENTRY_LIMIT STAGE4_SPEED_LIMIT SPEED_TEST_DURATION SPEED_TEST_PARALLEL SPEED_TEST_NODE_CONCURRENCY SPEED_TEST_MAX_RETRY SPEED_TEST_MAX_BYTES_PER_IP MIN_SPEED_THRESHOLD MAX_REFILL_ROUNDS REUSE_HISTORY VIP_SPEED_THRESHOLD VIP_FILE
 
     # 保存当前任务上下文供 stop 中断时获取
     cat << EOF > "$INFO_FILE"
@@ -237,8 +238,8 @@ EOF
             fi
         fi
 
-        echo "[*] 开始执行节点筛选测速: --tag ${ENV_TAG} --output ${OUTPUT_FILE} --interface ${INTERFACE} --sni ${VLESS_SNI} --target-country ${TARGET_COUNTRY} --sandbox ${SANDBOX_ENABLE} --min-speed ${MIN_SPEED_THRESHOLD} --max-refill-rounds ${MAX_REFILL_ROUNDS} --reuse-history ${REUSE_HISTORY} --vip-speed ${VIP_SPEED_THRESHOLD}..." >> "$LOG_FILE"
-        if python3 scripts/filter_us_nodes.py --tag "$ENV_TAG" --output "$OUTPUT_FILE" --interface "$INTERFACE" --sni "$VLESS_SNI" --uuid "$VLESS_UUID" --path "$VLESS_PATH" --port "$VLESS_PORT" --target-country "$TARGET_COUNTRY" --sandbox "$SANDBOX_ENABLE" --min-speed "$MIN_SPEED_THRESHOLD" --max-refill-rounds "$MAX_REFILL_ROUNDS" --reuse-history "$REUSE_HISTORY" --vip-speed "$VIP_SPEED_THRESHOLD" >> "$LOG_FILE" 2>&1; then
+        echo "[*] 开始执行节点筛选测速: --tag ${ENV_TAG} --output ${OUTPUT_FILE} --interface ${INTERFACE} --sni ${VLESS_SNI} --target-country ${TARGET_COUNTRY} --sandbox ${SANDBOX_ENABLE} --min-speed ${MIN_SPEED_THRESHOLD} --max-refill-rounds ${MAX_REFILL_ROUNDS} --reuse-history ${REUSE_HISTORY} --vip-speed ${VIP_SPEED_THRESHOLD} --vip-file ${VIP_FILE}..." >> "$LOG_FILE"
+        if python3 scripts/filter_us_nodes.py --tag "$ENV_TAG" --output "$OUTPUT_FILE" --interface "$INTERFACE" --sni "$VLESS_SNI" --uuid "$VLESS_UUID" --path "$VLESS_PATH" --port "$VLESS_PORT" --target-country "$TARGET_COUNTRY" --sandbox "$SANDBOX_ENABLE" --min-speed "$MIN_SPEED_THRESHOLD" --max-refill-rounds "$MAX_REFILL_ROUNDS" --reuse-history "$REUSE_HISTORY" --vip-speed "$VIP_SPEED_THRESHOLD" --vip-file "$VIP_FILE" >> "$LOG_FILE" 2>&1; then
             echo "[+] 节点筛选测速完成！" >> "$LOG_FILE"
             if [ -f "$OUTPUT_FILE" ]; then
                 NODE_COUNT=$(grep -v '^#' "$OUTPUT_FILE" 2>/dev/null | grep -c ':' 2>/dev/null || true)
@@ -264,6 +265,7 @@ EOF
             git add "$OUTPUT_FILE"
             DETAIL_FILE="${OUTPUT_FILE%.txt}_detail.json"
             [ -f "$DETAIL_FILE" ] && git add "$DETAIL_FILE"
+            [ -n "$VIP_FILE" ] && [ -f "$VIP_FILE" ] && git add "$VIP_FILE"
             if ! git diff --staged --quiet; then
                 git commit -m "auto: iStoreOS 节点优选更新 [$(date '+%Y-%m-%d %H:%M:%S')]" >> "$LOG_FILE" 2>&1
 
@@ -280,7 +282,9 @@ EOF
                             echo "[*] 检测到 ${OUTPUT_FILE} 冲突标记,保留本地最新数据 (checkout --ours)..." >> "$LOG_FILE"
                             git checkout --ours -- "$OUTPUT_FILE" 2>/dev/null
                             [ -f "$DETAIL_FILE" ] && git checkout --ours -- "$DETAIL_FILE" 2>/dev/null
+                            [ -n "$VIP_FILE" ] && [ -f "$VIP_FILE" ] && git checkout --ours -- "$VIP_FILE" 2>/dev/null
                             git add "$OUTPUT_FILE" "$DETAIL_FILE" 2>/dev/null
+                            [ -n "$VIP_FILE" ] && [ -f "$VIP_FILE" ] && git add "$VIP_FILE" 2>/dev/null
                         fi
                     else
                         # rebase 也失败 → abort,直接 fetch 后用本地 ours 强制重置机器文件
@@ -291,6 +295,7 @@ EOF
                         # 把本地最新文件写回(机器文件本地永远准)
                         [ -f "$OUTPUT_FILE" ] && git add "$OUTPUT_FILE"
                         [ -f "$DETAIL_FILE" ] && git add "$DETAIL_FILE"
+                        [ -n "$VIP_FILE" ] && [ -f "$VIP_FILE" ] && git add "$VIP_FILE"
                         git commit -m "auto: iStoreOS 节点优选更新 (rebase 冲突后强制 ours) [$(date '+%Y-%m-%d %H:%M:%S')]" >> "$LOG_FILE" 2>&1 || true
                     fi
 

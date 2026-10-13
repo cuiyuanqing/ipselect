@@ -121,7 +121,7 @@ DEFAULT_REGION_QUOTAS = {
 
 # 区域输出聚合优先级 (方案 A：US 永远集中置顶，随后为核心亚太及欧美节点)
 DEFAULT_REGION_PRIORITY = ["US", "HK", "TW", "SG", "JP", "KR", "DE", "IN", "UK", "FR", "CA", "AU"]
-DEFAULT_VIP_FILE = os.environ.get("VIP_FILE", "/etc/ipselect/vip_nodes.json" if os.path.exists("/etc") else os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vip_nodes.json"))
+DEFAULT_VIP_FILE = os.environ.get("VIP_FILE", "vip_nodes.json")
 
 EXCLUDE_CITIES = {'Toronto', 'Montreal', 'Vancouver', 'Calgary', 'Ottawa'}
 EXCLUDE_DCS = {'YYZ', 'YVR', 'YUL', 'YYC'}
@@ -1074,17 +1074,34 @@ def sort_qualified_nodes_by_region_and_speed(nodes, env_tag="公司", region_pri
 def load_warm_and_vip_seeds(workdir=None, output_file="best_us.txt", vip_file=None):
     """
     从 VIP 高价值节点库及上一轮优选生成的结果文件 (best_us.txt / best_us_detail.json) 中读取优质种子，
-    赋予其免采样淘汰特权，直接进入当期筛选候选池
+    赋予其免采样淘汰特权，直接进入当期筛选候选池。
+    支持自定义 VIP 库文件名并解析到 workdir，便于多环境由 Git 同步记录。
     """
     if vip_file is None:
         vip_file = DEFAULT_VIP_FILE
 
+    # 支持相对路径解析到 workdir，确保随项目仓库一同由 Git 记录与管理
+    if not os.path.isabs(vip_file):
+        if workdir:
+            vip_target_path = os.path.join(workdir, vip_file)
+        else:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            vip_target_path = os.path.join(os.path.dirname(script_dir), vip_file)
+    else:
+        vip_target_path = vip_file
+
+    # 平滑兼容：若指定的目标路径不存在，但 /etc/ipselect/vip_nodes.json 存在，做平滑兼容
+    if not os.path.exists(vip_target_path) and os.path.exists("/etc/ipselect/vip_nodes.json"):
+        vip_read_path = "/etc/ipselect/vip_nodes.json"
+    else:
+        vip_read_path = vip_target_path
+
     seeds = {}
 
     # 1. 加载 VIP 高价值专库
-    if os.path.exists(vip_file):
+    if os.path.exists(vip_read_path):
         try:
-            with open(vip_file, 'r', encoding='utf-8') as f:
+            with open(vip_read_path, 'r', encoding='utf-8') as f:
                 v_data = json.load(f)
                 for item in v_data.get('nodes', []):
                     ip = item.get('ip')
@@ -1100,7 +1117,7 @@ def load_warm_and_vip_seeds(workdir=None, output_file="best_us.txt", vip_file=No
                         'remark': item.get('remark', '') or f"VIP种子-{item.get('exit_country') or item.get('colo') or '极速'}"
                     }
         except Exception as e:
-            print(f"[-] 读取 VIP 种子库失败 ({vip_file}): {e}")
+            print(f"[-] 读取 VIP 种子库失败 ({vip_read_path}): {e}")
 
     # 2. 从上一轮输出的 detail.json 中加载
     target_path = output_file
@@ -1173,25 +1190,39 @@ def load_warm_and_vip_seeds(workdir=None, output_file="best_us.txt", vip_file=No
     return list(seeds.values())
 
 
-def update_vip_nodes_pool(vip_file=None, tested_nodes=None, vip_threshold=8.0, min_speed_threshold=3.0):
+def update_vip_nodes_pool(vip_file=None, tested_nodes=None, vip_threshold=8.0, min_speed_threshold=3.0, workdir=None):
     """
     更新高价值 VIP 节点专库 (>= vip_threshold MB/s)，淘汰严重掉速 (< min_speed_threshold) 或失效的节点
+    支持自定义 VIP 库文件名并解析到 workdir，便于随 Git 自动记录与多地协同。
     """
     if vip_file is None:
         vip_file = DEFAULT_VIP_FILE
     if tested_nodes is None:
         tested_nodes = []
 
+    if not os.path.isabs(vip_file):
+        if workdir:
+            vip_target_path = os.path.join(workdir, vip_file)
+        else:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            vip_target_path = os.path.join(os.path.dirname(script_dir), vip_file)
+    else:
+        vip_target_path = vip_file
+
     vip_map = {}
-    if os.path.exists(vip_file):
+    read_path = vip_target_path
+    if not os.path.exists(read_path) and os.path.exists("/etc/ipselect/vip_nodes.json"):
+        read_path = "/etc/ipselect/vip_nodes.json"
+
+    if os.path.exists(read_path):
         try:
-            with open(vip_file, 'r', encoding='utf-8') as f:
+            with open(read_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 for item in data.get('nodes', []):
                     k = (item['ip'], int(item['port']))
                     vip_map[k] = item
         except Exception as e:
-            print(f"[-] 读取 VIP 节点库失败 ({vip_file}): {e}")
+            print(f"[-] 读取 VIP 节点库失败 ({read_path}): {e}")
 
     now_str = time.strftime('%Y-%m-%d %H:%M:%S')
 
@@ -1229,11 +1260,12 @@ def update_vip_nodes_pool(vip_file=None, tested_nodes=None, vip_threshold=8.0, m
     }
 
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(vip_file)), exist_ok=True)
-        with open(vip_file, 'w', encoding='utf-8') as f:
+        os.makedirs(os.path.dirname(os.path.abspath(vip_target_path)), exist_ok=True)
+        with open(vip_target_path, 'w', encoding='utf-8') as f:
             json.dump(result_data, f, ensure_ascii=False, indent=2)
+        print(f"[*] VIP 节点专库已持久化至 Git 跟踪路径: {vip_target_path} (达标节点数: {len(saved_nodes)})")
     except Exception as e:
-        print(f"[-] 保存 VIP 节点库异常 ({vip_file}): {e}")
+        print(f"[-] 保存 VIP 节点库异常 ({vip_target_path}): {e}")
 
     return result_data
 
@@ -2604,7 +2636,8 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
             vip_file=vip_file,
             tested_nodes=all_tested_nodes,
             vip_threshold=vip_speed,
-            min_speed_threshold=min_speed
+            min_speed_threshold=min_speed,
+            workdir=workdir
         )
     except Exception as e:
         print(f"[-] 更新 VIP 节点库异常: {e}")
@@ -2676,6 +2709,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         'count': len(detail_nodes),
         'min_speed_threshold': min_speed,
         'vip_speed_threshold': vip_speed,
+        'vip_file': os.path.basename(vip_file) if vip_file else "vip_nodes.json",
         'reuse_history': reuse_history,
         'refill_rounds_executed': round_idx,
         'region_distribution': region_dist,

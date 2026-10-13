@@ -1,0 +1,46 @@
+{
+  "updated_at": "2026-10-13 18:00:00",
+  "vip_threshold": 8.0,
+  "nodes": [
+    {
+      "ip": "54.179.79.12",
+      "port": 443,
+      "speed": 8.5,
+      "exit_country": "SG",
+      "colo": "SIN",
+      "score": 92.5,
+      "e2e_avg_rtt": 195.0,
+      "last_tested": "2026-10-13 18:00:00"
+    },
+    {
+      "ip": "85.211.251.172",
+      "port": 443,
+      "speed": 8.29,
+      "exit_country": "MY",
+      "colo": "KUL",
+      "score": 91.2,
+      "e2e_avg_rtt": 210.0,
+      "last_tested": "2026-10-13 18:00:00"
+    },
+    {
+      "ip": "18.136.76.91",
+      "port": 443,
+      "speed": 8.23,
+      "exit_country": "SG",
+      "colo": "SIN",
+      "score": 90.8,
+      "e2e_avg_rtt": 198.0,
+      "last_tested": "2026-10-13 18:00:00"
+    },
+    {
+      "ip": "52.193.226.127",
+      "port": 443,
+      "speed": 8.14,
+      "exit_country": "JP",
+      "colo": "NRT",
+      "score": 90.5,
+      "e2e_avg_rtt": 182.0,
+      "last_tested": "2026-10-13 18:00:00"
+    }
+  ]
+}
