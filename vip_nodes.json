@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-10-15 08:12:06",
+  "updated_at": "2026-10-15 21:42:12",
   "vip_threshold": 5.0,
   "nodes": [
     {
@@ -23,16 +23,6 @@
       "last_tested": "2026-10-13 18:00:00"
     },
     {
-      "ip": "52.196.107.77",
-      "port": 443,
-      "speed": 7.53,
-      "exit_country": "JP",
-      "colo": "NRT",
-      "score": 5.4,
-      "e2e_avg_rtt": 694.0,
-      "last_tested": "2026-10-14 21:24:15"
-    },
-    {
       "ip": "13.125.141.213",
       "port": 443,
       "speed": 7.0,
@@ -41,16 +31,6 @@
       "score": 5.7,
       "e2e_avg_rtt": 889.0,
       "last_tested": "2026-10-14 17:26:06"
-    },
-    {
-      "ip": "54.65.168.160",
-      "port": 443,
-      "speed": 6.77,
-      "exit_country": "JP",
-      "colo": "NRT",
-      "score": 5.7,
-      "e2e_avg_rtt": 687.0,
-      "last_tested": "2026-10-14 21:24:15"
     },
     {
       "ip": "52.79.188.223",
@@ -73,26 +53,6 @@
       "last_tested": "2026-10-14 17:26:06"
     },
     {
-      "ip": "3.113.232.245",
-      "port": 443,
-      "speed": 6.11,
-      "exit_country": "JP",
-      "colo": "NRT",
-      "score": 4.0,
-      "e2e_avg_rtt": 705.5,
-      "last_tested": "2026-10-14 21:24:15"
-    },
-    {
-      "ip": "104.17.151.13",
-      "port": 443,
-      "speed": 6.1,
-      "exit_country": "US",
-      "colo": "SJC",
-      "score": 3.8,
-      "e2e_avg_rtt": 969.0,
-      "last_tested": "2026-10-14 17:26:06"
-    },
-    {
       "ip": "43.201.54.156",
       "port": 443,
       "speed": 6.05,
@@ -111,26 +71,6 @@
       "score": 5.6,
       "e2e_avg_rtt": 617.0,
       "last_tested": "2026-10-14 12:36:44"
-    },
-    {
-      "ip": "104.17.154.228",
-      "port": 443,
-      "speed": 5.79,
-      "exit_country": "US",
-      "colo": "SJC",
-      "score": 5.1,
-      "e2e_avg_rtt": 1257.0,
-      "last_tested": "2026-10-14 17:26:06"
-    },
-    {
-      "ip": "179.253.238.249",
-      "port": 8443,
-      "speed": 5.71,
-      "exit_country": "US",
-      "colo": "LAX",
-      "score": 5.6,
-      "e2e_avg_rtt": 982.5,
-      "last_tested": "2026-10-14 21:24:15"
     },
     {
       "ip": "179.255.132.122",
@@ -161,26 +101,6 @@
       "score": 5.5,
       "e2e_avg_rtt": 931.0,
       "last_tested": "2026-10-14 17:26:06"
-    },
-    {
-      "ip": "104.17.149.206",
-      "port": 443,
-      "speed": 4.18,
-      "exit_country": "US",
-      "colo": "SJC",
-      "score": 3.8,
-      "e2e_avg_rtt": 1341.0,
-      "last_tested": "2026-10-14 21:24:15"
-    },
-    {
-      "ip": "176.34.12.152",
-      "port": 8443,
-      "speed": 3.13,
-      "exit_country": "JP",
-      "colo": "NRT",
-      "score": 5.6,
-      "e2e_avg_rtt": 967.5,
-      "last_tested": "2026-10-14 21:24:15"
     }
   ]
 }
