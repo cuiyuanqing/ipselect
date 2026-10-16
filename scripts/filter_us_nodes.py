@@ -32,7 +32,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
-SNI_HOST = "proxy.19940407.xyz"
+SNI_HOST = "wall.19940404.xyz"
 TOP_COUNT = int(os.environ.get("TOP_COUNT", "30"))
 PROBE_TIMEOUT = 2.5
 # 阶段2 → 沙箱入围上限（放大入围数，让更多候选进入全链路实测，保障各区域样本充足）
@@ -48,7 +48,23 @@ SPEED_TEST_MAX_RETRY = int(os.environ.get("SPEED_TEST_MAX_RETRY", "1"))
 # 环境变量名沿用 UCI key SPEED_TEST_MAX_BYTES_PER_IP（单位 MB）；Python 内部用 _MB 后缀避免与字节常量混淆
 SPEED_TEST_MAX_BYTES_MB = int(os.environ.get("SPEED_TEST_MAX_BYTES_PER_IP", "10"))
 ROUNDS_PER_NODE = 6
-THREAD_WORKERS = 25
+
+# === 分层并发配置（抗 CF 冲击：阶段1 纯 TCP 可保并发，阶段2 直连 Worker 降并发） ===
+# 阶段1：TCP SYN 扫描（纯 TCP，不进 Worker），可保较高并发
+STAGE1_TCP_WORKERS = int(os.environ.get("STAGE1_TCP_WORKERS", "10"))
+# 阶段2：TLS + /cdn-cgi/trace 探针（CF 边缘应答，但仍扇出大量 TLS 连接），降并发
+STAGE2_COLO_WORKERS = int(os.environ.get("STAGE2_COLO_WORKERS", "3"))
+# 阶段3 Tier1：Mihomo 沙箱内 Google/YouTube 204 探测（走 VLESS 隧道）
+STAGE3_TIER1_WORKERS = int(os.environ.get("STAGE3_TIER1_WORKERS", "5"))
+# 沙箱失败降级路径：直连 probe_stability（打 Worker，必须温和）
+SANDBOX_FAILBACK_WORKERS = int(os.environ.get("SANDBOX_FAILBACK_WORKERS", "2"))
+
+# === 候选分片轮转（每日只扫 1/3 撒点，3 天一轮，扇出量降 2/3） ===
+SHARD_ROTATION_DAYS = int(os.environ.get("SHARD_ROTATION_DAYS", "3"))
+SHARD_INDEX = int(os.environ.get("SHARD_INDEX", "-1"))  # -1 = 自动按日期计算
+
+# === 阶段2 早停配额（导出配额 2~3 倍，避免产出塌方） ===
+STAGE2_EARLY_STOP_MULTIPLIER = 2.5
 
 # Cloudflare 官方 IPv4 网段清单
 CLOUDFLARE_CIDRS = [
@@ -251,9 +267,19 @@ def init_network_bypass(interface=None):
             print(f"[!] 设置 GID 失败 (可忽略): {e}")
 
 
-DEFAULT_VLESS_UUID = "e295e2a9-13ad-4251-baa8-28ee1b5aeae9"
-DEFAULT_VLESS_SNI = "proxy.19940407.xyz"
+# VLESS 默认值已去硬编码（安全修复：避免 UUID 明文泄露到公开仓库）
+# UUID 必须通过 CLI --uuid、环境变量 VLESS_UUID、或 UCI 配置传入
+DEFAULT_VLESS_UUID = ""
+DEFAULT_VLESS_SNI = "wall.19940404.xyz"
 DEFAULT_VLESS_PATH = "/"
+
+
+def uuid_fingerprint(uuid_str: str) -> str:
+    """返回 UUID 的 SHA256 指纹（前 12 位），用于详情 JSON 不落明文"""
+    if not uuid_str:
+        return ""
+    import hashlib
+    return hashlib.sha256(uuid_str.encode()).hexdigest()[:12]
 
 
 def detect_vless_template(cli_sni=None, cli_uuid=None, cli_path=None, cli_port=None) -> dict:
@@ -774,7 +800,7 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
             'jitter': jitter,
         }
 
-    with ThreadPoolExecutor(max_workers=15) as executor:
+    with ThreadPoolExecutor(max_workers=STAGE3_TIER1_WORKERS) as executor:
         fut_map = {executor.submit(_probe_tier1_node, name, item): name for name, item in candidates_with_name}
         for fut in as_completed(fut_map):
             name = fut_map[fut]
@@ -1471,7 +1497,18 @@ def fetch_candidates(workdir=None, output_file=None, reuse_history=True, vip_fil
             if key not in seen_cidr:
                 seen_cidr.add(key)
                 uniq_cidrs.append(net)
-        candidates.extend(generate_random_cf_candidates(RANDOM_CF_COUNT, uniq_cidrs))
+        # 候选分片轮转：每日只扫 1/N 撒点，N 天一轮，扇出量降 (N-1)/N
+        if SHARD_ROTATION_DAYS > 1:
+            if SHARD_INDEX >= 0:
+                shard_idx = SHARD_INDEX % SHARD_ROTATION_DAYS
+            else:
+                # 自动按一年中的第几天计算分片索引
+                shard_idx = time.localtime().tm_yday % SHARD_ROTATION_DAYS
+            shard_count = max(1, RANDOM_CF_COUNT // SHARD_ROTATION_DAYS)
+            print(f"[*] 候选分片轮转: 第 {shard_idx + 1}/{SHARD_ROTATION_DAYS} 片，本次撒点 {shard_count} IP（全量 {RANDOM_CF_COUNT}）")
+        else:
+            shard_count = RANDOM_CF_COUNT
+        candidates.extend(generate_random_cf_candidates(shard_count, uniq_cidrs))
 
     # 4. 补充备用高可用 Anycast IP 池
     for ip in BACKUP_CF_IPS:
@@ -1570,10 +1607,34 @@ def fast_tcp_ping(ip, port, timeout=0.8):
 SPEED_TEST_HOST = "speed.cloudflare.com"
 
 
+# CF 挑战页/封禁页标记（fail-closed 判定）
+BLOCK_MARKERS = (
+    "cf-chl-", "challenge-platform", "Attention Required",
+    "Sorry, you have been blocked", "Just a moment...",
+    "Checking your browser", "cf-browser-verification",
+    "error code: 10", "cloudflare-ray-id",
+)
+
+# 全局熔断：拦截信号累计计数
+_cf_block_count = 0
+CF_BLOCK_THRESHOLD = int(os.environ.get("CF_BLOCK_THRESHOLD", "5"))  # 累计 N 次拦截即触发熔断
+
+
+def record_cf_block():
+    """记录一次 CF 拦截，累计到阈值返回 True 表示应熔断"""
+    global _cf_block_count
+    _cf_block_count += 1
+    return _cf_block_count >= CF_BLOCK_THRESHOLD
+
+
 def probe_tls_colo(ip, port, timeout=2.5):
     """
-    阶段 2：TLS 握手与 cf-ray 机房质检
-    返回 (is_valid_us, colo_code, tcp_rtt_ms)
+    阶段 2：TLS 握手 + /cdn-cgi/trace 探针机房质检
+    返回 (is_valid, colo_code, tcp_rtt_ms, status)
+      - is_valid: 是否有效（fail-closed：必须有 colo 且 2xx）
+      - colo_code: 机房代码（如 SJC）
+      - tcp_rtt_ms: TCP 握手延迟
+      - status: "ok" / "blocked" / "error"
     """
     s = None
     ss = None
@@ -1594,17 +1655,54 @@ def probe_tls_colo(ip, port, timeout=2.5):
         ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(s, server_hostname=SNI_HOST)
 
-        req = f"HEAD / HTTP/1.1\r\nHost: {SNI_HOST}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+        # 探针换 /cdn-cgi/trace（CF 边缘保留路径，不进 Worker 路由）
+        # SNI 保持自有域，不换 cloudflare.com（避免 bot 管理更严的反效果）
+        req = (
+            f"GET /cdn-cgi/trace HTTP/1.1\r\n"
+            f"Host: {SNI_HOST}\r\n"
+            f"User-Agent: Mozilla/5.0\r\n"
+            f"Connection: close\r\n\r\n"
+        )
         ss.sendall(req.encode('utf-8'))
-        res = ss.recv(2048)
 
+        # 读循环：累积响应直到 EOF 或 64KB 上限
+        chunks = []
+        total = 0
+        while total < 65536:
+            try:
+                chunk = ss.recv(4096)
+            except Exception:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+
+        res = b"".join(chunks)
         res_text = res.decode('utf-8', errors='ignore')
-        colo = parse_colo_from_headers(res_text)
-        # 方案 A 全网极速优选模式：只要握手成功并收到有效 HTTP 响应即判定为有效 Cloudflare 边缘节点
-        is_valid = bool(colo) or (b"HTTP/1." in res) or ("cloudflare" in res_text.lower())
-        return is_valid, colo, tcp_rtt_ms
+
+        # 解析状态码
+        status_match = re.match(r"HTTP/1\.\d (\d{3})", res_text)
+        status_code = int(status_match.group(1)) if status_match else 0
+
+        # fail-closed：识别 CF 挑战页/封禁页
+        if status_code in (403, 429, 503, 530) or any(m in res_text for m in BLOCK_MARKERS):
+            record_cf_block()
+            return False, None, tcp_rtt_ms, "blocked"
+
+        # 解析机房：body colo= 优先，cf-ray 头回退
+        colo = None
+        body_colo_match = re.search(r"^colo=([A-Z]{3,4})", res_text, re.MULTILINE)
+        if body_colo_match:
+            colo = body_colo_match.group(1).upper()
+        else:
+            colo = parse_colo_from_headers(res_text)
+
+        # fail-closed：必须有 colo 且状态码 2xx 才算有效
+        is_valid = bool(colo) and (200 <= status_code < 300)
+        return is_valid, colo, tcp_rtt_ms, "ok" if is_valid else "error"
     except Exception:
-        return False, None, None
+        return False, None, None, "error"
     finally:
         if ss:
             try:
@@ -1640,7 +1738,7 @@ def probe_stability(ip, port, rounds=ROUNDS_PER_NODE, probe_func=None, sleep_int
         if probe_func:
             rtt, colo = probe_func(ip, port)
         else:
-            is_valid, colo, rtt = probe_tls_colo(ip, port, timeout=PROBE_TIMEOUT)
+            is_valid, colo, rtt, _status = probe_tls_colo(ip, port, timeout=PROBE_TIMEOUT)
             if not is_valid:
                 rtt = None
 
@@ -1747,10 +1845,10 @@ def get_speed_sources_for_region_rr(region: str) -> tuple:
 def probe_throughput_speed(
     ip: str,
     port: int,
-    duration: float = 5.0,
-    parallel: int = 3,
+    duration: float = 6.0,
+    parallel: int = 1,
     max_retry: int = 1,
-    max_bytes_per_ip: int = 80 * 1024 * 1024,
+    max_bytes_per_ip: int = 100 * 1024 * 1024,
     sources: tuple = SPEED_TEST_SOURCES_DEFAULT,
     proxy_port: int = 19998,
     mock_speed: float = None,
@@ -1759,12 +1857,12 @@ def probe_throughput_speed(
     """
     阶段 4：过 Mihomo 沙箱代理的真实吞吐测速
     - duration 秒时间窗内并发 N 个 HTTP GET (N = parallel)
-    - 两轮取中位，支持 429 重试 max_retry 次
+    - 三轮取中位 (n=3)，支持 429 重试 max_retry 次
     - 单 IP 累计字节超限提早结束
     - 返回 dict 含 speed, samples, p90, stddev, retries, bytes_downloaded, status
 
     Mock 参数优先级说明：当同时给定 mock_samples 与 mock_speed 时，
-    mock_samples 优先 (它代表两轮取中位所需的样本集)，mock_speed 被忽略。
+    mock_samples 优先 (它代表三轮取中位所需的样本集)，mock_speed 被忽略。
     """
     if mock_speed is not None or mock_samples is not None:
         if mock_samples is not None:
@@ -1882,7 +1980,7 @@ def probe_throughput_speed(
     src_pool = list(sources) if sources else list(SPEED_TEST_SOURCES_DEFAULT)
     src_idx = 0
 
-    for round_idx in range(2):
+    for round_idx in range(3):
         if not src_pool:
             break
         curr_url = src_pool[src_idx % len(src_pool)]
@@ -2213,7 +2311,7 @@ def run_stage3_and_stage4_batch(
     # 沙箱未启动 / 未产出结果 → 沿用直连兜底
     if not e2e_results:
         print(f"[!] [批次 {round_idx}] 启动直连稳定性深测回退兜底模式...")
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=SANDBOX_FAILBACK_WORKERS) as executor:
             future_map = {executor.submit(probe_stability, c[0], c[1]): c for c in batch_candidates}
             for future in as_completed(future_map):
                 res = future.result()
@@ -2427,12 +2525,12 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         init_network_bypass(interface)
 
     # ================= 阶段 1：快速 TCP 并发探针 =================
-    print(f"\n[+] [阶段 1/5] 启动快速 TCP 连通性并发扫描 (总数: {len(candidates)}, 并发度: 30)...")
+    print(f"\n[+] [阶段 1/5] 启动快速 TCP 连通性并发扫描 (总数: {len(candidates)}, 并发度: {STAGE1_TCP_WORKERS})...")
     stage1_survivors = []
     if mock_mode:
         stage1_survivors = list(candidates)
     else:
-        with ThreadPoolExecutor(max_workers=30) as executor:
+        with ThreadPoolExecutor(max_workers=STAGE1_TCP_WORKERS) as executor:
             future_map = {executor.submit(fast_tcp_ping, c[0], c[1]): c for c in candidates}
             for future in as_completed(future_map):
                 c = future_map[future]
@@ -2464,11 +2562,11 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
             rtt = 180.0 + idx * 5.0
             stage2_survivors.append((c[0], c[1], c[2], colo, rtt, rem))
     else:
-        with ThreadPoolExecutor(max_workers=25) as executor:
+        with ThreadPoolExecutor(max_workers=STAGE2_COLO_WORKERS) as executor:
             future_map = {executor.submit(probe_tls_colo, c[0], c[1]): c for c in stage1_survivors}
             for future in as_completed(future_map):
                 c = future_map[future]
-                is_valid, colo, rtt = future.result()
+                is_valid, colo, rtt, _status = future.result()
                 if is_valid:
                     rem = c[3] if len(c) > 3 else ""
                     stage2_survivors.append((c[0], c[1], c[2], colo, rtt if rtt else 200.0, rem))
@@ -2716,7 +2814,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         'sandbox_config': {
             'enabled': bool(sandbox_enable),
             'sni': vless_tpl.get('sni', DEFAULT_VLESS_SNI),
-            'uuid': vless_tpl.get('uuid', DEFAULT_VLESS_UUID),
+            'uuid_fingerprint': uuid_fingerprint(vless_tpl.get('uuid', DEFAULT_VLESS_UUID)),
             'path': vless_tpl.get('path', DEFAULT_VLESS_PATH),
             'port': str(vless_tpl.get('port', '443')),
             'target_country': target_country or 'AUTO'

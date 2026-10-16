@@ -714,6 +714,39 @@ return view.extend({
 		o.placeholder = '1';
 		o.rmempty = true;
 
+		/* ==================== 卡片 2.5: 抗 Cloudflare 冲击参数 ==================== */
+		addCardHeader(s, 'anti_cf', _('抗 Cloudflare 冲击参数'), _('调节并发度与撒点频率，降低对 CF 边缘节点的请求压力，避免触发 WAF 网络滥用判定'), '🛡️', '#f59e0b');
+
+		o = s.option(form.Value, 'stage1_tcp_workers', _('阶段1 TCP 扫描并发度'), _('快速 TCP 连通性扫描的并发线程数；纯 TCP 不进 Worker，可保较高并发 (默认 10，建议 8-15)'));
+		o.default = '10';
+		o.placeholder = '10';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'stage2_colo_workers', _('阶段2 TLS 探针并发度'), _('TLS 握手 + /cdn-cgi/trace 探针的并发数；直连 CF 边缘，调低可显著降载 (默认 3，建议 2-5)'));
+		o.default = '3';
+		o.placeholder = '3';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'stage3_tier1_workers', _('阶段3 沙箱探测并发度'), _('Mihomo 沙箱内 Google/YouTube 204 探测的并发数 (默认 5，建议 3-8)'));
+		o.default = '5';
+		o.placeholder = '5';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'sandbox_failback_workers', _('沙箱失败降级并发度'), _('沙箱启动失败时，直连稳定性测试的并发数；温和路径，避免反向轰击 Worker (默认 2，建议 1-3)'));
+		o.default = '2';
+		o.placeholder = '2';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'shard_rotation_days', _('候选分片轮转周期(天)'), _('每日只扫 1/N 的随机撒点 IP，N 天一轮，扇出量降 (N-1)/N；0 = 关闭分片轮转 (默认 3)'));
+		o.default = '3';
+		o.placeholder = '3';
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'cf_block_threshold', _('CF 拦截熔断阈值'), _('累计检测到 CF 挑战页/封禁页的次数达到该值时，主动终止本轮优选 (默认 5)'));
+		o.default = '5';
+		o.placeholder = '5';
+		o.rmempty = true;
+
 		/* ==================== 卡片 3: 隔离沙箱全链路质检代理 ==================== */
 		addCardHeader(s, 'sandbox', _('隔离沙箱全链路质检代理'), _('基于轻量 Mihomo 隔离沙箱与 Linux GID 直连技术，穿透质检 Google、YouTube 与真实出口落地归属'), '🛡️', '#6366f1');
 

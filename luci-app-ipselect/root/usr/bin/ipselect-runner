@@ -107,7 +107,20 @@ run_task() {
     START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
     TASK_ID=$(date '+%Y%m%d-%H%M%S')
     T_START=$(date +%s)
-    
+
+    # === 开关校验（Bug 修复：LuCI 关闭服务后程序不应继续运行） ===
+    ENABLED=$(get_config "enabled" "1")
+    CRON_ENABLED=$(get_config "cron_enabled" "1")
+    if [ "$ENABLED" != "1" ]; then
+        echo "[$(date)] 服务已在 LuCI 中关闭 (enabled=0)，跳过本次执行。触发源: $TRIGGER"
+        exit 0
+    fi
+    # cron 触发时额外检查定时任务开关
+    if [ "$TRIGGER" = "cron" ] && [ "$CRON_ENABLED" != "1" ]; then
+        echo "[$(date)] 定时优选已在 LuCI 中关闭 (cron_enabled=0)，跳过本次 cron 执行。"
+        exit 0
+    fi
+
     WORKDIR=$(get_config "workdir" "/root/ipselect")
     ENV_TAG=$(get_config "env_tag" "公司")
     OUTPUT_FILE=$(get_config "output_file" "best_us.txt")
@@ -130,7 +143,7 @@ run_task() {
     SPEED_TEST_MAX_BYTES_PER_IP=$(get_config "speed_test_max_bytes_per_ip" "80")
     SANDBOX_ENABLE=$(get_config "sandbox_enable" "1")
     VLESS_SNI=$(get_config "vless_sni" "proxy.19940407.xyz")
-    VLESS_UUID=$(get_config "vless_uuid" "e295e2a9-13ad-4251-baa8-28ee1b5aeae9")
+    VLESS_UUID=$(get_config "vless_uuid" "")
     VLESS_PATH=$(get_config "vless_path" "/")
     VLESS_PORT=$(get_config "vless_port" "443")
     TARGET_COUNTRY=$(get_config "target_country" "AUTO")
@@ -142,8 +155,21 @@ run_task() {
     REUSE_HISTORY=$(get_config "reuse_history" "1")
     VIP_SPEED_THRESHOLD=$(get_config "vip_speed_threshold" "8.0")
     VIP_FILE=$(get_config "vip_file" "vip_nodes.json")
+    # 抗 CF 冲击参数
+    STAGE1_TCP_WORKERS=$(get_config "stage1_tcp_workers" "10")
+    STAGE2_COLO_WORKERS=$(get_config "stage2_colo_workers" "3")
+    STAGE3_TIER1_WORKERS=$(get_config "stage3_tier1_workers" "5")
+    SANDBOX_FAILBACK_WORKERS=$(get_config "sandbox_failback_workers" "2")
+    SHARD_ROTATION_DAYS=$(get_config "shard_rotation_days" "3")
+    CF_BLOCK_THRESHOLD=$(get_config "cf_block_threshold" "5")
 
-    export SANDBOX_ENABLE VLESS_SNI VLESS_UUID VLESS_PATH VLESS_PORT TARGET_COUNTRY RANDOM_CF_COUNT STAGE2_ENTRY_LIMIT STAGE4_SPEED_LIMIT SPEED_TEST_DURATION SPEED_TEST_PARALLEL SPEED_TEST_NODE_CONCURRENCY SPEED_TEST_MAX_RETRY SPEED_TEST_MAX_BYTES_PER_IP MIN_SPEED_THRESHOLD MAX_REFILL_ROUNDS REUSE_HISTORY VIP_SPEED_THRESHOLD VIP_FILE
+    # 校验 UUID 必填（安全修复：不再硬编码默认值）
+    if [ -z "$VLESS_UUID" ]; then
+        echo "[$(date)] 错误：未配置 VLESS UUID，请在 LuCI 常规设置中填写。"
+        exit 1
+    fi
+
+    export SANDBOX_ENABLE VLESS_SNI VLESS_UUID VLESS_PATH VLESS_PORT TARGET_COUNTRY RANDOM_CF_COUNT STAGE2_ENTRY_LIMIT STAGE4_SPEED_LIMIT SPEED_TEST_DURATION SPEED_TEST_PARALLEL SPEED_TEST_NODE_CONCURRENCY SPEED_TEST_MAX_RETRY SPEED_TEST_MAX_BYTES_PER_IP MIN_SPEED_THRESHOLD MAX_REFILL_ROUNDS REUSE_HISTORY VIP_SPEED_THRESHOLD VIP_FILE STAGE1_TCP_WORKERS STAGE2_COLO_WORKERS STAGE3_TIER1_WORKERS SANDBOX_FAILBACK_WORKERS SHARD_ROTATION_DAYS CF_BLOCK_THRESHOLD
 
     # 保存当前任务上下文供 stop 中断时获取
     cat << EOF > "$INFO_FILE"

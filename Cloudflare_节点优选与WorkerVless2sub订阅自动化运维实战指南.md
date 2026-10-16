@@ -19,7 +19,22 @@
    - 4.2 每日定时筛选脚本设计（Top 15 美区极速节点）
    - 4.3 GitHub Actions 工作流自动化配置
    - 4.4 Cloudflare Worker 极简环境变量配置
-5. [日常运维与即时验证速查命令 (Cheat Sheet)](#五日常运维与即时验证速查命令)
+5. [五阶段漏斗严选引擎（filter_us_nodes.py 核心算法）](#五五阶段漏斗严选引擎filter_us_nodespy-核心算法)
+   - 5.1 阶段一：TCP 快速扫描查存活（fast_tcp_ping）
+   - 5.2 阶段二：TLS 探针 + cf-ray 机房质检（probe_tls_colo）
+   - 5.3 阶段三：多维质量评分模型（稳定性 / 延迟 / 抖动）
+   - 5.4 阶段四：真实连通性质量门（stage3_quality_gate 60s 密集采样）
+   - 5.5 阶段五：真实吞吐测速（Mihomo 沙箱 + 下载字节数）
+   - 5.6 候选数据源与 Cloudflare 官方网段白名单
+   - 5.7 分区域配额与 VIP 历史节点复用
+6. [iStoreOS LuCI 运维界面（luci-app-ipselect）](#六istoreos-luci-运维界面luci-app-ipselect)
+   - 6.1 安装包形态与菜单入口
+   - 6.2 UCI 配置项全表（/etc/config/ipselect）
+   - 6.3 执行引擎 ipselect-runner 与启停 / 日志 / 历史
+   - 6.4 定时任务与 OpenClash Provider 自动同步
+   - 6.5 推送链路：git push 脱敏 + Telegram / 飞书通知
+7. [软路由双出口部署拓扑（公司联通 / 家庭移动）](#七软路由双出口部署拓扑公司联通--家庭移动)
+8. [日常运维与即时验证速查命令 (Cheat Sheet)](#八日常运维与即时验证速查命令-cheat-sheet)
 
 ---
 
@@ -226,7 +241,195 @@ jobs:
 
 ---
 
-## 五、 日常运维与即时验证速查命令 (Cheat Sheet)
+## 五、 五阶段漏斗严选引擎（filter_us_nodes.py 核心算法）
+
+> **设计哲学**：从数千候选 Anycast IP 中，用"漏斗式分层递进"层层淘汰，最终只产出 Top 30（默认 `TOP_COUNT=30`）个真正能用、稳定、低延迟、有带宽的美区/亚太节点。每一层只做一件事，失败即淘汰，绝不带着问题节点进入下一层。
+>
+> **入口脚本**：`scripts/filter_us_nodes.py`（纯 Python 3 标准库，零三方依赖，可在 Windows / Linux / OpenWrt / GitHub Actions 无缝运行）
+> **关键常量**：`SNI_HOST=proxy.19940407.xyz`、`THREAD_WORKERS=25`、`PROBE_TIMEOUT=2.5s`、`STAGE2_ENTRY_LIMIT=75`、`STAGE4_SPEED_LIMIT=45`、`RANDOM_CF_COUNT=1500`
+
+```mermaid
+flowchart LR
+    A["候选池<br/>CSV+TXT+CF-CIDR随机1500+VIP历史"] --> S1
+    S1["阶段1 TCP快速存活<br/>0.8s握手淘汰不可达"] --> S2
+    S2["阶段2 TLS探针+cf-ray机房<br/>识别美西/亚太核心DC"] --> S3
+    S3["阶段3 多维质量评分<br/>6轮打散稳定性+延迟+抖动"] --> S4
+    S4["阶段4 真实连通性质量门<br/>Mihomo沙箱60s Google/YouTube"] --> S5
+    S5["阶段5 真实吞吐测速<br/>5s×2轮 单IP≤80MB"] --> O["Top30 节点列表<br/>best_us.txt / home_us_best_node.txt"]
+```
+
+### 5.1 阶段一：TCP 快速扫描查存活（`fast_tcp_ping`）
+* **目标**：用最低成本秒级淘汰不可达 IP。
+* **做法**：对候选 IP:Port 直接发起 `socket.create_connection((ip, port), timeout=0.8)`，TCP 三次握手成功即视为存活。
+* **并发**：`ThreadPoolExecutor(max_workers=25)`，数千候选在数十秒内跑完。
+* **输出**：存活 IP 列表进入阶段二。任何握手失败 / 超时 / RST 直接丢弃。
+
+### 5.2 阶段二：TLS 探针测试连通性 + `cf-ray` 机房质检（`probe_tls_colo`）
+* **目标**：确认这个 IP 背后真的是 Cloudflare 边缘节点，而不是第三方反代或已下线的 Oracle VPS。
+* **做法**：
+  1. 对存活 IP 发起真实 TLS 握手，SNI 固定填 `proxy.19940407.xyz`；
+  2. 握手成功后发送 `GET / HTTP/1.1`，解析响应头中的 `cf-ray: xxxxx-SJC`；
+  3. 从中提取 3~4 位机房代码（如 `SJC` / `LAX` / `NRT` / `HKG`）。
+* **机房白名单**：
+  * 美西极速直连：`SJC / LAX / SFO / SEA / PDX / SLC / PHX / LAS`
+  * 全美核心：`DFW / ORD / IAD / ATL / MIA / EWR / JFK / DEN / IAH / BOS / MSP / DTW / CLT`
+  * 亚太：`HKG / TPE / NRT / HND / KIX / SIN / ICN / GMP`
+* **入围上限**：`STAGE2_ENTRY_LIMIT=75`，避免后续阶段跑太久。
+
+### 5.3 阶段三：节点质量评分模型（`probe_stability` 6 轮打散测试）
+* **目标**：在入围节点中筛出"0 丢包、低延迟、低抖动"的稳定节点。
+* **做法**：对每个节点做 6 轮打散探测（`ROUNDS_PER_NODE=6`），每轮之间随机 sleep 50~100ms 避免时序相关偏差。
+* **统计指标**：
+  * `loss_rate`：丢包率（≥2 次丢包直接 `return None` 淘汰）
+  * `median_rtt`：RTT 中位数
+  * `avg_rtt`：RTT 均值
+  * `jitter`：RTT 极差
+* **综合评分公式（1.0~10.0 分制）**：
+
+  $$\text{综合得分} = \text{稳定性基础分(≤6.0)} + \text{延迟表现分(≤2.5)} + \text{抖动平稳度分(≤1.0)} + \text{吞吐速度加成(≤0.5)}$$
+
+* **命名规范**：`IP:PORT#US-DaTree-{评分}-{序号}-{tag} {速度}MB/s`，按评分降序排列。
+
+### 5.4 阶段四：节点真实连通性质量门（`stage3_quality_gate.py`，v2 升级）
+* **背景**：早期版本只测 `generate_204` 单次快照，出现过"脚本判通过、客户端实际打不开 Google / YouTube"的判定失真。
+* **v2 做法**：在 Mihomo Meta 沙箱（监听 19098 / 19998）中挂 VLESS 模板，对候选节点做 **60s 区间密集采样**：
+  * 每 5 秒探测一次 `https://www.google.com/` 和 `https://www.youtube.com/`，共 12 次；
+  * 必须拿到真实 HTML 且 `<title>` 命中 `Google` / `谷歌` / `YouTube` 才算通过；
+  * 302 跳转、登录页、CF challenge 页一律判失败；
+  * 12 次中至少 11 次通过（`PROBE_PASS_THRESHOLD=11`）才放行。
+* **降级链路**（按剩余节点数自动调整）：
+  * ≥15 个通过 → 直入阶段五；
+  * 12~14 个 → 全部保留进入阶段五；
+  * 8~11 个 → 触发降级 1（30s 区间重测）；
+  * 4~7 个 → 降级 2（用 `generate_204` 兜底）；
+  * <4 个 → 降级 3（`STATUS=no_quality`，不输出）。
+* **超时保护**：阶段四整体超过 600 秒主动中断，按已通过节点数路由降级。
+* **详细排障实录**：见 `docs/lessons_learned_speedtest_v5.md`（edgetunnel 拒 plain HTTP / CF WAF 反爬 / CF self-test 禁忌三层根因）。
+
+### 5.5 阶段五：节点真实吞吐测速（v1.4.0+）
+* **目标**：对通过质量门的节点做真实下载测速，拿到真实 MB/s 写进节点备注。
+* **默认参数**（全部可用 UCI / 环境变量调）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `speed_test_duration` | 5s | 单节点测速时间窗 |
+| `speed_test_parallel` | 3 | 节点内并发下载数 |
+| `speed_test_node_concurrency` | 4 | 同时测速的节点数 |
+| `speed_test_max_retry` | 1 | 429 / 1020 限流重试次数 |
+| `speed_test_max_bytes_per_ip` | 80MB | 单 IP 累计下载上限，防 CF 限流 |
+| `STAGE4_SPEED_LIMIT` | 45 | 进入测速的节点数上限 |
+
+* **总耗时估算**：30 节点 × (5s + 1s 准备 + 5s) / 4 并发 ≈ **75~90 秒**。
+* **补位机制**：若实测速度低于 `min_speed_threshold=3.0 MB/s`，自动从历史 VIP 池（`vip_nodes.json` / `yidong_vip_nodes.json`）补位，最多 `max_refill_rounds=2` 轮。
+
+### 5.6 候选数据源与 Cloudflare 官方网段白名单
+* **CSV 源**：`cmliu/WorkerVless2sub/addressescsv.csv`
+* **TXT 源**：`mocl1220/ip`、`ymyuuu/IPDB`（BestCF / BestEDG）、`ipdb.api.030101.xyz`、`addressesapi.090227.xyz`、`api.uouin.com`、`ip.164746.xyz`、`wetest.vip`
+* **CF 运营商优化网段**：`cmliu/CF-CIDR.txt` + 电信 `ct.txt` + 联通 `cu.txt` + 移动 `cmcc.txt`，随机采样 1500 个 IP（`RANDOM_CF_COUNT`）
+* **官方 Anycast CIDR 白名单**（15 段，杜绝第三方 VPS）：
+  `173.245.48.0/20`、`103.21.244.0/22`、`103.22.200.0/22`、`103.31.4.0/22`、`141.101.64.0/18`、`108.162.192.0/18`、`190.93.240.0/20`、`188.114.96.0/20`、`197.234.240.0/22`、`198.41.128.0/17`、`162.158.0.0/15`、`104.16.0.0/13`、`104.24.0.0/14`、`172.64.0.0/13`、`131.0.72.0/22`
+
+### 5.7 分区域配额与 VIP 历史节点复用
+* **默认配额**：`HK:5 / TW:5 / JP:5 / SG:5 / US:10`（US 置顶，用于解锁 AI 大模型）
+* **输出聚合优先级**：`US → HK → TW → SG → JP → KR → DE → IN → UK → FR → CA → AU`
+* **VIP 池**：连续两次测速超过 `vip_speed_threshold=8.0 MB/s` 的节点自动写入 `vip_nodes.json`，下次跑批优先复用，避免"每天重测、每天换节点"导致客户端频繁抖动。
+
+---
+
+## 六、 iStoreOS LuCI 运维界面（luci-app-ipselect）
+
+> **背景**：原本要 SSH 到软路由手动跑 `python filter_us_nodes.py` + `git push`，现在做了一个 LuCI 插件 `luci-app-ipselect`，在 iStoreOS 网页上点点鼠标就能完成配置、启停、看日志、看历史、推仓、同步 OpenClash。
+
+### 6.1 安装包形态与菜单入口
+* **OpenWrt 24**：`.ipk` 包，位于 `luci-app-ipselect/dist/openwrt-24/`（最新 `1.7.1-1`）。
+* **OpenWrt 25**：`.tar.gz` + 一键安装脚本 `luci-app-ipselect-openwrt25-installer.sh`。
+* **菜单路径**：`服务 → 节点优选`（`admin/services/ipselect`），ACL `luci-app-ipselect`。
+* **控制器**：`luasrc/controller/ipselect.lua`，暴露 JSON RPC：`get_status / start / stop / get_log / clear_log / get_results / get_history / get_history_log / test_github / test_telegram / test_feishu`。
+
+### 6.2 UCI 配置项全表（`/etc/config/ipselect`）
+
+| 分类 | 选项 | 默认值 | 说明 |
+|---|---|---|---|
+| 基础 | `enabled` | 1 | 服务总开关 |
+| | `workdir` | `/root/ipselect` | 脚本工作目录（git clone 位置） |
+| | `env_tag` | 公司 | 节点标签（公司 / 家庭） |
+| | `output_file` | `best_us.txt` | 输出文件名（家庭用 `home_us_best_node.txt`） |
+| | `interface` | `br-lan` | 出口网卡绑定（绕过 OpenClash 代理直连） |
+| GitHub 推送 | `auto_push` | 1 | 跑完自动 git push |
+| | `github_repo` | `cuiyuanqing/ipselect` | 目标仓库 |
+| | `github_token` | （空） | Personal Access Token，日志脱敏 |
+| | `github_branch` | `main` | 推送分支 |
+| | `github_user / github_email` | `cuiyuanqing / 759666247@qq.com` | git commit 身份 |
+| | `auto_clone` | 1 | 工作目录不存在时自动 git clone |
+| OpenClash | `openclash_sync` | 1 | 跑完自动写 OpenClash provider |
+| | `openclash_provider` | `datree` | provider 文件名 |
+| 定时 | `cron_enabled` | 1 | 启用 crontab |
+| | `cron_expression` | `30 4 * * *` | 每天 04:30 跑批 |
+| VLESS 沙箱 | `sandbox_enable` | 1 | 启用 Mihomo 沙箱（阶段四） |
+| | `vless_sni` | `proxy.19940407.xyz` | VLESS SNI |
+| | `vless_uuid` | `e295e2a9-...` | VLESS UUID |
+| | `vless_port` | 443 | VLESS 端口 |
+| 严选参数 | `target_country` | AUTO | AUTO / US / HK... |
+| | `random_cf_count` | 1500 | 随机 CF 候选数 |
+| | `stage2_entry_limit` | 75 | 阶段二入围数 |
+| | `stage4_speed_limit` | 45 | 阶段五测速数 |
+| | `speed_test_duration` | 5 | 单节点测速秒数 |
+| | `speed_test_parallel` | 3 | 节点内并发 |
+| | `speed_test_node_concurrency` | 4 | 节点间并发 |
+| | `speed_test_max_retry` | 1 | 429 重试 |
+| | `speed_test_max_bytes_per_ip` | 80 | 单 IP 下载上限 MB |
+| | `min_speed_threshold` | 3.0 | 最低速度阈值 MB/s |
+| | `max_refill_rounds` | 2 | 补位轮数 |
+| | `reuse_history` | 1 | 复用历史 VIP 节点 |
+| | `vip_speed_threshold` | 8.0 | VIP 入选速度阈值 |
+| | `vip_file` | `vip_nodes.json` | VIP 池文件 |
+| 通知 | `telegram_enabled / telegram_bot_token / telegram_chat_id` | 0 / 空 | Telegram 推送 |
+| | `feishu_enabled / feishu_webhook_url / feishu_secret` | 0 / 空 | 飞书机器人推送 |
+
+### 6.3 执行引擎 `ipselect-runner` 与启停 / 日志 / 历史
+* **路径**：`/usr/bin/ipselect-runner`（POSIX sh，零依赖）
+* **子命令**：
+  * `status`：返回 JSON，含运行状态、PID、当前阶段、最近一次结果数
+  * `start manual` / `start cron`：启动跑批（写 PID 文件 `var/run/ipselect.pid`）
+  * `stop`：优雅停止
+  * `log <offset>`：从 offset 开始读 `var/log/ipselect.log`（网页端增量刷新）
+  * `clear-log`：清空日志
+  * `results`：返回最新 Top 节点 JSON
+  * `history`：返回最近 10 次跑批记录（`etc/ipselect/history.json`）
+  * `history-log <id>`：拉取某次历史跑批的完整日志
+  * `test-github / test-telegram / test-feishu`：配置页一键连通性测试
+* **历史记录**：每次跑批写一条 `{id, timestamp, trigger, duration, status, nodeCount, gitStatus, openclashStatus, logFile}`，保留最近 10 条，自动清理过期日志文件。
+
+### 6.4 定时任务与 OpenClash Provider 自动同步
+* **init 脚本**：`/etc/init.d/ipselect`，`sync_cron` 命令根据 UCI 的 `cron_expression` 自动写 `/etc/crontabs/root`，并清理旧的 ipselect cron 标记。
+* **OpenClash 同步**：跑批完成后自动把 `best_us.txt` 写成 OpenClash 兼容的 provider YAML（默认 provider 名 `datree`），客户端刷新即可拿到新节点，无需手工改配置。
+
+### 6.5 推送链路：git push 脱敏 + Telegram / 飞书通知
+* **脱敏**：`run_git_masked()` 把 git 输出中的 `GITHUB_TOKEN` 自动替换为 `********` 再写入日志，防止网页端看日志时泄漏 PAT。
+* **通知**：跑批结束（成功 / 失败 / 节点数过少）自动发 Telegram 或飞书机器人，消息内含节点数、耗时、git 状态、OpenClash 同步状态。
+* **测试按钮**：LuCI 配置页每个通知渠道都有"测试发送"按钮，调 `test_telegram` / `test_feishu` 即时验证 webhook 是否配通。
+
+---
+
+## 七、 软路由双出口部署拓扑（公司联通 / 家庭移动）
+
+项目实际跑在两台物理软路由上，用**不同运营商出口**测出来的节点质量差异很大，因此维护两份独立的节点文件：
+
+| 场景 | 软路由地址 | 宽带出口 | 输出文件 | GitHub Raw 入口 |
+|---|---|---|---|---|
+| 公司 | `10.10.18.2`（root / Xg@2020+） | 黑龙江哈尔滨**联通** | `best_us.txt` | `https://raw.githubusercontent.com/cuiyuanqing/ipselect/main/best_us.txt` |
+| 家庭 | `192.168.0.3` / `192.168.0.2` | 中国移动**家庭宽带** | `home_us_best_node.txt` | `https://raw.githubusercontent.com/cuiyuanqing/ipselect/main/home_us_best_node.txt` |
+
+* **环境自动感知**：脚本 `detect_network_environment()` 根据本机出口 IP 自动判断走"公司"还是"家庭"标签，也可用 `--tag` / `--output` / `--interface` 显式覆盖。
+* **网卡绑定**：`--interface br-lan` 在 Linux 上通过 `os.setgid(65534)` + 出口网卡绑定，**强行绕过 OpenClash 自身代理**，避免"用代理测代理"的鸡生蛋问题。
+* **跑批节奏**：
+  * GitHub Actions 每天 UTC 20:00（北京 04:00）在 Ubuntu runner 上跑一次基线；
+  * 两台软路由各自在本地凌晨 04:30（`30 4 * * *`）用自己的物理出口跑一次，结果直接 git push 覆盖仓库文件；
+  * Worker 的 `ADDAPI` 永远指向最新 Raw 文件，客户端拉订阅秒级无感更新。
+
+---
+
+## 八、 日常运维与即时验证速查命令 (Cheat Sheet)
 
 ### 1. 本地手动重新执行筛选并推仓
 ```bash
