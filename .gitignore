@@ -6,3 +6,5 @@ update.log
 .pytest_cache/
 *.bak
 *.bak.*
+*.ipk
+dist/

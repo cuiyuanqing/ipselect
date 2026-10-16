@@ -32,7 +32,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
-SNI_HOST = "wall.19940404.xyz"
+SNI_HOST = "wall.19940407.xyz"
 TOP_COUNT = int(os.environ.get("TOP_COUNT", "30"))
 PROBE_TIMEOUT = 2.5
 # 阶段2 → 沙箱入围上限（放大入围数，让更多候选进入全链路实测，保障各区域样本充足）
@@ -269,9 +269,9 @@ def init_network_bypass(interface=None):
 
 # VLESS 默认值已去硬编码（安全修复：避免 UUID 明文泄露到公开仓库）
 # UUID 必须通过 CLI --uuid、环境变量 VLESS_UUID、或 UCI 配置传入
-DEFAULT_VLESS_UUID = ""
-DEFAULT_VLESS_SNI = "wall.19940404.xyz"
-DEFAULT_VLESS_PATH = "/"
+DEFAULT_VLESS_UUID = "e295e2a9-13ad-4251-baa8-28ee1b5aeae9"
+DEFAULT_VLESS_SNI = "wall.19940407.xyz"
+DEFAULT_VLESS_PATH = "/?ed=2560"
 
 
 def uuid_fingerprint(uuid_str: str) -> str:
@@ -293,6 +293,7 @@ def detect_vless_template(cli_sni=None, cli_uuid=None, cli_path=None, cli_port=N
         return {"uuid": env_uuid, "sni": env_sni, "path": env_path, "port": env_port}
 
     for provider_file in [
+        "/etc/openclash/proxy_provider/datree_xyz.yaml",
         "/etc/openclash/proxy_provider/datree1.yaml",
         "/etc/openclash/proxy_provider/datree.yaml"
     ]:
@@ -400,7 +401,17 @@ class MihomoSandbox:
         os.makedirs(self.work_dir, exist_ok=True)
         if not self.mock_mode and os.name != 'nt':
             try:
-                subprocess.run(["pkill", "-9", "-f", self.work_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # 兼容 OpenWrt/Busybox 无 pkill 环境：通过扫描 /proc 安全清理残留沙箱
+                cur_pid = os.getpid()
+                for pid_str in os.listdir('/proc'):
+                    if pid_str.isdigit() and int(pid_str) != cur_pid:
+                        try:
+                            with open(f'/proc/{pid_str}/cmdline', 'rb') as f:
+                                cmd_bytes = f.read()
+                            if self.work_dir.encode() in cmd_bytes and b'clash_meta' in cmd_bytes:
+                                os.kill(int(pid_str), 9)
+                        except Exception:
+                            pass
                 time.sleep(0.2)
             except Exception:
                 pass
@@ -877,7 +888,10 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
                 proxy_port=proxy_port, timeout=3.5, target_country=target_country
             )
             if not is_match:
-                print(f"  [-] [{name}] {ip}:{port} 出口国家不符 (target={target_country}, got={exit_country})，淘汰")
+                if not exit_country:
+                    print(f"  [-] [{name}] {ip}:{port} 代理网络连接超时/握手失败 (无法获取出口IP)，淘汰")
+                else:
+                    print(f"  [-] [{name}] {ip}:{port} 出口国家不符 (target={target_country}, got={exit_country})，淘汰")
                 continue
 
             # 3. 真实 HTML 页面拉取与 <title> 校验
@@ -1639,7 +1653,7 @@ def record_cf_block():
     return _cf_block_count >= CF_BLOCK_THRESHOLD
 
 
-def probe_tls_colo(ip, port, timeout=2.5):
+def probe_tls_colo(ip, port, timeout=2.5, sni=None):
     """
     阶段 2：TLS 握手 + /cdn-cgi/trace 探针机房质检
     返回 (is_valid, colo_code, tcp_rtt_ms, status)
@@ -1648,6 +1662,7 @@ def probe_tls_colo(ip, port, timeout=2.5):
       - tcp_rtt_ms: TCP 握手延迟
       - status: "ok" / "blocked" / "error"
     """
+    target_sni = sni or SNI_HOST
     s = None
     ss = None
     try:
@@ -1665,13 +1680,13 @@ def probe_tls_colo(ip, port, timeout=2.5):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        ss = ctx.wrap_socket(s, server_hostname=SNI_HOST)
+        ss = ctx.wrap_socket(s, server_hostname=target_sni)
 
         # 探针换 /cdn-cgi/trace（CF 边缘保留路径，不进 Worker 路由）
         # SNI 保持自有域，不换 cloudflare.com（避免 bot 管理更严的反效果）
         req = (
             f"GET /cdn-cgi/trace HTTP/1.1\r\n"
-            f"Host: {SNI_HOST}\r\n"
+            f"Host: {target_sni}\r\n"
             f"User-Agent: Mozilla/5.0\r\n"
             f"Connection: close\r\n\r\n"
         )
@@ -2501,6 +2516,12 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     except Exception:
         pass
 
+    global SNI_HOST
+    if vless_sni:
+        SNI_HOST = vless_sni
+    elif os.environ.get("VLESS_SNI"):
+        SNI_HOST = os.environ.get("VLESS_SNI")
+
     if min_speed is None:
         try:
             min_speed = float(os.environ.get("MIN_SPEED_THRESHOLD", "3.0"))
@@ -2596,7 +2617,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
         progress_step2 = max(1, total_stage2 // 20)  # 每 5% 打一次进度
         t0_stage2 = time.time()
         with ThreadPoolExecutor(max_workers=STAGE2_COLO_WORKERS) as executor:
-            future_map = {executor.submit(probe_tls_colo, c[0], c[1]): c for c in stage1_survivors}
+            future_map = {executor.submit(probe_tls_colo, c[0], c[1], sni=SNI_HOST): c for c in stage1_survivors}
             for future in as_completed(future_map):
                 c = future_map[future]
                 done_stage2 += 1
