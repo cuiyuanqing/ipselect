@@ -802,12 +802,24 @@ def run_stage3_real_quality_gate(topN_candidates, sandbox, target_country,
 
     with ThreadPoolExecutor(max_workers=STAGE3_TIER1_WORKERS) as executor:
         fut_map = {executor.submit(_probe_tier1_node, name, item): name for name, item in candidates_with_name}
+        total_tier1 = len(fut_map)
+        done_tier1 = 0
+        progress_step_t1 = max(1, total_tier1 // 10)  # 每 10% 打一次进度
+        t0_t1 = time.time()
         for fut in as_completed(fut_map):
             name = fut_map[fut]
+            done_tier1 += 1
             try:
                 tier1_results[name] = fut.result()
             except Exception:
                 pass
+            if done_tier1 % progress_step_t1 == 0 or done_tier1 == total_tier1:
+                pct = done_tier1 * 100 // total_tier1
+                elapsed = time.time() - t0_t1
+                alive_count = sum(1 for r in tier1_results.values() if r.get('is_alive'))
+                rate = done_tier1 / elapsed if elapsed > 0 else 0
+                eta = (total_tier1 - done_tier1) / rate if rate > 0 else 0
+                print(f"[*] [阶段 3/5 Tier 1] 进度: {done_tier1}/{total_tier1} ({pct}%) | 存活 {alive_count} | 已用时 {elapsed:.0f}s | 预计剩余 {eta:.0f}s")
 
     tier1_alive = [r for r in tier1_results.values() if r['is_alive']]
     tier1_alive.sort(key=lambda x: (x['avg_rtt'], x['jitter']))
@@ -2371,6 +2383,7 @@ def run_stage3_and_stage4_batch(
                 break
 
     print(f"\n[+] [阶段 4/5 批次 {round_idx}] 启动过隧道真实吞吐测速 (时长 {SPEED_TEST_DURATION}s×2轮 / 并发 {SPEED_TEST_PARALLEL} / 入围 {len(candidates_for_speed)} 节点)...")
+    t0_speed_batch = time.time()
 
     def _probe_one_node(node, mock_speed_value):
         if not mock_mode and sandbox is not None and sandbox.is_ready():
@@ -2454,8 +2467,13 @@ def run_stage3_and_stage4_batch(
                     print(f"[DBG-NO-DATA] [阶段 4/5 批次 {round_idx}] adaptive backoff: 连续 {consecutive_429} 个测速失败，暂停 {backoff_seconds:.1f}s")
                     time.sleep(backoff_seconds)
                     consecutive_429 = 0
-                if idx % 5 == 0:
-                    print(f"[DBG-NO-DATA] [阶段 4/5 批次 {round_idx}] 进度 {idx}/{len(candidates_for_speed)} 完成")
+                if idx % 5 == 0 or idx == len(candidates_for_speed):
+                    pct = idx * 100 // len(candidates_for_speed)
+                    elapsed = time.time() - t0_speed_batch
+                    alive_count = sum(1 for n in candidates_for_speed[:idx] if n.get("speed", 0) > 0)
+                    rate = idx / elapsed if elapsed > 0 else 0
+                    eta = (len(candidates_for_speed) - idx) / rate if rate > 0 else 0
+                    print(f"[*] [阶段 4/5 批次 {round_idx}] 进度: {idx}/{len(candidates_for_speed)} ({pct}%) | 达标 {alive_count} | 已用时 {elapsed:.0f}s | 预计剩余 {eta:.0f}s")
     finally:
         if sandbox is not None:
             sandbox.stop()
@@ -2530,12 +2548,23 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     if mock_mode:
         stage1_survivors = list(candidates)
     else:
+        total_stage1 = len(candidates)
+        done_stage1 = 0
+        progress_step = max(1, total_stage1 // 20)  # 每 5% 打一次进度
+        t0_stage1 = time.time()
         with ThreadPoolExecutor(max_workers=STAGE1_TCP_WORKERS) as executor:
             future_map = {executor.submit(fast_tcp_ping, c[0], c[1]): c for c in candidates}
             for future in as_completed(future_map):
                 c = future_map[future]
+                done_stage1 += 1
                 if future.result():
                     stage1_survivors.append(c)
+                if done_stage1 % progress_step == 0 or done_stage1 == total_stage1:
+                    pct = done_stage1 * 100 // total_stage1
+                    elapsed = time.time() - t0_stage1
+                    rate = done_stage1 / elapsed if elapsed > 0 else 0
+                    eta = (total_stage1 - done_stage1) / rate if rate > 0 else 0
+                    print(f"[*] [阶段 1/5] 进度: {done_stage1}/{total_stage1} ({pct}%) | 存活 {len(stage1_survivors)} | 已用时 {elapsed:.0f}s | 预计剩余 {eta:.0f}s")
 
     print(f"[+] [阶段 1/5] 快速 TCP 扫描完成，存活可通节点数: {len(stage1_survivors)} / {len(candidates)}")
 
@@ -2562,14 +2591,25 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
             rtt = 180.0 + idx * 5.0
             stage2_survivors.append((c[0], c[1], c[2], colo, rtt, rem))
     else:
+        total_stage2 = len(stage1_survivors)
+        done_stage2 = 0
+        progress_step2 = max(1, total_stage2 // 20)  # 每 5% 打一次进度
+        t0_stage2 = time.time()
         with ThreadPoolExecutor(max_workers=STAGE2_COLO_WORKERS) as executor:
             future_map = {executor.submit(probe_tls_colo, c[0], c[1]): c for c in stage1_survivors}
             for future in as_completed(future_map):
                 c = future_map[future]
+                done_stage2 += 1
                 is_valid, colo, rtt, _status = future.result()
                 if is_valid:
                     rem = c[3] if len(c) > 3 else ""
                     stage2_survivors.append((c[0], c[1], c[2], colo, rtt if rtt else 200.0, rem))
+                if done_stage2 % progress_step2 == 0 or done_stage2 == total_stage2:
+                    pct = done_stage2 * 100 // total_stage2
+                    elapsed = time.time() - t0_stage2
+                    rate = done_stage2 / elapsed if elapsed > 0 else 0
+                    eta = (total_stage2 - done_stage2) / rate if rate > 0 else 0
+                    print(f"[*] [阶段 2/5] 进度: {done_stage2}/{total_stage2} ({pct}%) | 存活 {len(stage2_survivors)} | 已用时 {elapsed:.0f}s | 预计剩余 {eta:.0f}s")
 
     print(f"[+] [阶段 2/5] 机房质检完毕，存活有效 Cloudflare 边缘节点数: {len(stage2_survivors)}")
 
