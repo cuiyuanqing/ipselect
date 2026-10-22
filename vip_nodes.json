@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-10-16 21:33:17",
+  "updated_at": "2026-10-22 23:49:29",
   "vip_threshold": 5.0,
   "nodes": [
     {
@@ -11,16 +11,6 @@
       "score": 92.5,
       "e2e_avg_rtt": 195.0,
       "last_tested": "2026-10-13 18:00:00"
-    },
-    {
-      "ip": "47.131.186.184",
-      "port": 443,
-      "speed": 8.35,
-      "exit_country": "SG",
-      "colo": "SIN",
-      "score": 5.2,
-      "e2e_avg_rtt": 490.5,
-      "last_tested": "2026-10-16 21:33:17"
     },
     {
       "ip": "85.211.251.172",
@@ -43,6 +33,16 @@
       "last_tested": "2026-10-16 21:33:17"
     },
     {
+      "ip": "47.131.186.184",
+      "port": 443,
+      "speed": 8.07,
+      "exit_country": "SG",
+      "colo": "SIN",
+      "score": 6.5,
+      "e2e_avg_rtt": 470.5,
+      "last_tested": "2026-10-22 23:49:29"
+    },
+    {
       "ip": "18.139.160.115",
       "port": 443,
       "speed": 7.88,
@@ -61,16 +61,6 @@
       "score": 6.0,
       "e2e_avg_rtt": 566.5,
       "last_tested": "2026-10-16 21:33:17"
-    },
-    {
-      "ip": "13.125.141.213",
-      "port": 443,
-      "speed": 7.0,
-      "exit_country": "KR",
-      "colo": "ICN",
-      "score": 5.7,
-      "e2e_avg_rtt": 889.0,
-      "last_tested": "2026-10-14 17:26:06"
     },
     {
       "ip": "43.175.131.207",
@@ -103,14 +93,24 @@
       "last_tested": "2026-10-16 21:33:17"
     },
     {
-      "ip": "43.175.131.30",
+      "ip": "43.168.16.67",
       "port": 443,
-      "speed": 6.21,
-      "exit_country": "CA",
-      "colo": "HKG",
-      "score": 7.2,
-      "e2e_avg_rtt": 309.0,
-      "last_tested": "2026-10-16 21:33:17"
+      "speed": 6.13,
+      "exit_country": "KR",
+      "colo": "ICN",
+      "score": 3.4,
+      "e2e_avg_rtt": 714.0,
+      "last_tested": "2026-10-22 23:49:29"
+    },
+    {
+      "ip": "47.75.104.211",
+      "port": 443,
+      "speed": 6.09,
+      "exit_country": "US",
+      "colo": "SJC",
+      "score": 4.7,
+      "e2e_avg_rtt": 954.0,
+      "last_tested": "2026-10-22 23:49:29"
     },
     {
       "ip": "142.248.139.25",
@@ -123,24 +123,14 @@
       "last_tested": "2026-10-14 12:36:44"
     },
     {
-      "ip": "179.253.225.172",
-      "port": 443,
-      "speed": 5.95,
+      "ip": "104.17.132.16",
+      "port": 8443,
+      "speed": 5.76,
       "exit_country": "US",
-      "colo": "LAX",
-      "score": 5.6,
-      "e2e_avg_rtt": 780.0,
-      "last_tested": "2026-10-16 21:33:17"
-    },
-    {
-      "ip": "54.65.168.160",
-      "port": 443,
-      "speed": 5.77,
-      "exit_country": "JP",
-      "colo": "NRT",
-      "score": 5.8,
-      "e2e_avg_rtt": 531.0,
-      "last_tested": "2026-10-16 21:33:17"
+      "colo": "SJC",
+      "score": 4.6,
+      "e2e_avg_rtt": 786.5,
+      "last_tested": "2026-10-22 23:49:29"
     },
     {
       "ip": "43.201.54.156",
@@ -161,56 +151,6 @@
       "score": 4.1,
       "e2e_avg_rtt": 904.0,
       "last_tested": "2026-10-14 21:24:15"
-    },
-    {
-      "ip": "179.255.111.185",
-      "port": 443,
-      "speed": 5.38,
-      "exit_country": "US",
-      "colo": "LAX",
-      "score": 4.7,
-      "e2e_avg_rtt": 777.5,
-      "last_tested": "2026-10-16 21:33:17"
-    },
-    {
-      "ip": "104.17.132.16",
-      "port": 8443,
-      "speed": 5.37,
-      "exit_country": "US",
-      "colo": "SJC",
-      "score": 4.9,
-      "e2e_avg_rtt": 765.0,
-      "last_tested": "2026-10-16 21:33:17"
-    },
-    {
-      "ip": "43.168.16.67",
-      "port": 443,
-      "speed": 5.2,
-      "exit_country": "JP",
-      "colo": "NRT",
-      "score": 5.6,
-      "e2e_avg_rtt": 460.0,
-      "last_tested": "2026-10-16 21:33:17"
-    },
-    {
-      "ip": "104.17.153.125",
-      "port": 8443,
-      "speed": 5.07,
-      "exit_country": "US",
-      "colo": "SJC",
-      "score": 5.5,
-      "e2e_avg_rtt": 931.0,
-      "last_tested": "2026-10-14 17:26:06"
-    },
-    {
-      "ip": "104.17.134.60",
-      "port": 8443,
-      "speed": 5.04,
-      "exit_country": "US",
-      "colo": "SJC",
-      "score": 5.5,
-      "e2e_avg_rtt": 823.5,
-      "last_tested": "2026-10-16 21:33:17"
     },
     {
       "ip": "179.255.132.122",
