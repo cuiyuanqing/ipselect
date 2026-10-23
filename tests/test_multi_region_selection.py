@@ -64,7 +64,7 @@ class TestMultiRegionSelection(unittest.TestCase):
             mock_candidates.append((f"10.3.3.{i}", 443, 0.0, f"JP-Node-{i:02d}"))
         for i in range(1, 7):
             mock_candidates.append((f"10.4.4.{i}", 443, 0.0, f"SG-Node-{i:02d}"))
-        for i in range(1, 16):
+        for i in range(1, 21):
             mock_candidates.append((f"10.5.5.{i}", 443, 0.0, f"US-Node-{i:02d}"))
 
         run_filter_and_export(
@@ -82,7 +82,7 @@ class TestMultiRegionSelection(unittest.TestCase):
             lines = [line.strip() for line in f if line.strip()]
 
         # 检查总输出节点数为 5 + 5 + 5 + 5 + 10 = 30
-        self.assertEqual(len(lines), 30)
+        self.assertEqual(len(lines), 35)
 
         hk_lines = [l for l in lines if "#HK-公司-" in l]
         tw_lines = [l for l in lines if "#TW-公司-" in l]
@@ -94,7 +94,7 @@ class TestMultiRegionSelection(unittest.TestCase):
         self.assertEqual(len(tw_lines), 5)
         self.assertEqual(len(jp_lines), 5)
         self.assertEqual(len(sg_lines), 5)
-        self.assertEqual(len(us_lines), 10)
+        self.assertEqual(len(us_lines), 15)
 
         # 检查各区域内部编号从 01 到 配额上限
         self.assertIn("#HK-公司-01-", hk_lines[0])
@@ -106,19 +106,19 @@ class TestMultiRegionSelection(unittest.TestCase):
         self.assertIn("#SG-公司-01-", sg_lines[0])
         self.assertIn("#SG-公司-05-", sg_lines[4])
         self.assertIn("#US-公司-01-", us_lines[0])
-        self.assertIn("#US-公司-10-", us_lines[9])
+        self.assertIn("#US-公司-15-", us_lines[14])
 
         # 检查 detail.json 统计
         with open(detail_file, "r", encoding="utf-8") as f:
             detail = json.load(f)
 
-        self.assertEqual(detail["count"], 30)
+        self.assertEqual(detail["count"], 35)
         self.assertEqual(detail["region_distribution"], {
             'HK': 5,
             'TW': 5,
             'JP': 5,
             'SG': 5,
-            'US': 10
+            'US': 15
         })
 
     def test_parse_geoip_response(self):

@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 SNI_HOST = "wall.19940407.xyz"
-TOP_COUNT = int(os.environ.get("TOP_COUNT", "30"))
+TOP_COUNT = int(os.environ.get("TOP_COUNT", "35"))
 PROBE_TIMEOUT = 2.5
 # 阶段2 → 沙箱入围上限（放大入围数，让更多候选进入全链路实测，保障各区域样本充足）
 STAGE2_ENTRY_LIMIT = int(os.environ.get("STAGE2_ENTRY_LIMIT", "75"))
@@ -132,7 +132,7 @@ DEFAULT_REGION_QUOTAS = {
     'TW': 5,
     'JP': 5,
     'SG': 5,
-    'US': 10,
+    'US': 15,
 }
 
 # 区域输出聚合优先级 (方案 A：US 永远集中置顶，随后为核心亚太及欧美节点)
@@ -1815,31 +1815,29 @@ def probe_stability(ip, port, rounds=ROUNDS_PER_NODE, probe_func=None, sleep_int
 # 注 4：经大陆直连实测，OVH/CacheFly/Singapore-Linode 这三源稳定可达
 # 高品质独立 IDC 100MB 真实测速源池（经实测 100% 存活，绝不经过 Cloudflare，无 429 激进限流，无 7 字节假文件）
 SPEED_TEST_SOURCES_APAC = (
-    "https://speedtest.singapore.linode.com/100MB-singapore.bin",         # Linode 新加坡 (亚太骨干)
-    "https://sgp-ping.vultr.com/vultr.com.100MB.bin",                     # Vultr 新加坡 (备用)
-    "https://speedtest.tokyo2.linode.com/100MB-tokyo2.bin",               # Linode 东京
-    "https://hnd-jp-ping.vultr.com/vultr.com.100MB.bin",                  # Vultr 东京
+    "https://sgp-ping.vultr.com/vultr.com.100MB.bin",                     # Vultr 新加坡 (亚太骨干)
+    "https://hnd-jp-ping.vultr.com/vultr.com.100MB.bin",                  # Vultr 东京 (亚太高速)
+    "https://syd-au-ping.vultr.com/vultr.com.100MB.bin",                  # Vultr 悉尼 (亚太备用)
 )
 
 SPEED_TEST_SOURCES_JP = (
-    "https://speedtest.tokyo2.linode.com/100MB-tokyo2.bin",               # Linode 东京
     "https://hnd-jp-ping.vultr.com/vultr.com.100MB.bin",                  # Vultr 东京
-    "https://speedtest.singapore.linode.com/100MB-singapore.bin",         # Linode 新加坡
-    "https://sgp-ping.vultr.com/vultr.com.100MB.bin",                     # Vultr 新加坡
+    "https://sgp-ping.vultr.com/vultr.com.100MB.bin",                     # Vultr 新加坡 (备用)
 )
 
 SPEED_TEST_SOURCES_US = (
-    "https://speedtest.fremont.linode.com/100MB-fremont.bin",             # Linode 美西 Fremont
     "https://sjo-ca-us-ping.vultr.com/vultr.com.100MB.bin",               # Vultr 硅谷 Silicon Valley
     "https://lax-ca-us-ping.vultr.com/vultr.com.100MB.bin",               # Vultr 洛杉矶
-    "https://speedtest.singapore.linode.com/100MB-singapore.bin",         # 备用
+    "https://wa-us-ping.vultr.com/vultr.com.100MB.bin",                   # Vultr 西雅图
+    "https://il-us-ping.vultr.com/vultr.com.100MB.bin",                   # Vultr 芝加哥
+    "https://nj-us-ping.vultr.com/vultr.com.100MB.bin",                   # Vultr 新泽西
 )
 
 SPEED_TEST_SOURCES_DEFAULT = (
-    "https://speedtest.singapore.linode.com/100MB-singapore.bin",
+    "https://sjo-ca-us-ping.vultr.com/vultr.com.100MB.bin",
     "https://sgp-ping.vultr.com/vultr.com.100MB.bin",
-    "https://speedtest.fremont.linode.com/100MB-fremont.bin",
-    "https://speedtest.tokyo2.linode.com/100MB-tokyo2.bin",
+    "https://hnd-jp-ping.vultr.com/vultr.com.100MB.bin",
+    "https://fra-de-ping.vultr.com/vultr.com.100MB.bin",
 )
 
 
@@ -1969,9 +1967,7 @@ def probe_throughput_speed(
             if any(term in err_msg or term in err_name for term in (
                 "RemoteDisconnected", "UNEXPECTED_EOF", "ConnectionReset", "ConnectionRefused",
                 "ConnectionAborted", "BrokenPipe", "The handshake operation timed out", "timed out"
-            )):
-                is_tunnel_broken = True
-            elif received == 0:
+            )) and not any(ssl_term in err_msg for ssl_term in ("SSLV3", "CERTIFICATE_VERIFY_FAILED", "alert handshake failure")):
                 is_tunnel_broken = True
         elapsed = max(0.05, time.time() - start_t)
         return received, elapsed, hit_429, is_tunnel_broken
@@ -2674,7 +2670,7 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     all_tested_nodes = []
 
     # 初始批次抽取规划 (美区分配 22 个名额，亚太各 10 个，韩国 6 个)
-    initial_budgets = {'HK': 10, 'TW': 10, 'JP': 10, 'SG': 10, 'KR': 6, 'US': 22}
+    initial_budgets = {'HK': 10, 'TW': 10, 'JP': 10, 'SG': 10, 'KR': 6, 'US': 25}
     current_batch = []
     for r, b_quota in initial_budgets.items():
         pulled = untested_candidates[r][:b_quota]
