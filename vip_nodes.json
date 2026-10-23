@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-10-22 23:49:29",
+  "updated_at": "2026-10-23 09:06:00",
   "vip_threshold": 5.0,
   "nodes": [
     {
@@ -23,26 +23,6 @@
       "last_tested": "2026-10-13 18:00:00"
     },
     {
-      "ip": "18.142.4.29",
-      "port": 443,
-      "speed": 8.13,
-      "exit_country": "SG",
-      "colo": "SIN",
-      "score": 6.5,
-      "e2e_avg_rtt": 477.5,
-      "last_tested": "2026-10-16 21:33:17"
-    },
-    {
-      "ip": "47.131.186.184",
-      "port": 443,
-      "speed": 8.07,
-      "exit_country": "SG",
-      "colo": "SIN",
-      "score": 6.5,
-      "e2e_avg_rtt": 470.5,
-      "last_tested": "2026-10-22 23:49:29"
-    },
-    {
       "ip": "18.139.160.115",
       "port": 443,
       "speed": 7.88,
@@ -51,6 +31,26 @@
       "score": 5.7,
       "e2e_avg_rtt": 470.5,
       "last_tested": "2026-10-16 21:33:17"
+    },
+    {
+      "ip": "18.136.144.144",
+      "port": 443,
+      "speed": 7.84,
+      "exit_country": "SG",
+      "colo": "SIN",
+      "score": 4.8,
+      "e2e_avg_rtt": 458.0,
+      "last_tested": "2026-10-23 09:06:00"
+    },
+    {
+      "ip": "140.235.37.72",
+      "port": 443,
+      "speed": 7.81,
+      "exit_country": "JP",
+      "colo": "NRT",
+      "score": 6.6,
+      "e2e_avg_rtt": 415.0,
+      "last_tested": "2026-10-23 09:06:00"
     },
     {
       "ip": "3.113.232.245",
@@ -93,24 +93,34 @@
       "last_tested": "2026-10-16 21:33:17"
     },
     {
-      "ip": "43.168.16.67",
-      "port": 443,
-      "speed": 6.13,
-      "exit_country": "KR",
-      "colo": "ICN",
-      "score": 3.4,
-      "e2e_avg_rtt": 714.0,
-      "last_tested": "2026-10-22 23:49:29"
-    },
-    {
-      "ip": "47.75.104.211",
-      "port": 443,
-      "speed": 6.09,
+      "ip": "104.17.158.86",
+      "port": 8443,
+      "speed": 6.49,
       "exit_country": "US",
       "colo": "SJC",
-      "score": 4.7,
-      "e2e_avg_rtt": 954.0,
-      "last_tested": "2026-10-22 23:49:29"
+      "score": 5.6,
+      "e2e_avg_rtt": 728.0,
+      "last_tested": "2026-10-23 09:06:00"
+    },
+    {
+      "ip": "47.131.186.184",
+      "port": 443,
+      "speed": 6.17,
+      "exit_country": "SG",
+      "colo": "SIN",
+      "score": 5.9,
+      "e2e_avg_rtt": 443.0,
+      "last_tested": "2026-10-23 09:06:00"
+    },
+    {
+      "ip": "104.17.137.4",
+      "port": 8443,
+      "speed": 6.03,
+      "exit_country": "US",
+      "colo": "SJC",
+      "score": 3.4,
+      "e2e_avg_rtt": 801.5,
+      "last_tested": "2026-10-23 09:06:00"
     },
     {
       "ip": "142.248.139.25",
@@ -123,14 +133,14 @@
       "last_tested": "2026-10-14 12:36:44"
     },
     {
-      "ip": "104.17.132.16",
-      "port": 8443,
-      "speed": 5.76,
-      "exit_country": "US",
-      "colo": "SJC",
-      "score": 4.6,
-      "e2e_avg_rtt": 786.5,
-      "last_tested": "2026-10-22 23:49:29"
+      "ip": "18.142.4.29",
+      "port": 443,
+      "speed": 5.65,
+      "exit_country": "SG",
+      "colo": "SIN",
+      "score": 6.2,
+      "e2e_avg_rtt": 457.0,
+      "last_tested": "2026-10-23 09:06:00"
     },
     {
       "ip": "43.201.54.156",
@@ -153,14 +163,34 @@
       "last_tested": "2026-10-14 21:24:15"
     },
     {
-      "ip": "179.255.132.122",
+      "ip": "23.147.172.131",
       "port": 443,
-      "speed": 4.97,
+      "speed": 5.48,
+      "exit_country": "US",
+      "colo": "HKG",
+      "score": 4.9,
+      "e2e_avg_rtt": 432.0,
+      "last_tested": "2026-10-23 09:06:00"
+    },
+    {
+      "ip": "202.144.195.203",
+      "port": 443,
+      "speed": 5.17,
+      "exit_country": "JP",
+      "colo": "NRT",
+      "score": 3.8,
+      "e2e_avg_rtt": 507.0,
+      "last_tested": "2026-10-23 09:06:00"
+    },
+    {
+      "ip": "179.255.111.185",
+      "port": 443,
+      "speed": 5.07,
       "exit_country": "US",
       "colo": "LAX",
-      "score": 4.3,
-      "e2e_avg_rtt": 953.0,
-      "last_tested": "2026-10-16 21:33:17"
+      "score": 5.5,
+      "e2e_avg_rtt": 790.0,
+      "last_tested": "2026-10-23 09:06:00"
     },
     {
       "ip": "104.17.146.39",
