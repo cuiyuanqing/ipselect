@@ -1,0 +1,17 @@
+[Unit]
+Description=Aimili Pure Node Picker Web Service
+After=network.target aimilivpn.service
+Wants=aimilivpn.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/aimilivpn
+ExecStart=/usr/bin/python3 /opt/aimilivpn/aimili_node_picker.py --port 8585 --country JP --max-risk 15 --top-n 20 --interval 6
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
