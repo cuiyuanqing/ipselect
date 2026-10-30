@@ -119,62 +119,98 @@ class CandidateNode:
 class AimiliClient:
     """与本地运行的 AimiliVPN 管理后端进行通信与鉴权"""
 
-    def __init__(self, auth_file: str = "/opt/aimilivpn/vpngate_data/ui_auth.json"):
+    def __init__(
+        self,
+        auth_file: str = "/opt/aimilivpn/vpngate_data/ui_auth.json",
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        secret_path: Optional[str] = None,
+        port: Optional[int] = None
+    ):
         self.auth_file = auth_file
         self.host = "127.0.0.1"
-        self.port = 8501
-        self.username = "admin"
-        self.password = ""
-        self.secret_path = ""
+        self.port = port or 8501
+        self.username = username or "admin"
+        self.password = password or ""
+        self.secret_path = secret_path or ""
         self.cookie_jar = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookie_jar))
         self.logged_in = False
-        self._load_auth()
+        self._working_base_url: Optional[str] = None
 
-    def _load_auth(self):
+        self._load_auth(username=username, password=password, secret_path=secret_path, port=port)
+
+    def _load_auth(self, username=None, password=None, secret_path=None, port=None):
         """读取本地 Aimili 密码与配置"""
         if os.path.isfile(self.auth_file):
             try:
                 with open(self.auth_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.host = data.get("host", "127.0.0.1")
-                    self.port = int(data.get("port", 8501))
-                    self.username = data.get("username", "admin")
-                    self.password = data.get("password", "")
-                    self.secret_path = data.get("secret_path", "")
-                    logger.info(f"🔑 成功从 [{self.auth_file}] 加载 Aimili 认证凭据 (用户: {self.username}, 端口: {self.port})")
+                    if not port:
+                        self.port = int(data.get("port", 8501))
+                    if not username:
+                        self.username = data.get("username", "admin")
+                    if not password:
+                        self.password = data.get("password", "")
+                    if not secret_path:
+                        self.secret_path = data.get("secret_path", "")
+                    logger.info(f"🔑 成功从 [{self.auth_file}] 加载 Aimili 认证凭据 (用户: {self.username}, 端口: {self.port}, 安全后缀: {self.secret_path})")
                     return
             except Exception as e:
-                logger.warning(f"⚠️ 解析 {self.auth_file} 失败: {e}，将使用默认参数")
+                logger.warning(f"⚠️ 解析 {self.auth_file} 失败: {e}，将使用命令行/默认参数")
         else:
-            logger.warning(f"⚠️ 未找到 {self.auth_file}，使用本地默认 http://127.0.0.1:8501")
+            logger.warning(f"⚠️ 未找到 {self.auth_file}，使用参数配置: http://{self.host}:{self.port}")
 
     @property
     def base_url(self) -> str:
+        if self._working_base_url:
+            return self._working_base_url
+        s = (self.secret_path or "").strip("/")
+        if s:
+            return f"http://{self.host}:{self.port}/{s}"
         return f"http://{self.host}:{self.port}"
 
     def login(self) -> bool:
-        """登录 Aimili 获取会话 Cookie"""
-        url = f"{self.base_url}/api/login"
+        """登录 Aimili 获取会话 Cookie，支持智能探测正确 API 路径"""
+        # 候选 URL 列表 (优先尝试带安全后缀的路径)
+        candidates_urls = []
+        s = (self.secret_path or "").strip("/")
+        if s:
+            candidates_urls.append(f"http://{self.host}:{self.port}/{s}/api/login")
+        candidates_urls.append(f"http://{self.host}:{self.port}/api/login")
+
         payload = json.dumps({"username": self.username, "password": self.password}).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": "AimiliPurePicker/1.0"}
-        )
-        try:
-            with self.opener.open(req, timeout=10) as resp:
-                res_data = json.loads(resp.read().decode("utf-8"))
-                if res_data.get("ok"):
-                    self.logged_in = True
-                    logger.info("✅ 成功登录 AimiliVPN 本地管理服务")
-                    return True
-                else:
-                    logger.error(f"❌ 登录 AimiliVPN 失败: {res_data.get('error', '未知错误')}")
-                    return False
-        except Exception as e:
-            logger.error(f"❌ 请求 AimiliVPN 登录接口失败 [{url}]: {e}")
-            return False
+
+        for url in candidates_urls:
+            logger.info(f"🔐 尝试向 Aimili 发起登录请求: {url} (用户名: {self.username})")
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json", "User-Agent": "AimiliPurePicker/1.0"}
+            )
+            try:
+                with self.opener.open(req, timeout=10) as resp:
+                    res_data = json.loads(resp.read().decode("utf-8"))
+                    if res_data.get("ok"):
+                        self.logged_in = True
+                        # 锁定成功的前缀作为后续所有 API 的基准 URL
+                        self._working_base_url = url.replace("/api/login", "")
+                        logger.info(f"✅ 成功登录 AimiliVPN 本地管理服务 (已锁定基础路径: {self._working_base_url})")
+                        return True
+                    else:
+                        logger.error(f"❌ 登录 AimiliVPN 失败 (账号或密码错误): {res_data.get('error', '未知错误')}")
+                        return False
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    logger.debug(f"ℹ️ 路径 {url} 返回 404，尝试下一个候选路径...")
+                    continue
+                logger.error(f"❌ 登录 AimiliVPN 返回 HTTP {e.code}: {e.reason}")
+            except Exception as e:
+                logger.error(f"❌ 请求 AimiliVPN 登录接口失败 [{url}]: {e}")
+
+        logger.error(f"❌ 所有登录路径尝试完毕，均未能成功连接到 Aimili 后端 (请确认端口 {self.port} 及安全路径 {self.secret_path} 是否正确)")
+        return False
 
     def fetch_scoped_nodes(self, country: str = "JP", status: str = "available", limit: int = 150) -> List[CandidateNode]:
         """从 Aimili 提取指定国家和状态的候选节点"""
@@ -934,9 +970,22 @@ def main():
     parser.add_argument("--top-n", type=int, default=5, help="优选收藏入库节点数 (默认 5)")
     parser.add_argument("--interval", type=int, default=6, help="定时自动扫描间隔小时 (默认 6 小时)")
     parser.add_argument("--scan-once", action="store_true", help="仅执行一次筛选并立刻退出 (适用于系统 crontab)")
+
+    # Aimili 连接覆盖参数
+    parser.add_argument("--secret-path", type=str, default=None, help="Aimili 网页安全后缀 (如 vuYkz89zKZtf，默认自动读取 ui_auth.json)")
+    parser.add_argument("--username", type=str, default=None, help="Aimili 管理员账号 (默认自动读取 ui_auth.json)")
+    parser.add_argument("--password", type=str, default=None, help="Aimili 管理员密码 (默认自动读取 ui_auth.json)")
+    parser.add_argument("--aimili-port", type=int, default=None, help="Aimili 本地管理端口 (默认 8501)")
+    parser.add_argument("--auth-file", type=str, default="/opt/aimilivpn/vpngate_data/ui_auth.json", help="Aimili 认证文件路径")
     args = parser.parse_args()
 
-    aimili = AimiliClient()
+    aimili = AimiliClient(
+        auth_file=args.auth_file,
+        username=args.username,
+        password=args.password,
+        secret_path=args.secret_path,
+        port=args.aimili_port
+    )
     inspector = IpIntelligenceManager()
     engine = PickerEngine(aimili=aimili, inspector=inspector)
 
