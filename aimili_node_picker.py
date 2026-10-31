@@ -74,6 +74,13 @@ class RingLogHandler(logging.Handler):
 logger = logging.getLogger("AimiliPicker")
 logger.setLevel(logging.INFO)
 
+# 确保标准输出与标准错误流在任何系统环境下(包含 Windows 与 Linux)统一使用 UTF-8 编码
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # 控制台输出
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
@@ -426,7 +433,42 @@ class AimiliClient:
             logger.error(f"❌ 收藏节点 [{node.ip}] (ID: {fav_id}) 异常: {e}")
             return False
 
-    def remove_favorite_by_id(self, fav_id: str, timeout: int = 10) -> bool:
+    def set_active_node(self, node: CandidateNode, timeout: int = 20) -> bool:
+        """调用 Aimili 将指定优选节点切换为当前活动出口节点"""
+        if not self.logged_in and not self.login():
+            return False
+
+        if node.pool_endpoint_id:
+            url = f"{self.base_url}/api/connect_pool_endpoint"
+            payload = json.dumps({
+                "endpoint_id": node.pool_endpoint_id,
+                "endpoint_ids": [node.pool_endpoint_id]
+            }).encode("utf-8")
+        else:
+            url = f"{self.base_url}/api/connect"
+            payload = json.dumps({
+                "id": node.id
+            }).encode("utf-8")
+
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "AimiliPurePicker/1.0"}
+        )
+        try:
+            with self.opener.open(req, timeout=timeout) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                ok = bool(res.get("ok") or res.get("running") or "state" in res)
+                if ok:
+                    logger.info(f"🚀 成功向 Aimili 下发节点切换指令 -> 活动出口: {node.ip} (ID: {node.id})")
+                else:
+                    logger.warning(f"⚠️ 切换节点返回异常: {res.get('message', res)}")
+                return ok
+        except Exception as e:
+            logger.error(f"❌ 切换 Aimili 活动节点 [{node.ip}] 异常: {e}")
+            return False
+
+    def remove_favorite_by_id(self, fav_id: str, timeout: int = 3) -> bool:
         """移除指定收藏 ID (Aimili 在 favorite=False 时无需网络测活，毫秒级极速返回)"""
         if not self.logged_in and not self.login():
             return False
@@ -503,7 +545,14 @@ class IpIntelligenceManager:
         self.cache: Dict[str, Dict[str, Any]] = {}
         self._cookie_jar = http.cookiejar.CookieJar()
         self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._cookie_jar))
+        self._ping0_block_count: int = 0
+        self._ping0_circuit_broken: bool = False
         self._load_cache()
+
+    def reset_circuit_breaker(self):
+        """重置熔断器状态，供新一轮扫描开始时调用"""
+        self._ping0_block_count = 0
+        self._ping0_circuit_broken = False
 
     def _load_cache(self):
         if os.path.isfile(self.cache_file):
@@ -529,7 +578,7 @@ class IpIntelligenceManager:
     def inspect_ip(self, ip: str, source_mode: str = "auto") -> IpQuality:
         """
         查询单个 IP 的风控质量，支持多源模式：
-          - auto: 智能自动降级 (Ping0 优先 -> IP-API 兜底 -> IPWho.is 补偿)
+          - auto: 智能自动降级 (Ping0 优先 -> 熔断直通 / IP-API 兜底 -> IPWho.is 补偿)
           - fallback_only: 极速备选源通道 (仅走 IP-API + IPWho.is，完全规避 Ping0 频控)
           - ping0_only: 严格主通道 (仅走 Ping0.cc)
         """
@@ -552,13 +601,20 @@ class IpIntelligenceManager:
             quality = self._query_ping0_with_retry(ip)
         else:
             # 智能自动融合降级模式 (auto)
-            quality = self._query_ping0_with_retry(ip)
-            if quality.risk_label in ["未知", "反爬拦截", "检测超时"] or quality.ip_type == "未知宽带类型":
-                logger.info(f"🔄 触发自动降级：无缝切换备选接口 1 (IP-API) 复检 IP: {ip}...")
+            if self._ping0_circuit_broken:
+                # 熔断直通：避免每节点耗时 6 秒等待无效的 Ping0 反爬重试
+                logger.debug(f"⚡ [熔断直通] IP {ip} 直通备选源 (IP-API)...")
                 quality = self._query_ip_api(ip, quality)
                 if quality.risk_label in ["未知", "反爬拦截", "检测超时"] or quality.ip_type == "未知宽带类型":
-                    logger.info(f"🔄 触发二级自动降级：切换备选接口 2 (IPWho.is) 复检 IP: {ip}...")
                     quality = self._query_ipwhois(ip, quality)
+            else:
+                quality = self._query_ping0_with_retry(ip)
+                if quality.risk_label in ["未知", "反爬拦截", "检测超时"] or quality.ip_type == "未知宽带类型":
+                    logger.info(f"🔄 触发自动降级：无缝切换备选接口 1 (IP-API) 复检 IP: {ip}...")
+                    quality = self._query_ip_api(ip, quality)
+                    if quality.risk_label in ["未知", "反爬拦截", "检测超时"] or quality.ip_type == "未知宽带类型":
+                        logger.info(f"🔄 触发二级自动降级：切换备选接口 2 (IPWho.is) 复检 IP: {ip}...")
+                        quality = self._query_ipwhois(ip, quality)
 
         # 仅当结果为有效数据时才写入持久化缓存
         if quality.ip_type != "未知宽带类型" and quality.risk_label not in ["未知", "检测超时", "反爬拦截"]:
@@ -568,13 +624,19 @@ class IpIntelligenceManager:
         return quality
 
     def _query_ping0_with_retry(self, ip: str, max_retries: int = 2) -> IpQuality:
-        """带重试保护的 Ping0 查询"""
+        """带重试保护的 Ping0 查询与连续失败智能熔断"""
         quality = IpQuality(ip=ip, updated_at=time.time())
         for attempt in range(1, max_retries + 1):
             q, ok = self._query_ping0(ip)
             if ok:
+                self._ping0_block_count = 0  # 恢复正常，计数器归零
                 return q
             quality = q
+            self._ping0_block_count += 1
+            if self._ping0_block_count >= 2:
+                self._ping0_circuit_broken = True
+                logger.warning("🚨 [Ping0 智能熔断激活] 检测到 Ping0 连续返回拦截或频控，已激活智能熔断直通模式！本轮剩余节点将直接走 IP-API + IPWhois 高速通道，避免无效等待。")
+                break
             if attempt < max_retries:
                 backoff = 3.0 * attempt
                 logger.warning(f"⚠️ [Ping0] IP {ip} 触发反爬防护或频控，等待 {backoff:.1f} 秒后重试 (第 {attempt}/{max_retries} 次)...")
@@ -806,6 +868,7 @@ class PickerEngine:
         self.is_running = True
         picked_nodes: List[CandidateNode] = []
         start_time = time.time()
+        self.inspector.reset_circuit_breaker()
 
         try:
             self.current_step = f"正在从 AimiliVPN 提取 [{country}] 地区存活候选节点..."
@@ -834,7 +897,8 @@ class PickerEngine:
                     cand_by_fav_id[c.pool_endpoint_id] = c
 
             retained_nodes: List[CandidateNode] = []
-            evicted_fav_ids: List[str] = []
+            live_evicted_fav_ids: List[str] = []
+            dead_evicted_fav_ids: List[str] = []
             checked_fav_ips = set()
 
             # 2. 阶段一：存量收藏验身与经验结算
@@ -845,9 +909,9 @@ class PickerEngine:
                 for fav_id in current_fav_ids:
                     node = cand_by_fav_id.get(fav_id)
                     if not node:
-                        logger.warning(f"🚫 [存量淘汰] 收藏节点 [{fav_id}] 已在候选池中离线/不可用，标记清退")
+                        logger.warning(f"🚫 [存量清退] 收藏节点 [{fav_id}] 已在候选池中离线/不可用，标记底层配置清退 (无需API耗时操作)")
                         self.exp_mgr.record_fail(fav_id, "节点离线/不可用")
-                        evicted_fav_ids.append(fav_id)
+                        dead_evicted_fav_ids.append(fav_id)
                         continue
 
                     if node.ip in checked_fav_ips:
@@ -859,14 +923,14 @@ class PickerEngine:
                         reason = f"带宽速率不足 ({node.speed_mbps} Mbps < {min_speed_mbps} Mbps)"
                         logger.warning(f"🚫 [存量淘汰] 收藏节点 {node.ip:<15} 验身未达标 ({reason})，标记移出收藏")
                         self.exp_mgr.record_fail(node.ip, reason)
-                        evicted_fav_ids.append(fav_id)
+                        live_evicted_fav_ids.append(fav_id)
                         continue
 
                     # 探测存量收藏的风控与宽带类型
                     self.current_step = f"正在复检存量收藏质量: {node.ip}"
                     cached = self.inspector.cache.get(node.ip)
                     node.quality = self.inspector.inspect_ip(node.ip, source_mode=source_mode)
-                    if not cached and source_mode != "fallback_only":
+                    if not cached and source_mode != "fallback_only" and not self.inspector._ping0_circuit_broken:
                         time.sleep(random.uniform(1.2, 1.8))
                     else:
                         time.sleep(0.05)
@@ -891,11 +955,19 @@ class PickerEngine:
                         reason = f"非家宽({q.ip_type})" if (not q or not q.is_residential) else f"风控超标({q.risk_score}%>{risk_limit}%)"
                         logger.warning(f"🚫 [存量淘汰] 收藏节点 {node.ip:<15} 验身未达标 ({reason})，标记移出收藏")
                         self.exp_mgr.record_fail(node.ip, reason)
-                        evicted_fav_ids.append(fav_id)
+                        live_evicted_fav_ids.append(fav_id)
 
-                logger.info(f"📊 [阶段一结算] 存量收藏复检完毕: 合格保留 {len(retained_nodes)} 个，淘汰失效/超标 {len(evicted_fav_ids)} 个")
+                total_evicted = len(live_evicted_fav_ids) + len(dead_evicted_fav_ids)
+                logger.info(
+                    f"📊 [阶段一结算] 存量收藏复检完毕: 合格保留 {len(retained_nodes)} 个，淘汰清退 {total_evicted} 个 "
+                    f"(离线已剔除: {len(dead_evicted_fav_ids)}, 在线未达标: {len(live_evicted_fav_ids)})"
+                )
             else:
-                evicted_fav_ids = list(current_fav_ids)
+                for fav_id in current_fav_ids:
+                    if fav_id in cand_by_fav_id:
+                        live_evicted_fav_ids.append(fav_id)
+                    else:
+                        dead_evicted_fav_ids.append(fav_id)
 
             # 3. 阶段二：容量评估与差额智能补位
             needed = top_n - len(retained_nodes)
@@ -926,7 +998,7 @@ class PickerEngine:
                     cached = self.inspector.cache.get(node.ip)
                     node.quality = self.inspector.inspect_ip(node.ip, source_mode=source_mode)
 
-                    if not cached and source_mode != "fallback_only":
+                    if not cached and source_mode != "fallback_only" and not self.inspector._ping0_circuit_broken:
                         time.sleep(random.uniform(1.2, 1.8))
                     else:
                         time.sleep(0.05)
@@ -983,17 +1055,18 @@ class PickerEngine:
                 picked_nodes = retained_nodes + newly_picked_nodes
 
             # 4. 阶段三：同步落库 Aimili 收藏夹
-            self.current_step = f"正在同步 Aimili 收藏状态 (保留: {len(retained_nodes)}, 淘汰: {len(evicted_fav_ids)}, 新入库: {len(newly_picked_nodes)})..."
+            total_evicted_count = len(live_evicted_fav_ids) + len(dead_evicted_fav_ids)
+            self.current_step = f"正在同步 Aimili 收藏状态 (保留: {len(retained_nodes)}, 淘汰清退: {total_evicted_count}, 新入库: {len(newly_picked_nodes)})..."
 
-            # 移出淘汰节点
-            if evicted_fav_ids:
-                logger.info(f"🧹 正在从 Aimili 收藏库移除 {len(evicted_fav_ids)} 个失效/超标旧节点...")
+            # 移出在线淘汰节点 (离线节点直接由底层配置文件同步清理，无需且不能调用 API，避免 Aimili 阻塞超时)
+            if live_evicted_fav_ids:
+                logger.info(f"🧹 正在从 Aimili 内存收藏库移除 {len(live_evicted_fav_ids)} 个在库但超标的旧节点 (离线节点 {len(dead_evicted_fav_ids)} 个由底层配置自动同步清理)...")
                 removed_count = 0
-                for old_id in evicted_fav_ids:
-                    if self.aimili.remove_favorite_by_id(old_id, timeout=10):
+                for old_id in live_evicted_fav_ids:
+                    if self.aimili.remove_favorite_by_id(old_id, timeout=3):
                         removed_count += 1
-                    time.sleep(0.05)
-                logger.info(f"🧹 旧节点移出完毕: 成功移出 {removed_count}/{len(evicted_fav_ids)} 个")
+                    time.sleep(0.02)
+                logger.info(f"🧹 内存旧节点移出完毕: 成功移出 {removed_count}/{len(live_evicted_fav_ids)} 个")
 
             # 增量写入新入选节点
             added_count = 0
@@ -1008,17 +1081,30 @@ class PickerEngine:
                     logger.warning(f"⚠️ 节点 [{node.ip}] 接口响应异常，底层持久化文件保障同步")
                 time.sleep(0.2)
 
-            # 底层持久化双重保证
+            # 底层持久化双重保证 (清空所有离线及超标节点，仅保留本次优选的节点)
             final_target_fav_ids = [n.canonical_fav_id for n in picked_nodes]
             self.aimili.sync_auth_file_favorites(final_target_fav_ids)
+
+            # 5. 阶段四：自动切换 Aimili 活动出口为第 1 名最佳节点
+            active_node_ip = ""
+            if picked_nodes:
+                best_node = picked_nodes[0]
+                active_node_ip = best_node.ip
+                self.current_step = f"正在将第 1 名最佳节点设为 Aimili 当前活动出口: {best_node.ip}..."
+                logger.info(f"🎯 开始将优选评分第一的黄金节点自动切换为 Aimili 当前活动出口 -> IP: {best_node.ip} (延迟: {best_node.latency_ms}ms, 速率: {best_node.speed_mbps}Mbps)")
+                switched = self.aimili.set_active_node(best_node, timeout=15)
+                if switched:
+                    logger.info(f"✨ [活动出口已切换] Aimili 当前活动出口已成功锁定为: {best_node.ip}！")
+                else:
+                    logger.warning(f"⚠️ 自动切换活动出口返回异常，已在收藏夹首位保留，可从 Aimili 网页手动点击连接")
 
             final_favs = self.aimili.get_current_favorites()
             logger.info(
                 f"🎉 优选落盘完毕！当前 Aimili 收藏库总计: {len(final_favs)} 个纯净家宽节点 "
-                f"(传承老兵: {len(retained_nodes)} 个, 新秀补位: {added_count} 个, 淘汰清退: {len(evicted_fav_ids)} 个)！"
+                f"(传承老兵: {len(retained_nodes)} 个, 新秀补位: {added_count} 个, 淘汰清退: {total_evicted_count} 个, 当前出口: {active_node_ip or '未变更'})！"
             )
 
-            # 5. 保存最新结果并持久化
+            # 6. 保存最新结果并持久化
             elapsed = round(time.time() - start_time, 1)
             self.last_result = {
                 "scan_time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1029,9 +1115,10 @@ class PickerEngine:
                 "elapsed_seconds": elapsed,
                 "total_candidates": total_candidates,
                 "retained_count": len(retained_nodes),
-                "evicted_count": len(evicted_fav_ids),
+                "evicted_count": total_evicted_count,
                 "newly_added_count": len(newly_picked_nodes),
                 "picked_count": len(picked_nodes),
+                "active_node_ip": active_node_ip,
                 "nodes": [
                     {
                         "id": n.id,
@@ -1043,6 +1130,7 @@ class PickerEngine:
                         "speed_bps": n.speed_bps,
                         "rank_score": n.rank_score,
                         "is_inherited": n.is_inherited,
+                        "is_active": (idx == 0),
                         "experience_level": n.experience.level_label if n.experience else "Lv.1 新秀",
                         "consecutive_passes": n.experience.consecutive_passes if n.experience else 1,
                         "reputation_score": n.experience.reputation_score if n.experience else 80.0,
@@ -1053,7 +1141,7 @@ class PickerEngine:
                         "is_native": n.quality.is_native if n.quality else False,
                         "isp": n.quality.isp if n.quality else ""
                     }
-                    for n in picked_nodes
+                    for idx, n in enumerate(picked_nodes)
                 ]
             }
 
@@ -1202,6 +1290,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     td { padding: 12px 14px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
     tr:hover td { background: rgba(255, 255, 255, 0.02); }
     .tag-pure { background: rgba(16, 185, 129, 0.2); color: #34d399; padding: 2px 8px; border-radius: 9999px; font-weight: 600; font-size: 11px; }
+    .tag-active { background: rgba(239, 68, 68, 0.2); color: #f87171; padding: 2px 8px; border-radius: 9999px; font-weight: 600; font-size: 11px; border: 1px solid rgba(239, 68, 68, 0.4); }
     .tag-fav { background: rgba(245, 158, 11, 0.2); color: #fbbf24; padding: 2px 8px; border-radius: 9999px; font-weight: 600; font-size: 11px; }
     .tag-fresh { background: rgba(168, 85, 247, 0.2); color: #c084fc; padding: 2px 8px; border-radius: 9999px; font-weight: 600; font-size: 11px; }
     .tag-home { background: rgba(59, 130, 246, 0.2); color: #60a5fa; padding: 2px 8px; border-radius: 9999px; font-size: 11px; }
@@ -1213,8 +1302,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div class="container">
   <div class="header">
     <div class="title-box">
-      <h1>⭐ Aimili 纯净家宽优选控制台 <span style="font-size: 13px; font-weight: normal; color: #38bdf8;">v3.5 多源多维版</span></h1>
-      <p>速率门槛过滤 · 多备选情报源矩阵 · 存量优先继承 · 老兵信誉成长 · 差额按需补位 · 双重持久化落盘</p>
+      <h1>⭐ Aimili 纯净家宽优选控制台 <span style="font-size: 13px; font-weight: normal; color: #38bdf8;">v3.6 极速联动版</span></h1>
+      <p>速率门槛过滤 · 智能熔断防卡死 · 自动切换最优出口 · 老兵信誉成长 · 差额按需补位 · 双重持久化落盘</p>
     </div>
     <div>
       <span class="badge">联动模式: 仅用收藏 (Favorites)</span>
@@ -1332,8 +1421,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       if (data.last_result && data.last_result.scan_time) {
         const r = data.last_result;
+        const activeIp = r.active_node_ip || (r.nodes && r.nodes[0] ? r.nodes[0].ip : '未切换');
         document.getElementById('lblLastScanTime').textContent = 
-          `时间: ${r.scan_time} · 耗时 ${r.elapsed_seconds || 0}s · 门槛: ≥${r.min_speed_threshold_mbps || 0}Mbps · 传承保留: ${r.retained_count || 0} 个 · 新选补位: ${r.newly_added_count || 0} 个 · 淘汰清退: ${r.evicted_count || 0} 个 · 收藏池就绪: ${r.picked_count || 0} 个`;
+          `时间: ${r.scan_time} · 🔥 当前活动出口: ${activeIp} · 耗时 ${r.elapsed_seconds || 0}s · 门槛: ≥${r.min_speed_threshold_mbps || 0}Mbps · 传承保留: ${r.retained_count || 0} · 新选补位: ${r.newly_added_count || 0} · 淘汰清退: ${r.evicted_count || 0} · 收藏总计: ${r.picked_count || 0}`;
         renderTable(r.nodes || []);
       }
     } catch (e) {
@@ -1359,7 +1449,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
     tbody.innerHTML = nodes.map(n => `
       <tr>
-        <td>${n.is_inherited ? '<span class="tag-fav">⭐ 传承老兵</span>' : '<span class="tag-fresh">🌟 新选补位</span>'}</td>
+        <td>${n.is_active ? '<span class="tag-active">🔥 当前出口</span> ' : ''}${n.is_inherited ? '<span class="tag-fav">⭐ 传承老兵</span>' : '<span class="tag-fresh">🌟 新选补位</span>'}</td>
         <td style="font-weight: 600; font-family: monospace;">${n.ip}</td>
         <td><span class="tag-speed">⚡ ${n.speed_mbps > 0 ? n.speed_mbps + ' Mbps' : '未测速'}</span></td>
         <td><span class="tag-level">${escapeHtml(n.experience_level || 'Lv.1 新秀')} (${n.consecutive_passes || 1}轮)</span></td>
