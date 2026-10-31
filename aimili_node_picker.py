@@ -33,6 +33,7 @@ import os
 import random
 import re
 import socketserver
+import subprocess
 import sys
 import threading
 import time
@@ -2093,6 +2094,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div id="progBar" class="progress-bar-val"></div>
         </div>
       </div>
+
+      <!-- 远程热更新与服务维护 -->
+      <div style="margin-top: 16px; padding: 12px; border-radius: 8px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border);">
+        <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between;">
+          <span>🛠️ 远端更新与服务管理</span>
+          <span style="font-size: 11px; color: var(--text-muted);">/home/chuiyuanwo/ipselect</span>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <button type="button" class="btn-sub" style="flex: 1; padding: 7px; font-size: 12px; background: #334155; color: #f8fafc; border: 1px solid #475569; border-radius: 6px; cursor: pointer;" onclick="triggerDeployPull()">📥 Git 覆盖更新</button>
+          <button type="button" class="btn-sub" style="flex: 1; padding: 7px; font-size: 12px; background: #334155; color: #f8fafc; border: 1px solid #475569; border-radius: 6px; cursor: pointer;" onclick="triggerDeployRestart()">⚡ 重启服务</button>
+          <button type="button" class="btn-sub" style="flex: 1.2; padding: 7px; font-size: 12px; background: #2563eb; color: #ffffff; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;" onclick="triggerDeploySyncAndRestart()">🚀 更新并重启</button>
+        </div>
+      </div>
     </div>
 
     <!-- 右侧实时终端日志 -->
@@ -2227,6 +2241,49 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
   }
 
+  async function triggerDeployPull() {
+    if (!confirm('确定要从 Git 远端强制覆盖拉取最新代码吗？\n(目标: /home/chuiyuanwo/ipselect)')) return;
+    try {
+      const res = await fetch('/api/git_pull', { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        alert('✅ Git 强制覆盖成功:\n' + (data.commit || data.message));
+      } else {
+        alert('❌ Git 覆盖失败:\n' + (data.error || JSON.stringify(data)));
+      }
+    } catch (e) {
+      alert('请求异常: ' + e);
+    }
+  }
+
+  async function triggerDeployRestart() {
+    if (!confirm('确定要重启 VPS 上的 aimili-picker 服务吗？\n(命令: sudo systemctl restart aimili-picker)')) return;
+    try {
+      const res = await fetch('/api/restart', { method: 'POST' });
+      const data = await res.json();
+      alert(data.message || '服务重启指令已下发，稍候刷新页面...');
+      setTimeout(() => location.reload(), 3000);
+    } catch (e) {
+      alert('请求异常: ' + e);
+    }
+  }
+
+  async function triggerDeploySyncAndRestart() {
+    if (!confirm('确定要强制拉取远端代码并重启 aimili-picker 服务吗？')) return;
+    try {
+      const res = await fetch('/api/sync_and_restart', { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        alert('🚀 ' + data.message + '\n页面将在 3 秒后自动刷新...');
+        setTimeout(() => location.reload(), 3000);
+      } else {
+        alert('❌ 部署失败: ' + (data.message || JSON.stringify(data)));
+      }
+    } catch (e) {
+      alert('请求异常: ' + e);
+    }
+  }
+
   function escapeHtml(str) {
     return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
@@ -2240,6 +2297,104 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>
 """
 
+VPS_GIT_REPO_DIR = "/home/chuiyuanwo/ipselect"
+
+def run_git_force_update(repo_dir: Optional[str] = None) -> dict:
+    """
+    在指定仓库目录执行 git 强制更新:
+    git fetch --all
+    git reset --hard origin/main
+    """
+    target_dir = repo_dir or VPS_GIT_REPO_DIR
+    if not os.path.exists(target_dir):
+        # 回退至脚本所在目录
+        target_dir = os.path.dirname(os.path.abspath(__file__))
+
+    try:
+        if not os.path.isdir(os.path.join(target_dir, ".git")):
+            return {
+                "ok": False,
+                "repo_dir": target_dir,
+                "error": f"目录 {target_dir} 不是有效的 Git 仓库 (.git 不存在)"
+            }
+
+        # 1. git fetch --all
+        fetch_res = subprocess.run(
+            ["git", "-C", target_dir, "fetch", "--all"],
+            capture_output=True, text=True, timeout=30
+        )
+        if fetch_res.returncode != 0:
+            return {
+                "ok": False,
+                "repo_dir": target_dir,
+                "stage": "git fetch",
+                "output": fetch_res.stdout.strip(),
+                "error": fetch_res.stderr.strip()
+            }
+
+        # 2. git reset --hard origin/main (优先 origin/main，若无则尝试 origin/HEAD)
+        reset_res = subprocess.run(
+            ["git", "-C", target_dir, "reset", "--hard", "origin/main"],
+            capture_output=True, text=True, timeout=30
+        )
+        if reset_res.returncode != 0:
+            reset_res = subprocess.run(
+                ["git", "-C", target_dir, "reset", "--hard", "origin/HEAD"],
+                capture_output=True, text=True, timeout=30
+            )
+
+        if reset_res.returncode != 0:
+            return {
+                "ok": False,
+                "repo_dir": target_dir,
+                "stage": "git reset",
+                "output": reset_res.stdout.strip(),
+                "error": reset_res.stderr.strip()
+            }
+
+        # 3. 获取最新提交信息
+        log_res = subprocess.run(
+            ["git", "-C", target_dir, "log", "-1", "--format=%h - %s (%ci)"],
+            capture_output=True, text=True, timeout=10
+        )
+        commit_info = log_res.stdout.strip() if log_res.returncode == 0 else "unknown"
+
+        logger.info(f"✅ Git 强制覆盖更新成功 [{target_dir}]: {commit_info}")
+        return {
+            "ok": True,
+            "repo_dir": target_dir,
+            "commit": commit_info,
+            "fetch_output": fetch_res.stdout.strip() + " " + fetch_res.stderr.strip(),
+            "reset_output": reset_res.stdout.strip(),
+            "message": f"成功覆盖更新至最新提交: {commit_info}"
+        }
+    except Exception as e:
+        logger.error(f"❌ Git 强制更新异常: {e}")
+        return {
+            "ok": False,
+            "repo_dir": target_dir,
+            "error": str(e)
+        }
+
+def schedule_service_restart(delay_sec: float = 1.0) -> None:
+    """
+    在后台线程中延迟执行 sudo systemctl restart aimili-picker，
+    确保 HTTP 响应能够完整写入并返回给调用方后再重启。
+    """
+    def _do_restart():
+        time.sleep(delay_sec)
+        logger.info("🔄 正在执行服务重启: sudo systemctl restart aimili-picker")
+        try:
+            res = subprocess.run(["sudo", "systemctl", "restart", "aimili-picker"], capture_output=True, text=True)
+            if res.returncode != 0:
+                logger.error(f"❌ 重启服务失败: {res.stderr.strip()}")
+            else:
+                logger.info("✅ 服务重启成功")
+        except Exception as e:
+            logger.error(f"❌ 重启命令调用异常: {e}")
+
+    threading.Thread(target=_do_restart, daemon=True).start()
+
 class WebRequestHandler(http.server.BaseHTTPRequestHandler):
     """自包含 HTTP 请求处理器"""
 
@@ -2247,6 +2402,12 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass
+
+    def _send_json_response(self, data: dict, status_code: int = 200):
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
@@ -2256,21 +2417,36 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
         elif url.path == "/api/status":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
             status_data = {
                 "running": self.engine.is_running if self.engine else False,
                 "current_step": self.engine.current_step if self.engine else "未就绪",
                 "last_result": self.engine.last_result if self.engine else {}
             }
-            self.wfile.write(json.dumps(status_data, ensure_ascii=False).encode("utf-8"))
+            self._send_json_response(status_data)
         elif url.path == "/api/logs":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
             logs = ring_handler.get_logs()
-            self.wfile.write(json.dumps(logs, ensure_ascii=False).encode("utf-8"))
+            self._send_json_response(logs)
+        elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
+            res = run_git_force_update()
+            self._send_json_response(res, status_code=200 if res.get("ok") else 500)
+        elif url.path in ("/api/restart", "/api/deploy/restart"):
+            schedule_service_restart(delay_sec=1.0)
+            self._send_json_response({"ok": True, "message": "服务正在重启 (sudo systemctl restart aimili-picker)，请稍候 2-3 秒刷新..."})
+        elif url.path in ("/api/sync_and_restart", "/api/deploy/sync_and_restart"):
+            res = run_git_force_update()
+            if res.get("ok"):
+                schedule_service_restart(delay_sec=1.0)
+                self._send_json_response({
+                    "ok": True,
+                    "message": f"Git 远端覆盖成功，已触发服务重启: {res.get('commit')}",
+                    "git_result": res
+                })
+            else:
+                self._send_json_response({
+                    "ok": False,
+                    "message": "Git 覆盖更新失败，未触发重启",
+                    "git_result": res
+                }, status_code=500)
         else:
             self.send_response(404)
             self.end_headers()
@@ -2308,10 +2484,28 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             else:
                 resp = {"ok": False, "message": "任务正在执行中，请勿重复触发"}
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(json.dumps(resp, ensure_ascii=False).encode("utf-8"))
+            self._send_json_response(resp)
+        elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
+            res = run_git_force_update()
+            self._send_json_response(res, status_code=200 if res.get("ok") else 500)
+        elif url.path in ("/api/restart", "/api/deploy/restart"):
+            schedule_service_restart(delay_sec=1.0)
+            self._send_json_response({"ok": True, "message": "服务正在重启 (sudo systemctl restart aimili-picker)，请稍候 2-3 秒刷新..."})
+        elif url.path in ("/api/sync_and_restart", "/api/deploy/sync_and_restart"):
+            res = run_git_force_update()
+            if res.get("ok"):
+                schedule_service_restart(delay_sec=1.0)
+                self._send_json_response({
+                    "ok": True,
+                    "message": f"Git 远端覆盖成功，已触发服务重启: {res.get('commit')}",
+                    "git_result": res
+                })
+            else:
+                self._send_json_response({
+                    "ok": False,
+                    "message": "Git 覆盖更新失败，未触发重启",
+                    "git_result": res
+                }, status_code=500)
         else:
             self.send_response(404)
             self.end_headers()

@@ -603,5 +603,107 @@ class TestPipelineExecutionOrder(unittest.TestCase):
         self.assertEqual(picked[0].jitter_ms, 6)
 
 
+
+
+class TestRemoteDeployEndpoints(unittest.TestCase):
+    """测试 VPS 远程 Git 覆盖更新与服务重启接口"""
+
+    @patch("os.path.exists", return_value=True)
+    @patch("os.path.isdir", return_value=True)
+    @patch("subprocess.run")
+    def test_run_git_force_update_success(self, mock_subproc, mock_isdir, mock_exists):
+        from aimili_node_picker import run_git_force_update
+
+        # 模拟 fetch 成功, reset 成功, log 成功
+        def fake_run(cmd, *args, **kwargs):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            m.stderr = ""
+            if "log" in cmd:
+                m.stdout = "d918950 - feat: auto deploy (2026-10-31)"
+            elif "reset" in cmd:
+                m.stdout = "HEAD is now at d918950 feat: auto deploy"
+            return m
+
+        mock_subproc.side_effect = fake_run
+
+        res = run_git_force_update("/home/chuiyuanwo/ipselect")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["repo_dir"], "/home/chuiyuanwo/ipselect")
+        self.assertIn("d918950", res["commit"])
+
+        # 验证调用的 git 命令包含 -C /home/chuiyuanwo/ipselect
+        calls = [c[0][0] for c in mock_subproc.call_args_list]
+        self.assertTrue(any("fetch" in cmd and "--all" in cmd for cmd in calls))
+        self.assertTrue(any("reset" in cmd and "--hard" in cmd for cmd in calls))
+
+    @patch("os.path.exists", return_value=True)
+    @patch("os.path.isdir", return_value=True)
+    @patch("subprocess.run")
+    def test_run_git_force_update_fetch_failure(self, mock_subproc, mock_isdir, mock_exists):
+        from aimili_node_picker import run_git_force_update
+
+        # 模拟 fetch 失败
+        mock_res = MagicMock()
+        mock_res.returncode = 1
+        mock_res.stdout = ""
+        mock_res.stderr = "fatal: unable to access github"
+        mock_subproc.return_value = mock_res
+
+        res = run_git_force_update("/home/chuiyuanwo/ipselect")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["stage"], "git fetch")
+        self.assertIn("fatal: unable to access", res["error"])
+
+    @patch("aimili_node_picker.subprocess.run")
+    @patch("aimili_node_picker.time.sleep", return_value=None)
+    @patch("aimili_node_picker.threading.Thread")
+    def test_schedule_service_restart(self, mock_thread, mock_sleep, mock_subproc):
+        from aimili_node_picker import schedule_service_restart
+        mock_subproc.return_value = MagicMock(returncode=0)
+
+        def fake_thread(target=None, daemon=None):
+            m = MagicMock()
+            m.start = lambda: target()
+            return m
+        mock_thread.side_effect = fake_thread
+
+        schedule_service_restart(delay_sec=0)
+        mock_subproc.assert_called_with(["sudo", "systemctl", "restart", "aimili-picker"], capture_output=True, text=True)
+
+    def test_web_ui_has_deploy_controls(self):
+        from aimili_node_picker import HTML_TEMPLATE
+        self.assertIn("远端更新与服务管理", HTML_TEMPLATE)
+        self.assertIn("/home/chuiyuanwo/ipselect", HTML_TEMPLATE)
+        self.assertIn("triggerDeployPull()", HTML_TEMPLATE)
+        self.assertIn("triggerDeployRestart()", HTML_TEMPLATE)
+        self.assertIn("triggerDeploySyncAndRestart()", HTML_TEMPLATE)
+
+
+    @patch("aimili_node_picker.run_git_force_update", return_value={"ok": True, "commit": "abc1234"})
+    @patch("aimili_node_picker.schedule_service_restart")
+    def test_web_request_handler_deploy_routes(self, mock_restart, mock_git):
+        import io
+        from aimili_node_picker import WebRequestHandler
+
+        handler = WebRequestHandler.__new__(WebRequestHandler)
+        handler.path = "/api/deploy/git_pull"
+        handler.headers = {}
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = io.BytesIO()
+
+        handler.do_GET()
+        mock_git.assert_called_once()
+        self.assertIn(b"abc1234", handler.wfile.getvalue())
+
+        handler.path = "/api/deploy/sync_and_restart"
+        handler.wfile = io.BytesIO()
+        handler.do_POST()
+        mock_restart.assert_called_once()
+        self.assertIn(b"Git", handler.wfile.getvalue())
+
 if __name__ == "__main__":
     unittest.main()
