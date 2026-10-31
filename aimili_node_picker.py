@@ -437,40 +437,107 @@ class AimiliClient:
             logger.error(f"❌ 收藏节点 [{node.ip}] (ID: {fav_id}) 异常: {e}")
             return False
 
-    def set_active_node(self, node: CandidateNode, timeout: int = 20) -> bool:
-        """调用 Aimili 将指定优选节点切换为当前活动出口节点"""
+    def get_state(self) -> Dict[str, Any]:
+        """获取 Aimili 当前网关与连接运行状态"""
+        if not self.logged_in and not self.login():
+            return {}
+        url = f"{self.base_url}/api/nodes?limit=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "AimiliPurePicker/1.0"})
+        try:
+            with self.opener.open(req, timeout=5) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                return res.get("state", {})
+        except Exception as e:
+            logger.debug(f"⚠️ 获取 Aimili 状态异常: {e}")
+            return {}
+
+    def wait_for_idle(self, timeout: float = 12.0) -> bool:
+        """等待 Aimili 连接或维护任务释放锁，恢复空闲就绪状态"""
+        start = time.time()
+        while time.time() - start < timeout:
+            st = self.get_state()
+            if not st:
+                time.sleep(0.5)
+                continue
+            is_connecting = st.get("is_connecting", False)
+            maintenance = st.get("maintenance_running", False)
+            if not is_connecting and not maintenance:
+                return True
+            time.sleep(0.8)
+        return False
+
+    def wait_for_tunnel_ready(self, expected_node_id: str, timeout: float = 10.0) -> bool:
+        """等待 Aimili 成功建立 OpenVPN 隧道与本地代理通道"""
+        clean_id = expected_node_id.replace("pool:", "")
+        start = time.time()
+        while time.time() - start < timeout:
+            st = self.get_state()
+            if not st:
+                time.sleep(0.5)
+                continue
+            if st.get("is_connecting"):
+                time.sleep(0.8)
+                continue
+            active_id = str(st.get("active_openvpn_node_id") or "")
+            tunnel_ready = bool(st.get("tunnel_ready") or st.get("proxy_ready"))
+            if tunnel_ready and (clean_id in active_id or active_id in clean_id or not clean_id):
+                return True
+            if not st.get("is_connecting") and not tunnel_ready:
+                msg = st.get("last_check_message", "")
+                logger.warning(f"⚠️ 节点 {expected_node_id} 隧道建连失败: {msg}")
+                return False
+            time.sleep(0.8)
+        return False
+
+    def set_active_node(self, node: CandidateNode, timeout: int = 15, max_retries: int = 3) -> bool:
+        """调用 Aimili 将指定优选节点切换为当前活动出口节点，带 409 互斥锁感知与重试"""
         if not self.logged_in and not self.login():
             return False
 
-        if node.pool_endpoint_id:
-            url = f"{self.base_url}/api/connect_pool_endpoint"
-            payload = json.dumps({
-                "endpoint_id": node.pool_endpoint_id,
-                "endpoint_ids": [node.pool_endpoint_id]
-            }).encode("utf-8")
-        else:
-            url = f"{self.base_url}/api/connect"
-            payload = json.dumps({
-                "id": node.id
-            }).encode("utf-8")
+        # 1. 尝试前确保 Aimili 不在其他并发连接锁中
+        self.wait_for_idle(timeout=6.0)
 
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": "AimiliPurePicker/1.0"}
-        )
-        try:
-            with self.opener.open(req, timeout=timeout) as resp:
-                res = json.loads(resp.read().decode("utf-8"))
-                ok = bool(res.get("ok") or res.get("running") or "state" in res)
-                if ok:
-                    logger.info(f"🚀 成功向 Aimili 下发节点切换指令 -> 活动出口: {node.ip} (ID: {node.id})")
-                else:
-                    logger.warning(f"⚠️ 切换节点返回异常: {res.get('message', res)}")
-                return ok
-        except Exception as e:
-            logger.error(f"❌ 切换 Aimili 活动节点 [{node.ip}] 异常: {e}")
-            return False
+        url = f"{self.base_url}/api/connect"
+        clean_id = node.id.replace("pool:", "")
+        cand_ids = [clean_id, node.id, f"pool:{clean_id}"]
+        seen = set()
+        unique_ids = [x for x in cand_ids if x and not (x in seen or seen.add(x))]
+
+        for attempt in range(1, max_retries + 1):
+            for test_id in unique_ids:
+                payload = json.dumps({"id": test_id}).encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=payload,
+                    headers={"Content-Type": "application/json", "User-Agent": "AimiliPurePicker/1.0"}
+                )
+                try:
+                    with self.opener.open(req, timeout=timeout) as resp:
+                        res = json.loads(resp.read().decode("utf-8"))
+                        ok = bool(res.get("ok") or res.get("running") or "state" in res)
+                        if ok:
+                            logger.info(f"🚀 成功向 Aimili 下发节点切换指令 -> 活动出口: {node.ip} (ID: {test_id})")
+                            ready = self.wait_for_tunnel_ready(test_id, timeout=8.0)
+                            if ready:
+                                return True
+                            else:
+                                logger.warning(f"⚠️ 节点 {node.ip} 握手未就绪或建连超时")
+                                return False
+                        else:
+                            logger.warning(f"⚠️ 切换节点返回异常: {res.get('message', res)}")
+                except urllib.error.HTTPError as e:
+                    if e.code == 409:
+                        logger.warning(f"⏳ Aimili 正在执行前序建连 (HTTP 409 互斥)，等待 2.5 秒后重试 (第 {attempt}/{max_retries} 次)...")
+                        time.sleep(2.5)
+                        self.wait_for_idle(timeout=6.0)
+                        break
+                    else:
+                        logger.warning(f"⚠️ 尝试使用 ID [{test_id}] 切换返回 HTTP {e.code}: {e.reason}")
+                except Exception as e:
+                    logger.warning(f"⚠️ 请求 Aimili 切换接口异常 [{test_id}]: {e}")
+
+        logger.error(f"❌ 最终未能成功将活动节点切换到 [{node.ip}]")
+        return False
 
     def remove_favorite_by_id(self, fav_id: str, timeout: int = 3) -> bool:
         """移除指定收藏 ID (Aimili 在 favorite=False 时无需网络测活，毫秒级极速返回)"""
@@ -501,9 +568,10 @@ class AimiliClient:
             return False
 
     def refresh_nodes(self, country: str = "JP", timeout: int = 15) -> bool:
-        """向 Aimili 发送节点刷新指令，触发后台从 VPNGate 发现新节点"""
+        """向 Aimili 发送节点刷新指令，触发后台从 VPNGate 发现新节点 (带 409 互斥避让)"""
         if not self.logged_in and not self.login():
             return False
+        self.wait_for_idle(timeout=8.0)
         url = f"{self.base_url}/api/refresh_nodes"
         payload = json.dumps({"discovery_countries": [country]}).encode("utf-8")
         req = urllib.request.Request(
@@ -984,6 +1052,7 @@ class PickerEngine:
             live_evicted_fav_ids: List[str] = []
             dead_evicted_fav_ids: List[str] = []
             checked_fav_ips = set()
+            evaluated_candidates: List[CandidateNode] = []
 
             # 2. 阶段一：存量收藏验身与经验结算
             current_fav_ids = self.aimili.get_current_favorites()
@@ -1029,6 +1098,7 @@ class PickerEngine:
                             )
                             node.speed_mbps = real_speed
                             node.speed_bps = int(real_speed * 1e6)
+                            evaluated_candidates.append(node)
                             if real_speed < min_speed_mbps:
                                 reason = f"实测速率不达标 ({real_speed} Mbps < {min_speed_mbps} Mbps)"
                                 logger.warning(f"🚫 [存量淘汰] 收藏节点 {node.ip:<15} {reason}，标记移出收藏")
@@ -1209,6 +1279,7 @@ class PickerEngine:
 
 
                         continue
+                    evaluated_candidates.append(node)
 
 
 
@@ -1224,9 +1295,10 @@ class PickerEngine:
                         logger.info(f"⚡ [实测开始] 节点 {node.ip:<15} (风控 {q.risk_score}%) 通过初筛，正在连接测试真实带宽...")
 
 
-                        self.aimili.set_active_node(node, timeout=12)
-
-
+                        connected = self.aimili.set_active_node(node, timeout=12)
+                        if not connected:
+                            logger.warning(f"⚠️ 无法切换到活动节点 {node.ip} (隧道建连失败或Aimili被占用)，跳过测速")
+                            continue
                         time.sleep(1.2)
 
 
@@ -1397,6 +1469,45 @@ class PickerEngine:
 
 
 
+            # 核心保底策略：确保收藏池至少有 5 个存活节点 (若达标节点不足 5 个，降级选取最优的 5 个补齐，绝不为空)
+            SAFETY_FLOOR = min(5, top_n)
+            if len(picked_nodes) == 0 and evaluated_candidates:
+                logger.warning(
+                    f"🚨 [触发安全保底降级机制] {rounds_run} 轮筛选后实测达标仅 {len(picked_nodes)} 个 (不足最低 {SAFETY_FLOOR} 个保底要求)，"
+                    f"启动最优节点降级补齐，确保出站链路绝不断流！"
+                )
+                picked_ips = {n.ip for n in picked_nodes}
+                picked_ids = {n.canonical_fav_id for n in picked_nodes}
+                fallback_candidates = [
+                    c for c in evaluated_candidates
+                    if c.ip not in picked_ips and c.canonical_fav_id not in picked_ids
+                ]
+                # 排序规则：实测流速高 > 综合排名分低 > 延迟低
+                fallback_candidates.sort(key=lambda n: (-n.speed_mbps, n.rank_score, n.latency_ms))
+                needed_floor = SAFETY_FLOOR - len(picked_nodes)
+                fallback_picked = fallback_candidates[:needed_floor]
+
+                for fn in fallback_picked:
+                    exp = self.exp_mgr.record_pass(
+                        fn.ip, fn.canonical_fav_id, fn.quality.isp if fn.quality else "", fn.quality.risk_score if fn.quality else 10, fn.latency_ms
+                    )
+                    fn.experience = exp
+                    fn.is_inherited = False
+                    speed_str = f"{fn.speed_mbps} Mbps" if fn.speed_mbps > 0 else "未达5Mbps"
+                    logger.info(
+                        f"🛡️ [降级保底入选] 节点 {fn.ip:<15} (实测: {speed_str}, 风控: {fn.quality.risk_score if fn.quality else 10}%, 延迟: {fn.latency_ms}ms) -> "
+                        f"保底补充入选成功 (当前总计: {len(picked_nodes) + 1}/{SAFETY_FLOOR})"
+                    )
+                    picked_nodes.append(fn)
+                    all_newly_picked.append(fn)
+
+            # 紧急熔断：如果依然没有节点且存量收藏不为空，拒绝清空底层配置，保留旧收藏
+            if not picked_nodes and current_fav_ids:
+                logger.error("🚨 本次筛选未获得任何可用节点，启动紧急熔断保护：保留上一期旧收藏，拒绝写入空列表！")
+                final_target_fav_ids = list(current_fav_ids)
+            else:
+                final_target_fav_ids = [n.canonical_fav_id for n in picked_nodes]
+
             picked_nodes.sort(key=lambda n: n.rank_score)
 
             # 4. 阶段三：同步落库 Aimili 收藏夹
@@ -1427,7 +1538,6 @@ class PickerEngine:
                 time.sleep(0.2)
 
             # 底层持久化双重保证 (清空所有离线及超标节点，仅保留本次优选的节点)
-            final_target_fav_ids = [n.canonical_fav_id for n in picked_nodes]
             self.aimili.sync_auth_file_favorites(final_target_fav_ids)
 
             # 5. 阶段四：自动切换 Aimili 活动出口为第 1 名最佳节点
@@ -1713,7 +1823,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <!-- 右侧实时终端日志 -->
     <div class="card">
-      <div class="card-title">📜 实时探查与决策日志</div>
+      <div class="card-title" style="justify-content: space-between;">
+        <span>📜 实时探查与决策日志</span>
+        <label style="font-size: 12px; color: var(--text-muted); cursor: pointer; display: flex; align-items: center; gap: 5px; font-weight: normal;">
+          <input type="checkbox" id="chkPauseLog" style="width: 14px; height: 14px; cursor: pointer; accent-color: var(--accent);"> 暂停日志刷新
+        </label>
+      </div>
       <div class="terminal" id="termLogs"></div>
     </div>
   </div>
@@ -1777,6 +1892,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
 
   async function fetchLogs() {
+    if (document.getElementById('chkPauseLog')?.checked) return;
     try {
       const res = await fetch('./api/logs');
       const logs = await res.json();

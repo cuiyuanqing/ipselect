@@ -206,6 +206,101 @@ class TestPickerEngineMultiRound(unittest.TestCase):
         self.mock_aimili.remove_favorite_by_id.assert_called_with("fav_1", timeout=3)
         self.mock_exp.record_fail.assert_called()
 
+    def test_safety_floor_at_least_5_nodes_when_sub_5mbps(self):
+        """测试3轮测速后若没有节点达到 5 Mbps，触发降级保底机制，自动补足最优的 5 个节点"""
+        # 构造 6 个节点，实测速率全都在 1.5 ~ 4.2 Mbps (< 5.0 Mbps)
+        candidates = [
+            CandidateNode(id=f"n_{i}", ip=f"10.0.0.{i}", port=1194, country="JP", protocol="openvpn", latency_ms=30 + i * 5)
+            for i in range(1, 7)
+        ]
+        self.mock_aimili.fetch_scoped_nodes.return_value = candidates
+        self.mock_inspector.inspect_ip.return_value = IpQuality(
+            ip="test", is_residential=True, risk_score=5, ip_type="家庭宽带 IP", shared_users="1 - 10"
+        )
+        # 速率字典：最高 4.2，最低 1.5
+        speed_dict = {
+            "10.0.0.1": 4.2,
+            "10.0.0.2": 3.8,
+            "10.0.0.3": 3.0,
+            "10.0.0.4": 2.5,
+            "10.0.0.5": 2.0,
+            "10.0.0.6": 1.5,
+        }
+        self.engine.probe_speed_func = lambda proxy_port, proxy_host, max_duration: speed_dict.get(
+            self.mock_aimili.set_active_node.call_args[0][0].ip, 1.0
+        )
+
+        with patch("time.sleep", return_value=None):
+            picked = self.engine.run_screening(
+                country="JP",
+                max_risk=15,
+                min_speed_mbps=5.0,  # 门槛 5.0
+                top_n=20,            # 期望 20 个
+                inherit_existing=False,
+                max_rounds=3
+            )
+
+        # 触发保底降级：选出最优的 5 个存活节点，绝不为空！
+        self.assertEqual(len(picked), 5)
+        picked_ips = [n.ip for n in picked]
+        # 应该优先入选速率最高的 5 个节点 (10.0.0.1 ~ 10.0.0.5)
+        self.assertIn("10.0.0.1", picked_ips)
+        self.assertIn("10.0.0.2", picked_ips)
+        self.assertIn("10.0.0.5", picked_ips)
+        self.assertNotIn("10.0.0.6", picked_ips)
+
+
+class TestWebUiAndClientRobustness(unittest.TestCase):
+    """测试 Web 前端日志暂停与 AimiliClient 409 防冲突重试机制"""
+
+    def test_web_ui_has_pause_logs_checkbox(self):
+        from aimili_node_picker import HTML_TEMPLATE
+        self.assertIn('id="chkPauseLog"', HTML_TEMPLATE)
+        self.assertIn("暂停日志刷新", HTML_TEMPLATE)
+        self.assertIn("if (document.getElementById('chkPauseLog')?.checked) return;", HTML_TEMPLATE)
+
+    def test_aimili_client_set_active_node_409_retry(self):
+        import io
+        import urllib.error
+        client = AimiliClient(
+            auth_file="/nonexistent/ui_auth.json",
+            username="admin",
+            password="admin",
+            secret_path="test_token",
+            port=8501,
+            proxy_port=8500
+        )
+        client.logged_in = True
+        client.wait_for_idle = MagicMock(return_value=True)
+        client.wait_for_tunnel_ready = MagicMock(return_value=True)
+
+        node = CandidateNode(id="test_node_1", ip="192.168.1.1", port=1194, country="JP", protocol="openvpn", latency_ms=45)
+
+        # 模拟第一次 409 Conflict，第二次成功
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"ok": true}'
+        mock_resp.__enter__.return_value = mock_resp
+        mock_resp.__exit__.return_value = None
+
+        error_409 = urllib.error.HTTPError("http://127.0.0.1:8501/api/connect", 409, "Conflict", {}, io.BytesIO(b"Conflict"))
+
+        call_count = 0
+        def fake_open(req, timeout=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise error_409
+            return mock_resp
+
+        client.opener = MagicMock()
+        client.opener.open.side_effect = fake_open
+
+        with patch("time.sleep", return_value=None):
+            ok = client.set_active_node(node, timeout=5, max_retries=3)
+
+        self.assertTrue(ok)
+        self.assertGreaterEqual(call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
