@@ -169,6 +169,8 @@ class CandidateNode:
     rank_score: float = 9999.0
     handshake_ok: bool = False
     real_latency_ms: Optional[int] = None
+    jitter_ms: int = 0
+    packet_loss_pct: int = 0
 
     @property
     def canonical_fav_id(self) -> str:
@@ -998,6 +1000,124 @@ TEST_SPEED_URLS = [
     "http://speedtest.tele2.net/1MB.zip"
 ]
 
+def probe_network_quality(
+    ip: str,
+    port: int,
+    protocol: str = "openvpn",
+    samples: int = 3,
+    timeout_per_sample: float = 0.8
+) -> Dict[str, Any]:
+    """
+    节点多维度网络质量探测（漏斗初筛第 1 关）：
+    1. 探测主机存活率（丢包率 packet_loss_pct）
+    2. 测量物理真实延迟（avg_latency_ms）
+    3. 测量网络抖动（jitter_ms，基于各采样离散差）
+    4. 探测业务端口通畅度（port_open）
+    """
+    is_tcp = protocol.lower() == "tcp" or port in [443, 995, 8443, 1195]
+
+    # 策略 A: TCP 协议多采样测探 (直接以业务握手测得端口、延迟与抖动)
+    if is_tcp:
+        rtts = []
+        lost = 0
+        for _ in range(samples):
+            t0 = time.time()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout_per_sample)
+            err = s.connect_ex((ip, port))
+            duration_ms = (time.time() - t0) * 1000.0
+            s.close()
+            if err == 0:
+                rtts.append(duration_ms)
+            else:
+                lost += 1
+            time.sleep(0.02)
+
+        loss_pct = int((lost / samples) * 100)
+        if len(rtts) > 0:
+            avg_rtt = round(sum(rtts) / len(rtts), 1)
+            diffs = [abs(rtts[i] - rtts[i-1]) for i in range(1, len(rtts))] if len(rtts) > 1 else [0.0]
+            jitter = round(sum(diffs) / len(diffs), 1)
+            return {
+                "is_alive": True,
+                "port_open": True,
+                "avg_latency_ms": max(1, int(avg_rtt)),
+                "jitter_ms": int(jitter),
+                "packet_loss_pct": loss_pct,
+                "method": "tcp_socket"
+            }
+        else:
+            return {
+                "is_alive": False,
+                "port_open": False,
+                "avg_latency_ms": 999,
+                "jitter_ms": 999,
+                "packet_loss_pct": 100,
+                "method": "tcp_socket"
+            }
+
+    # 策略 B: UDP / OpenVPN 协议：ICMP 存活+抖动分析 + UDP 端口探针
+    import platform
+    import subprocess
+    is_win = platform.system().lower() == "windows"
+    cmd = ["ping", "-n" if is_win else "-c", str(samples), "-w" if is_win else "-W", "800", ip]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3.0)
+        out = proc.stdout
+
+        # 解析丢包率
+        loss_m = re.search(r"(\d+)%\s*(?:packet\s*)?loss", out, re.IGNORECASE) or re.search(r"丢失\s*=\s*\d+\s*\((\d+)%\s*丢失\)", out)
+        loss_pct = int(loss_m.group(1)) if loss_m else 100
+
+        # 解析延迟与抖动
+        avg_rtt = 999
+        jitter = 0
+        rtt_m = re.search(r"(?:Average|平均)\s*=\s*(\d+)ms", out)
+        if rtt_m:
+            avg_rtt = int(rtt_m.group(1))
+            min_m = re.search(r"(?:Minimum|最短)\s*=\s*(\d+)ms", out)
+            max_m = re.search(r"(?:Maximum|最长)\s*=\s*(\d+)ms", out)
+            if min_m and max_m:
+                jitter = int(max_m.group(1)) - int(min_m.group(1))
+        else:
+            linux_rtt = re.search(r"rtt\s+min/avg/max/mdev\s*=\s*([\d\.]+)/([\d\.]+)/([\d\.]+)/([\d\.]+)", out)
+            if linux_rtt:
+                avg_rtt = int(float(linux_rtt.group(2)))
+                jitter = int(float(linux_rtt.group(4)))
+
+        is_alive = loss_pct < 100 and avg_rtt < 900
+
+        # UDP 端口通畅度 (校验能否正常向目标 UDP 端口投递 OpenVPN 复位探测包)
+        port_open = False
+        if is_alive:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(0.5)
+                probe_pkt = b"\x38" + os.urandom(8) + b"\x00\x00\x00\x00\x00"
+                s.sendto(probe_pkt, (ip, port))
+                s.close()
+                port_open = True
+            except Exception:
+                port_open = False
+
+        return {
+            "is_alive": is_alive,
+            "port_open": port_open,
+            "avg_latency_ms": max(1, avg_rtt),
+            "jitter_ms": jitter,
+            "packet_loss_pct": loss_pct,
+            "method": "icmp_ping"
+        }
+    except Exception:
+        return {
+            "is_alive": False,
+            "port_open": False,
+            "avg_latency_ms": 999,
+            "jitter_ms": 999,
+            "packet_loss_pct": 100,
+            "method": "error"
+        }
+
 def probe_socket_reachability(ip: str, port: int, protocol: str = "tcp", timeout: float = 1.5) -> Tuple[bool, int]:
     """
     对目标节点端口进行轻量直连网络预检，测量真实 RTT 延迟 (毫秒)。
@@ -1074,6 +1194,7 @@ class PickerEngine:
 
     def __init__(self, aimili: AimiliClient, inspector: IpIntelligenceManager, exp_mgr: NodeExperienceManager, probe_speed_func=None, blacklist: Optional[BlacklistManager] = None):
         self.blacklist = blacklist or BlacklistManager()
+        self.probe_network_func = probe_network_quality
         self.aimili = aimili
         self.inspector = inspector
         self.exp_mgr = exp_mgr
@@ -1342,47 +1463,68 @@ class PickerEngine:
 
                     tested_ips.add(node.ip)
 
-
-
-                    # 1. IP 纯净度与家宽属性检测
-
-
-                    self.current_step = f"[第 {current_round}/{max_rounds} 轮] 正在质检 IP ({idx}/{len(fresh_candidates)}): {node.ip}"
-
-
-                    cached = self.inspector.cache.get(node.ip)
-
-
-                    node.quality = self.inspector.inspect_ip(node.ip, source_mode=source_mode)
-
-
-
-                    if not cached and source_mode != "fallback_only" and not self.inspector._ping0_circuit_broken:
-
-
-                        time.sleep(random.uniform(1.2, 1.8))
-
-
-                    else:
-
-
-                        time.sleep(0.05)
-
-
-
+                    # [关卡 0] 永久黑名单拦截 (无需任何网络探测)
                     if self.blacklist.is_blacklisted(node.ip):
+                        logger.debug(f"🚫 [黑名单跳过] 节点 {node.ip} 处于永久黑名单中，忽略")
                         continue
 
+                    # [关卡 1] 节点存活、真实延迟与网络抖动探测 (Pre-flight Network Quality)
+                    self.current_step = f"[第 {current_round}/{max_rounds} 轮] 正在测活与抖动 ({idx}/{len(fresh_candidates)}): {node.ip}"
+                    net_q = self.probe_network_func(node.ip, node.port, node.protocol)
+
+                    if not net_q.get("is_alive") or net_q.get("packet_loss_pct", 100) >= 100:
+                        logger.warning(f"🚫 [存活淘汰] 节点 {node.ip:<15} 网络不可达/丢包率 100%，已淘汰 (完全规避无谓风控查询)")
+                        continue
+
+                    if net_q.get("jitter_ms", 0) > 150 or net_q.get("packet_loss_pct", 0) > 30:
+                        logger.warning(
+                            f"🚫 [网络不稳] 节点 {node.ip:<15} 网络抖动过大 ({net_q.get('jitter_ms')}ms > 150ms) "
+                            f"或丢包超标 ({net_q.get('packet_loss_pct')}%)，已淘汰"
+                        )
+                        continue
+
+                    # [关卡 2] 业务端口通畅度探测 (Port Connectivity)
+                    if not net_q.get("port_open"):
+                        logger.warning(f"🚫 [端口关闭] 节点 {node.ip}:{node.port} ({node.protocol}) 端口不通畅，已淘汰")
+                        continue
+
+                    node.latency_ms = net_q.get("avg_latency_ms", node.latency_ms)
+                    node.real_latency_ms = node.latency_ms
+                    node.jitter_ms = net_q.get("jitter_ms", 0)
+                    node.packet_loss_pct = net_q.get("packet_loss_pct", 0)
+                    logger.info(
+                        f"🌐 [存活达标] 节点 {node.ip:<15} 连通性合格 "
+                        f"(延迟: {node.latency_ms}ms, 抖动: {node.jitter_ms}ms, 丢包: {node.packet_loss_pct}%, 端口: {node.port}通畅)"
+                    )
+
+                    # [关卡 3] IP 纯净度与家庭宽带质检 (IP Risk & Intelligence Inspection)
+                    # 关键重构：只有前面存活、抖动与端口完全达标的健康节点，才启动风控查询，杜绝消耗 Ping0/IP-API 额度！
+                    self.current_step = f"[第 {current_round}/{max_rounds} 轮] 正在质检风控 ({idx}/{len(fresh_candidates)}): {node.ip}"
+                    cached = self.inspector.cache.get(node.ip)
+                    node.quality = self.inspector.inspect_ip(node.ip, source_mode=source_mode)
+
+                    if not cached and source_mode != "fallback_only" and not self.inspector._ping0_circuit_broken:
+                        time.sleep(random.uniform(1.2, 1.8))
+                    else:
+                        time.sleep(0.05)
+
                     q = node.quality
-                    if not q or q.risk_score >= 10:
-                        score_val = q.risk_score if q else 100
-                        isp_val = q.isp if q else ""
+                    try:
+                        risk_val = int(getattr(q, "risk_score", 100) or 100) if q else 100
+                    except Exception:
+                        risk_val = 100
+
+                    if risk_val >= 10:
+                        score_val = risk_val
+                        isp_val = getattr(q, "isp", "") if q else ""
                         self.blacklist.add(node.ip, reason=f"纯净度/风控超标 ({score_val}% >= 10%)", risk_score=score_val, isp=isp_val)
                         logger.warning(f"🚫 [永久拉黑] 节点 {node.ip:<15} 风控超标 ({score_val}% ≥ 10%)，已加入永久黑名单，永不选用！")
                         continue
 
-                    if not q.is_residential or q.risk_score > max_risk:
+                    if not q or not getattr(q, "is_residential", False) or risk_val > max_risk:
                         continue
+
+                    logger.info(f"🔍 [风控达标] 节点 {node.ip:<15} (类型: {getattr(q, 'ip_type', '未知')}, 风控: {risk_val}%, 运营商: {getattr(q, 'isp', '')}) 初筛通过！")
 
 
 
@@ -1711,6 +1853,8 @@ class PickerEngine:
                         "port": n.port,
                         "country": n.country,
                         "latency_ms": n.latency_ms,
+                        "jitter_ms": getattr(n, "jitter_ms", 0),
+                        "packet_loss_pct": getattr(n, "packet_loss_pct", 0),
                         "speed_mbps": n.speed_mbps,
                         "speed_bps": n.speed_bps,
                         "rank_score": n.rank_score,
@@ -1983,7 +2127,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <th>风控评分</th>
             <th>共享人数</th>
             <th>原生 IP</th>
-            <th>实测延迟</th>
+            <th>实测延迟 (抖动)</th>
           </tr>
         </thead>
         <tbody id="tblPickedNodes">
@@ -2050,7 +2194,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <td><span class="tag-pure">${n.risk_score}% (${n.risk_label || '极度纯净'})</span></td>
         <td>${escapeHtml(n.shared_users || '未知')}</td>
         <td>${n.is_native ? '✅ 原生' : '广播'}</td>
-        <td>${n.latency_ms} ms</td>
+        <td>${n.latency_ms} ms ${n.jitter_ms ? `(±${n.jitter_ms}ms)` : ''}</td>
       </tr>
     `).join('');
   }

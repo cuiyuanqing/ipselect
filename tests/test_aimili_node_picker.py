@@ -81,6 +81,14 @@ class TestPickerEngineMultiRound(unittest.TestCase):
             exp_mgr=self.mock_exp
         )
         self.engine.blacklist.records = {}
+        self.engine.probe_network_func = lambda ip, port, protocol: {
+            "is_alive": True,
+            "port_open": True,
+            "avg_latency_ms": 30,
+            "jitter_ms": 5,
+            "packet_loss_pct": 0,
+            "method": "mock"
+        }
 
     def test_real_speed_filtering_rejects_under_5mbps(self):
         """测试实测速率低于 5 Mbps 的节点被淘汰，达到或超过 5 Mbps 的节点入选"""
@@ -344,6 +352,14 @@ class TestBlacklistAndHandshakeReliability(unittest.TestCase):
             exp_mgr=self.mock_exp,
             blacklist=self.bl
         )
+        self.engine.probe_network_func = lambda ip, port, protocol: {
+            "is_alive": True,
+            "port_open": True,
+            "avg_latency_ms": 30,
+            "jitter_ms": 5,
+            "packet_loss_pct": 0,
+            "method": "mock"
+        }
         self.engine.probe_speed_func = lambda proxy_port, proxy_host, max_duration: 10.0
 
     def tearDown(self):
@@ -437,6 +453,154 @@ class TestBlacklistAndHandshakeReliability(unittest.TestCase):
 
         # 必须判定为 False（未就绪）
         self.assertFalse(ready)
+
+
+class TestPipelineExecutionOrder(unittest.TestCase):
+    """测试漏斗型初筛顺序：存活/抖动 -> 端口通畅 -> 风控质检 -> 真实测速"""
+
+    def setUp(self):
+        self.mock_aimili = MagicMock(spec=AimiliClient)
+        self.mock_aimili.logged_in = True
+        self.mock_aimili.host = "127.0.0.1"
+        self.mock_aimili.proxy_port = 7928
+        self.mock_aimili.base_url = "http://127.0.0.1:8501"
+        self.mock_aimili.login.return_value = True
+        self.mock_aimili.get_current_favorites.return_value = []
+        self.mock_aimili.set_active_node.return_value = True
+        self.mock_aimili.toggle_favorite.return_value = True
+        self.mock_aimili.refresh_nodes.return_value = True
+
+        self.mock_inspector = MagicMock(spec=IpIntelligenceManager)
+        self.mock_inspector.cache = {}
+        self.mock_inspector._ping0_circuit_broken = False
+        self.mock_inspector.reset_circuit_breaker.return_value = None
+
+        self.mock_exp = MagicMock(spec=NodeExperienceManager)
+        self.mock_exp.get_experience_bonus.return_value = 0.0
+        exp_sample = NodeExperience(ip="test", consecutive_passes=1, reputation_score=80.0)
+        self.mock_exp.get_or_create.return_value = exp_sample
+        self.mock_exp.record_pass.return_value = exp_sample
+        self.mock_exp.record_fail.return_value = exp_sample
+
+        self.engine = PickerEngine(
+            aimili=self.mock_aimili,
+            inspector=self.mock_inspector,
+            exp_mgr=self.mock_exp
+        )
+        self.engine.blacklist.records = {}
+        self.engine.probe_network_func = lambda ip, port, protocol: {
+            "is_alive": True,
+            "port_open": True,
+            "avg_latency_ms": 30,
+            "jitter_ms": 5,
+            "packet_loss_pct": 0,
+            "method": "mock"
+        }
+        self.engine.probe_network_func = lambda ip, port, protocol: {
+            "is_alive": True,
+            "port_open": True,
+            "avg_latency_ms": 30,
+            "jitter_ms": 5,
+            "packet_loss_pct": 0,
+            "method": "mock"
+        }
+        self.engine.probe_speed_func = lambda proxy_port, proxy_host, max_duration: 10.0
+
+    def test_dead_host_rejected_before_ip_risk_inspection(self):
+        """丢包率100%/网络不可达的死节点，必须在风控质检前被淘汰，不得调用 inspect_ip"""
+        dead_node = CandidateNode(id="n_dead", ip="192.0.2.1", port=1194, country="JP", protocol="openvpn", latency_ms=50)
+        self.mock_aimili.fetch_scoped_nodes.return_value = [dead_node]
+
+        # 模拟 probe_network_func 检测为死节点
+        fake_probe = MagicMock(return_value={
+            "is_alive": False,
+            "port_open": False,
+            "avg_latency_ms": 999,
+            "jitter_ms": 999,
+            "packet_loss_pct": 100,
+            "method": "icmp_ping"
+        })
+        self.engine.probe_network_func = fake_probe
+
+        with patch("time.sleep", return_value=None):
+            picked = self.engine.run_screening(country="JP", top_n=5, max_rounds=1)
+
+        fake_probe.assert_called_once()
+        # 核心断言：inspect_ip 绝对不应被调用！
+        self.mock_inspector.inspect_ip.assert_not_called()
+        self.assertEqual(len(picked), 0)
+
+    def test_port_closed_node_rejected_before_ip_risk_inspection(self):
+        """存活但端口关闭/不通畅的节点，必须在风控质检前淘汰，不得调用 inspect_ip"""
+        closed_node = CandidateNode(id="n_closed", ip="10.0.0.1", port=443, country="JP", protocol="tcp", latency_ms=30)
+        self.mock_aimili.fetch_scoped_nodes.return_value = [closed_node]
+
+        fake_probe = MagicMock(return_value={
+            "is_alive": True,
+            "port_open": False,  # 端口不通
+            "avg_latency_ms": 40,
+            "jitter_ms": 5,
+            "packet_loss_pct": 0,
+            "method": "tcp_socket"
+        })
+        self.engine.probe_network_func = fake_probe
+
+        with patch("time.sleep", return_value=None):
+            picked = self.engine.run_screening(country="JP", top_n=5, max_rounds=1)
+
+        fake_probe.assert_called_once()
+        self.mock_inspector.inspect_ip.assert_not_called()
+        self.assertEqual(len(picked), 0)
+
+    def test_high_jitter_node_rejected_before_ip_risk_inspection(self):
+        """网络抖动过大 (>150ms) 的不稳定节点，必须在风控前被淘汰，不得调用 inspect_ip"""
+        jitter_node = CandidateNode(id="n_jitter", ip="10.0.0.2", port=1194, country="JP", protocol="openvpn", latency_ms=40)
+        self.mock_aimili.fetch_scoped_nodes.return_value = [jitter_node]
+
+        fake_probe = MagicMock(return_value={
+            "is_alive": True,
+            "port_open": True,
+            "avg_latency_ms": 60,
+            "jitter_ms": 220,  # 极端抖动
+            "packet_loss_pct": 10,
+            "method": "icmp_ping"
+        })
+        self.engine.probe_network_func = fake_probe
+
+        with patch("time.sleep", return_value=None):
+            picked = self.engine.run_screening(country="JP", top_n=5, max_rounds=1)
+
+        fake_probe.assert_called_once()
+        self.mock_inspector.inspect_ip.assert_not_called()
+        self.assertEqual(len(picked), 0)
+
+    def test_healthy_node_progresses_through_full_funnel(self):
+        """存活、低抖动且端口通畅的节点，正常进入风控质检并最终入选"""
+        good_node = CandidateNode(id="n_good", ip="164.70.137.225", port=1194, country="JP", protocol="openvpn", latency_ms=40)
+        self.mock_aimili.fetch_scoped_nodes.return_value = [good_node]
+
+        fake_probe = MagicMock(return_value={
+            "is_alive": True,
+            "port_open": True,
+            "avg_latency_ms": 35,
+            "jitter_ms": 6,
+            "packet_loss_pct": 0,
+            "method": "icmp_ping"
+        })
+        self.engine.probe_network_func = fake_probe
+        self.mock_inspector.inspect_ip.return_value = IpQuality(
+            ip="164.70.137.225", is_residential=True, risk_score=5, ip_type="家庭宽带 IP", shared_users="1 - 10"
+        )
+
+        with patch("time.sleep", return_value=None):
+            picked = self.engine.run_screening(country="JP", top_n=5, min_speed_mbps=5.0, max_rounds=1)
+
+        fake_probe.assert_called_once()
+        self.mock_inspector.inspect_ip.assert_called_once_with("164.70.137.225", source_mode="auto")
+        self.assertEqual(len(picked), 1)
+        self.assertEqual(picked[0].ip, "164.70.137.225")
+        self.assertEqual(picked[0].latency_ms, 35)
+        self.assertEqual(picked[0].jitter_ms, 6)
 
 
 if __name__ == "__main__":
