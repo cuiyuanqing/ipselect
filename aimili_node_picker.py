@@ -99,6 +99,7 @@ CACHE_FILE = os.path.join(DATA_DIR, "ip_intel_cache.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "picker_config.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "latest_picked_nodes.json")
 EXPERIENCE_FILE = os.path.join(DATA_DIR, "node_experience.json")
+BLACKLIST_FILE = os.path.join(DATA_DIR, "ip_blacklist.json")
 
 # ==============================================================================
 # 2. 数据结构定义
@@ -166,6 +167,8 @@ class CandidateNode:
     experience: Optional[NodeExperience] = None
     is_inherited: bool = False
     rank_score: float = 9999.0
+    handshake_ok: bool = False
+    real_latency_ms: Optional[int] = None
 
     @property
     def canonical_fav_id(self) -> str:
@@ -260,6 +263,68 @@ class NodeExperienceManager:
         pass_bonus = min(35.0, rec.consecutive_passes * 5.0)
         rep_bonus = (rec.reputation_score - 80.0) * 0.4 if rec.reputation_score > 80.0 else 0.0
         return pass_bonus + rep_bonus
+
+# ==============================================================================
+# ==============================================================================
+# 3.5. IP 永久黑名单管理器 (Blacklist Manager)
+# ==============================================================================
+
+class BlacklistManager:
+    """管理永久黑名单 IP，对风控>=10%或违规节点永久拉黑，永不录用"""
+
+    def __init__(self, blacklist_file: str = BLACKLIST_FILE):
+        self.blacklist_file = blacklist_file
+        self.records: Dict[str, Dict[str, Any]] = {}
+        self._load()
+
+    def _load(self):
+        if os.path.isfile(self.blacklist_file):
+            try:
+                with open(self.blacklist_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.records = data.get("ips", {})
+                    logger.info(f"🚫 成功加载 IP 永久黑名单库共 {len(self.records)} 条")
+            except Exception as e:
+                logger.warning(f"⚠️ 读取黑名单文件异常: {e}")
+
+    def save(self):
+        try:
+            with open(self.blacklist_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "count": len(self.records),
+                    "ips": self.records
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"❌ 保存黑名单文件异常: {e}")
+
+    def is_blacklisted(self, ip: str) -> bool:
+        return ip in self.records
+
+    def add(self, ip: str, reason: str, risk_score: int = 100, isp: str = ""):
+        if ip not in self.records:
+            self.records[ip] = {
+                "reason": reason,
+                "risk_score": risk_score,
+                "isp": isp,
+                "added_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            self.save()
+            logger.warning(f"🚫 [永久拉黑] 节点 IP {ip:<15} (风控 {risk_score}%) 已永久拉黑: {reason}")
+
+    def remove(self, ip: str) -> bool:
+        if ip in self.records:
+            del self.records[ip]
+            self.save()
+            return True
+        return False
+
+    def get_all(self) -> Dict[str, Any]:
+        return dict(self.records)
+
+    @property
+    def count(self) -> int:
+        return len(self.records)
 
 # ==============================================================================
 # 4. AimiliVPN 本地客户端 (与 127.0.0.1:8501 交互)
@@ -479,7 +544,8 @@ class AimiliClient:
                 time.sleep(0.8)
                 continue
             active_id = str(st.get("active_openvpn_node_id") or "")
-            tunnel_ready = bool(st.get("tunnel_ready") or st.get("proxy_ready"))
+            # 严格握手验证：必须是 OpenVPN 隧道真正就绪，绝不能被本地 proxy_ready 敷衍
+            tunnel_ready = bool(st.get("tunnel_ready"))
             if tunnel_ready and (clean_id in active_id or active_id in clean_id or not clean_id):
                 return True
             if not st.get("is_connecting") and not tunnel_ready:
@@ -932,6 +998,28 @@ TEST_SPEED_URLS = [
     "http://speedtest.tele2.net/1MB.zip"
 ]
 
+def probe_socket_reachability(ip: str, port: int, protocol: str = "tcp", timeout: float = 1.5) -> Tuple[bool, int]:
+    """
+    对目标节点端口进行轻量直连网络预检，测量真实 RTT 延迟 (毫秒)。
+    若端口不可达（连接拒绝、无响应超时），提前淘汰死节点，避免耗费后台切换开销。
+    """
+    t0 = time.time()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        err = sock.connect_ex((ip, port))
+        rtt = int((time.time() - t0) * 1000)
+        sock.close()
+        if err == 0:
+            return True, max(1, rtt)
+        if protocol.lower() == "tcp":
+            return False, 999
+        return True, max(1, rtt)
+    except Exception:
+        if protocol.lower() == "tcp":
+            return False, 999
+        return True, 999
+
 def probe_real_download_speed(
     proxy_port: int = 7928,
     proxy_host: str = "127.0.0.1",
@@ -984,7 +1072,8 @@ def probe_real_download_speed(
 class PickerEngine:
     """优选排程核心"""
 
-    def __init__(self, aimili: AimiliClient, inspector: IpIntelligenceManager, exp_mgr: NodeExperienceManager, probe_speed_func=None):
+    def __init__(self, aimili: AimiliClient, inspector: IpIntelligenceManager, exp_mgr: NodeExperienceManager, probe_speed_func=None, blacklist: Optional[BlacklistManager] = None):
+        self.blacklist = blacklist or BlacklistManager()
         self.aimili = aimili
         self.inspector = inspector
         self.exp_mgr = exp_mgr
@@ -1037,7 +1126,9 @@ class PickerEngine:
                 return []
 
             total_candidates = len(candidates)
-            logger.info(f"📡 Aimili 在库 [{country}] 地区存活候选节点共 {total_candidates} 个")
+            logger.info(f"📡 Aimili 在库 [{country}] 地区存活候选节点共 {total_candidates} 个 (当前永久黑名单: {self.blacklist.count} 个)")
+            # 过滤处于永久黑名单中的候选节点
+            candidates = [c for c in candidates if not self.blacklist.is_blacklisted(c.ip)]
 
             # 建立候选节点快速索引表
             cand_by_fav_id: Dict[str, CandidateNode] = {}
@@ -1083,6 +1174,13 @@ class PickerEngine:
                     q = node.quality
                     exp = self.exp_mgr.get_or_create(node.ip, node.canonical_fav_id, q.isp if q else "")
                     risk_limit = (max_risk + 3) if getattr(exp, "consecutive_passes", 0) >= 5 else max_risk
+
+                    if q and q.risk_score >= 10:
+                        self.blacklist.add(node.ip, reason=f"纯净度/风控超标 ({q.risk_score}% >= 10%)", risk_score=q.risk_score, isp=q.isp)
+                        logger.warning(f"🚫 [存量淘汰并拉黑] 收藏节点 {node.ip:<15} 风控超标 ({q.risk_score}% ≥ 10%)，永久拉黑并移出收藏")
+                        self.exp_mgr.record_fail(node.ip, f"风控超标永久拉黑({q.risk_score}%>=10%)")
+                        live_evicted_fav_ids.append(fav_id)
+                        continue
 
                     if q and q.is_residential and q.risk_score <= risk_limit:
                         # 存量节点真实测速校验 (若低于门槛则淘汰)
@@ -1272,14 +1370,19 @@ class PickerEngine:
 
 
 
-                    q = node.quality
-
-
-                    if not q or not q.is_residential or q.risk_score > max_risk:
-
-
+                    if self.blacklist.is_blacklisted(node.ip):
                         continue
-                    evaluated_candidates.append(node)
+
+                    q = node.quality
+                    if not q or q.risk_score >= 10:
+                        score_val = q.risk_score if q else 100
+                        isp_val = q.isp if q else ""
+                        self.blacklist.add(node.ip, reason=f"纯净度/风控超标 ({score_val}% >= 10%)", risk_score=score_val, isp=isp_val)
+                        logger.warning(f"🚫 [永久拉黑] 节点 {node.ip:<15} 风控超标 ({score_val}% ≥ 10%)，已加入永久黑名单，永不选用！")
+                        continue
+
+                    if not q.is_residential or q.risk_score > max_risk:
+                        continue
 
 
 
@@ -1297,8 +1400,11 @@ class PickerEngine:
 
                         connected = self.aimili.set_active_node(node, timeout=12)
                         if not connected:
-                            logger.warning(f"⚠️ 无法切换到活动节点 {node.ip} (隧道建连失败或Aimili被占用)，跳过测速")
+                            logger.warning(f"❌ [握手失败] 无法切换到活动节点 {node.ip} (OpenVPN握手失败或Aimili正忙)，标记握手未通")
+                            node.handshake_ok = False
+                            self.exp_mgr.record_fail(node.ip, "OpenVPN握手或建连失败")
                             continue
+
                         time.sleep(1.2)
 
 
@@ -1318,9 +1424,16 @@ class PickerEngine:
 
 
                         node.speed_mbps = real_speed
-
-
                         node.speed_bps = int(real_speed * 1e6)
+
+                        if real_speed <= 0.0:
+                            logger.warning(f"❌ [出站不通] 节点 {node.ip:<15} 虽已建立隧道但代理出站流量为 0.0 Mbps，握手未真正打通，已淘汰")
+                            node.handshake_ok = False
+                            self.exp_mgr.record_fail(node.ip, "出站流量不通(0.0Mbps)")
+                            continue
+
+                        node.handshake_ok = True
+                        evaluated_candidates.append(node)
 
 
 
@@ -1401,9 +1514,10 @@ class PickerEngine:
 
 
 
-                    exp_bonus = self.exp_mgr.get_experience_bonus(node.ip)
-
-
+                    try:
+                        exp_bonus = float(self.exp_mgr.get_experience_bonus(node.ip))
+                    except Exception:
+                        exp_bonus = 0.0
                     score -= exp_bonus
 
 
@@ -1469,37 +1583,50 @@ class PickerEngine:
 
 
 
-            # 核心保底策略：确保收藏池至少有 5 个存活节点 (若达标节点不足 5 个，降级选取最优的 5 个补齐，绝不为空)
+            # 核心保底策略：当3轮后无任何达标节点时，降级选取最优的存活节点保底 (必须真正握手成功且有流量)
             SAFETY_FLOOR = min(5, top_n)
-            if len(picked_nodes) == 0 and evaluated_candidates:
-                logger.warning(
-                    f"🚨 [触发安全保底降级机制] {rounds_run} 轮筛选后实测达标仅 {len(picked_nodes)} 个 (不足最低 {SAFETY_FLOOR} 个保底要求)，"
-                    f"启动最优节点降级补齐，确保出站链路绝不断流！"
-                )
+            if len(picked_nodes) == 0:
                 picked_ips = {n.ip for n in picked_nodes}
                 picked_ids = {n.canonical_fav_id for n in picked_nodes}
-                fallback_candidates = [
+                # 极其严格：只有真正握手成功 (handshake_ok=True 且 speed_mbps > 0)，且非黑名单、风控严格 < 10% 的节点才允许保底！
+                valid_fallbacks = [
                     c for c in evaluated_candidates
-                    if c.ip not in picked_ips and c.canonical_fav_id not in picked_ids
+                    if getattr(c, "handshake_ok", False) and c.speed_mbps > 0
+                    and c.ip not in picked_ips and c.canonical_fav_id not in picked_ids
+                    and not self.blacklist.is_blacklisted(c.ip)
+                    and (c.quality and c.quality.risk_score < 10)
                 ]
-                # 排序规则：实测流速高 > 综合排名分低 > 延迟低
-                fallback_candidates.sort(key=lambda n: (-n.speed_mbps, n.rank_score, n.latency_ms))
-                needed_floor = SAFETY_FLOOR - len(picked_nodes)
-                fallback_picked = fallback_candidates[:needed_floor]
+                seen_fb_ips = set()
+                deduped_fallbacks = []
+                for c in valid_fallbacks:
+                    if c.ip not in seen_fb_ips and c.ip not in picked_ips:
+                        seen_fb_ips.add(c.ip)
+                        deduped_fallbacks.append(c)
 
-                for fn in fallback_picked:
-                    exp = self.exp_mgr.record_pass(
-                        fn.ip, fn.canonical_fav_id, fn.quality.isp if fn.quality else "", fn.quality.risk_score if fn.quality else 10, fn.latency_ms
+                if deduped_fallbacks:
+                    logger.warning(
+                        f"🚨 [触发安全保底降级机制] {rounds_run} 轮筛选后实测无任何节点达到 {min_speed_mbps} Mbps，"
+                        f"从真正握手成功的候选池中选取前 {min(SAFETY_FLOOR, len(deduped_fallbacks))} 个最优节点保底！"
                     )
-                    fn.experience = exp
-                    fn.is_inherited = False
-                    speed_str = f"{fn.speed_mbps} Mbps" if fn.speed_mbps > 0 else "未达5Mbps"
-                    logger.info(
-                        f"🛡️ [降级保底入选] 节点 {fn.ip:<15} (实测: {speed_str}, 风控: {fn.quality.risk_score if fn.quality else 10}%, 延迟: {fn.latency_ms}ms) -> "
-                        f"保底补充入选成功 (当前总计: {len(picked_nodes) + 1}/{SAFETY_FLOOR})"
-                    )
-                    picked_nodes.append(fn)
-                    all_newly_picked.append(fn)
+                    deduped_fallbacks.sort(key=lambda n: (-n.speed_mbps, float(getattr(n, "rank_score", 9999.0) or 9999.0), n.latency_ms))
+                    needed_floor = SAFETY_FLOOR - len(picked_nodes)
+                    fallback_picked = deduped_fallbacks[:needed_floor]
+
+                    for fn in fallback_picked:
+                        exp = self.exp_mgr.record_pass(
+                            fn.ip, fn.canonical_fav_id, fn.quality.isp if fn.quality else "", fn.quality.risk_score if fn.quality else 10, fn.latency_ms
+                        )
+                        fn.experience = exp
+                        fn.is_inherited = False
+                        speed_str = f"{fn.speed_mbps} Mbps" if fn.speed_mbps > 0 else "未达5Mbps"
+                        logger.info(
+                            f"🛡️ [降级保底入选] 节点 {fn.ip:<15} (实测: {speed_str}, 风控: {fn.quality.risk_score if fn.quality else 10}%, 延迟: {fn.latency_ms}ms) -> "
+                            f"保底补充入选成功 (当前总计: {len(picked_nodes) + 1}/{SAFETY_FLOOR})"
+                        )
+                        picked_nodes.append(fn)
+                        all_newly_picked.append(fn)
+                else:
+                    logger.error("🚨 3 轮筛选未找到任何能成功握手且有出站流量的节点！拒绝将死节点写入收藏库。")
 
             # 紧急熔断：如果依然没有节点且存量收藏不为空，拒绝清空底层配置，保留旧收藏
             if not picked_nodes and current_fav_ids:
@@ -1508,7 +1635,10 @@ class PickerEngine:
             else:
                 final_target_fav_ids = [n.canonical_fav_id for n in picked_nodes]
 
-            picked_nodes.sort(key=lambda n: n.rank_score)
+            try:
+                picked_nodes.sort(key=lambda n: float(getattr(n, "rank_score", 9999.0) or 9999.0))
+            except Exception:
+                pass
 
             # 4. 阶段三：同步落库 Aimili 收藏夹
             total_evicted_count = len(live_evicted_fav_ids) + len(dead_evicted_fav_ids)

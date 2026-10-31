@@ -16,6 +16,7 @@ if BASE_DIR not in sys.path:
 
 from aimili_node_picker import (
     AimiliClient,
+    BlacklistManager,
     CandidateNode,
     IpIntelligenceManager,
     IpQuality,
@@ -79,6 +80,7 @@ class TestPickerEngineMultiRound(unittest.TestCase):
             inspector=self.mock_inspector,
             exp_mgr=self.mock_exp
         )
+        self.engine.blacklist.records = {}
 
     def test_real_speed_filtering_rejects_under_5mbps(self):
         """测试实测速率低于 5 Mbps 的节点被淘汰，达到或超过 5 Mbps 的节点入选"""
@@ -87,7 +89,7 @@ class TestPickerEngineMultiRound(unittest.TestCase):
 
         self.mock_aimili.fetch_scoped_nodes.return_value = [node_fast, node_slow]
         self.mock_inspector.inspect_ip.return_value = IpQuality(
-            ip="test", is_residential=True, risk_score=10, ip_type="家庭宽带 IP", shared_users="1 - 10"
+            ip="test", is_residential=True, risk_score=5, ip_type="家庭宽带 IP", shared_users="1 - 10"
         )
 
         # 模拟 node_fast 实测 8.5 Mbps，node_slow 实测 3.2 Mbps
@@ -300,6 +302,141 @@ class TestWebUiAndClientRobustness(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertGreaterEqual(call_count, 2)
+
+
+class TestBlacklistAndHandshakeReliability(unittest.TestCase):
+    """测试黑名单(风控>=10%永久拉黑)与真实握手质量把关"""
+
+    def setUp(self):
+        self.tmp_bl_file = os.path.join(BASE_DIR, "tests", "tmp_blacklist.json")
+        if os.path.exists(self.tmp_bl_file):
+            os.remove(self.tmp_bl_file)
+        self.bl = BlacklistManager(blacklist_file=self.tmp_bl_file)
+
+        self.mock_aimili = MagicMock(spec=AimiliClient)
+        self.mock_aimili.logged_in = True
+        self.mock_aimili.host = "127.0.0.1"
+        self.mock_aimili.proxy_port = 7928
+        self.mock_aimili.base_url = "http://127.0.0.1:8501"
+        self.mock_aimili.login.return_value = True
+        self.mock_aimili.get_current_favorites.return_value = []
+        self.mock_aimili.set_active_node.return_value = True
+        self.mock_aimili.toggle_favorite.return_value = True
+        self.mock_aimili.refresh_nodes.return_value = True
+
+        self.mock_inspector = MagicMock(spec=IpIntelligenceManager)
+        self.mock_inspector.cache = {}
+        self.mock_inspector._ping0_circuit_broken = False
+        self.mock_inspector.reset_circuit_breaker.return_value = None
+
+        self.mock_exp = MagicMock(spec=NodeExperienceManager)
+        self.mock_exp.records = {}
+        sample_exp = MagicMock(spec=NodeExperience)
+        sample_exp.consecutive_passes = 1
+        sample_exp.reputation_score = 80.0
+        sample_exp.level_label = "🌱 Lv.1 新晋新秀"
+        self.mock_exp.record_pass.return_value = sample_exp
+        self.mock_exp.record_fail.return_value = sample_exp
+
+        self.engine = PickerEngine(
+            aimili=self.mock_aimili,
+            inspector=self.mock_inspector,
+            exp_mgr=self.mock_exp,
+            blacklist=self.bl
+        )
+        self.engine.probe_speed_func = lambda proxy_port, proxy_host, max_duration: 10.0
+
+    def tearDown(self):
+        if os.path.exists(self.tmp_bl_file):
+            try:
+                os.remove(self.tmp_bl_file)
+            except Exception:
+                pass
+
+    def test_risk_score_ge_10_is_blacklisted_and_never_picked(self):
+        """纯净度/风控值 >= 10 的节点必须直接拉黑且永不入选，即使速率极高"""
+        # node1: risk 12% (>=10, 必须拉黑淘汰)
+        # node2: risk 5% (<10, 优质家宽通过)
+        node_dirty = CandidateNode(id="n_dirty", ip="219.100.37.24", port=1194, country="JP", protocol="openvpn", latency_ms=30)
+        node_clean = CandidateNode(id="n_clean", ip="164.70.137.225", port=1194, country="JP", protocol="openvpn", latency_ms=35)
+
+        self.mock_aimili.fetch_scoped_nodes.return_value = [node_dirty, node_clean]
+
+        def fake_inspect(ip, source_mode="auto"):
+            if ip == "219.100.37.24":
+                return IpQuality(ip=ip, is_residential=True, risk_score=12, ip_type="住宅/商业宽带", shared_users="1 - 10")
+            return IpQuality(ip=ip, is_residential=True, risk_score=5, ip_type="家庭宽带 IP", shared_users="1 - 10")
+
+        self.mock_inspector.inspect_ip.side_effect = fake_inspect
+
+        with patch("time.sleep", return_value=None):
+            picked = self.engine.run_screening(
+                country="JP",
+                max_risk=15, # 即使入参设为15，硬性黑名单规则仍必须执行
+                min_speed_mbps=5.0,
+                top_n=5,
+                inherit_existing=False,
+                max_rounds=1
+            )
+
+        # 验证 dirty 节点被永久拉黑并持久化
+        self.assertTrue(self.bl.is_blacklisted("219.100.37.24"))
+        self.assertFalse(self.bl.is_blacklisted("164.70.137.225"))
+
+        picked_ips = [n.ip for n in picked]
+        self.assertIn("164.70.137.225", picked_ips)
+        self.assertNotIn("219.100.37.24", picked_ips)
+
+    def test_pre_existing_blacklisted_nodes_are_skipped_without_inspection(self):
+        """已被拉黑的节点在候选扫描时直接跳过，不再消耗网络查询与测试"""
+        self.bl.add("1.2.3.4", reason="历史风控超标 (12%)", risk_score=12)
+
+        node_bl = CandidateNode(id="n_bl", ip="1.2.3.4", port=1194, country="JP", protocol="openvpn", latency_ms=30)
+        self.mock_aimili.fetch_scoped_nodes.return_value = [node_bl]
+
+        with patch("time.sleep", return_value=None):
+            picked = self.engine.run_screening(country="JP", top_n=5, max_rounds=1)
+
+        self.mock_inspector.inspect_ip.assert_not_called()
+        self.assertEqual(len(picked), 0)
+
+    def test_handshake_failed_dead_nodes_excluded_from_fallback(self):
+        """握手失败/未就绪的节点不得进入保底池，绝不将死节点写入收藏夹"""
+        dead_node = CandidateNode(id="n_dead", ip="10.0.0.99", port=1194, country="JP", protocol="openvpn", latency_ms=40)
+        self.mock_aimili.fetch_scoped_nodes.return_value = [dead_node]
+        self.mock_inspector.inspect_ip.return_value = IpQuality(
+            ip="10.0.0.99", is_residential=True, risk_score=5, ip_type="家庭宽带 IP", shared_users="1 - 10"
+        )
+
+        # 模拟该节点 OpenVPN 握手超时建连失败 (set_active_node 返回 False)
+        self.mock_aimili.set_active_node.return_value = False
+
+        with patch("time.sleep", return_value=None):
+            picked = self.engine.run_screening(country="JP", top_n=5, min_speed_mbps=5.0, max_rounds=1)
+
+        # 即使触发生存保底，也绝不能选入死节点！
+        self.assertEqual(len(picked), 0)
+
+    def test_tunnel_ready_strictness(self):
+        """wait_for_tunnel_ready 必须严格校验 tunnel_ready，不能被 proxy_ready 糊弄"""
+        client = AimiliClient(auth_file="/nonexistent/ui_auth.json")
+        client.logged_in = True
+
+        # 状态中 proxy_ready 为 True 但 tunnel_ready 为 False（即代理在跑但OpenVPN根本没连上）
+        fake_state = {
+            "is_connecting": False,
+            "tunnel_ready": False,
+            "proxy_ready": True,
+            "active_openvpn_node_id": "test_node_id",
+            "last_check_message": "TLS Key Negotiation failed"
+        }
+        client.get_state = MagicMock(return_value=fake_state)
+
+        with patch("time.sleep", return_value=None):
+            ready = client.wait_for_tunnel_ready("test_node_id", timeout=0.1)
+
+        # 必须判定为 False（未就绪）
+        self.assertFalse(ready)
 
 
 if __name__ == "__main__":
