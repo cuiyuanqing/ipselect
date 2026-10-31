@@ -274,11 +274,13 @@ class AimiliClient:
         username: Optional[str] = None,
         password: Optional[str] = None,
         secret_path: Optional[str] = None,
-        port: Optional[int] = None
+        port: Optional[int] = None,
+        proxy_port: Optional[int] = None
     ):
         self.auth_file = auth_file
         self.host = "127.0.0.1"
         self.port = port or 8501
+        self.proxy_port = proxy_port or 7928
         self.username = username or "admin"
         self.password = password or ""
         self.secret_path = secret_path or ""
@@ -287,9 +289,9 @@ class AimiliClient:
         self.logged_in = False
         self._working_base_url: Optional[str] = None
 
-        self._load_auth(username=username, password=password, secret_path=secret_path, port=port)
+        self._load_auth(username=username, password=password, secret_path=secret_path, port=port, proxy_port=proxy_port)
 
-    def _load_auth(self, username=None, password=None, secret_path=None, port=None):
+    def _load_auth(self, username=None, password=None, secret_path=None, port=None, proxy_port=None):
         """读取本地 Aimili 密码与配置"""
         if os.path.isfile(self.auth_file):
             try:
@@ -298,13 +300,15 @@ class AimiliClient:
                     self.host = data.get("host", "127.0.0.1")
                     if not port:
                         self.port = int(data.get("port", 8501))
+                    if not proxy_port:
+                        self.proxy_port = int(data.get("proxy_port", 7928))
                     if not username:
                         self.username = data.get("username", "admin")
                     if not password:
                         self.password = data.get("password", "")
                     if not secret_path:
                         self.secret_path = data.get("secret_path", "")
-                    logger.info(f"🔑 成功从 [{self.auth_file}] 加载 Aimili 认证凭据 (用户: {self.username}, 端口: {self.port}, 安全后缀: {self.secret_path})")
+                    logger.info(f"🔑 成功从 [{self.auth_file}] 加载 Aimili 认证凭据 (用户: {self.username}, 端口: {self.port}, 代理端口: {self.proxy_port}, 安全后缀: {self.secret_path})")
                     return
             except Exception as e:
                 logger.warning(f"⚠️ 解析 {self.auth_file} 失败: {e}，将使用命令行/默认参数")
@@ -494,6 +498,25 @@ class AimiliClient:
                 return bool(res.get("ok"))
         except Exception as e:
             logger.warning(f"⚠️ 移除旧收藏 [{fav_id}] 异常: {e}")
+            return False
+
+    def refresh_nodes(self, country: str = "JP", timeout: int = 15) -> bool:
+        """向 Aimili 发送节点刷新指令，触发后台从 VPNGate 发现新节点"""
+        if not self.logged_in and not self.login():
+            return False
+        url = f"{self.base_url}/api/refresh_nodes"
+        payload = json.dumps({"discovery_countries": [country]}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "AimiliPurePicker/1.0"}
+        )
+        try:
+            with self.opener.open(req, timeout=timeout) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                return bool(res.get("ok"))
+        except Exception as e:
+            logger.warning(f"⚠️ 触发 Aimili 刷新节点库异常: {e}")
             return False
 
     def get_current_favorites(self) -> List[str]:
@@ -831,13 +854,73 @@ class IpIntelligenceManager:
 # 6. 核心优选排程器 (三阶段智能流水线: 速率过滤 + 存量验身 + 经验加权补位)
 # ==============================================================================
 
+# ==============================================================================
+# 5.5. 真实下行带宽测速器 (通过 Aimili 本地代理进行微吞吐实测)
+# ==============================================================================
+
+TEST_SPEED_URLS = [
+    "http://cachefly.cachefly.net/1mb.test",
+    "https://speed.cloudflare.com/__down?bytes=1572864",
+    "http://speedtest.tele2.net/1MB.zip"
+]
+
+def probe_real_download_speed(
+    proxy_port: int = 7928,
+    proxy_host: str = "127.0.0.1",
+    max_bytes: int = 2 * 1024 * 1024,
+    max_duration: float = 3.0,
+    test_urls: Optional[List[str]] = None,
+    mock_speed: Optional[float] = None
+) -> float:
+    """
+    通过 Aimili 本地代理进行真实微吞吐测速：
+    拉取数据切片，限制在 max_duration 秒内，测算实际下行速率 (Mbps)。
+    """
+    if mock_speed is not None:
+        return round(float(mock_speed), 2)
+
+    urls = test_urls or TEST_SPEED_URLS
+    proxy_url = f"http://{proxy_host}:{proxy_port}"
+    proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    opener = urllib.request.build_opener(proxy_handler)
+
+    for url in urls:
+        start_t = time.time()
+        received = 0
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            with opener.open(req, timeout=max_duration + 1.2) as res:
+                while True:
+                    if (time.time() - start_t) >= max_duration:
+                        break
+                    chunk = res.read(16384)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                    if received >= max_bytes:
+                        break
+            duration = max(0.08, time.time() - start_t)
+            if received > 2048:
+                speed_mbps = round((received * 8.0) / (duration * 1e6), 2)
+                logger.debug(f"⚡ [测速成功] 源: {url} -> 传输 {received} 字节，耗时 {duration:.2f}s，流速: {speed_mbps} Mbps")
+                return speed_mbps
+        except Exception as e:
+            logger.debug(f"⚠️ [测速异常] 源 {url} 请求失败: {e}，尝试下一个备用源...")
+            continue
+
+    return 0.0
+
 class PickerEngine:
     """优选排程核心"""
 
-    def __init__(self, aimili: AimiliClient, inspector: IpIntelligenceManager, exp_mgr: NodeExperienceManager):
+    def __init__(self, aimili: AimiliClient, inspector: IpIntelligenceManager, exp_mgr: NodeExperienceManager, probe_speed_func=None):
         self.aimili = aimili
         self.inspector = inspector
         self.exp_mgr = exp_mgr
+        self.probe_speed_func = probe_speed_func or probe_real_download_speed
         self.is_running = False
         self.current_step = "空闲就绪"
         self.last_result: Dict[str, Any] = {}
@@ -855,10 +938,11 @@ class PickerEngine:
         self,
         country: str = "JP",
         max_risk: int = 15,
-        min_speed_mbps: float = 10.0,
+        min_speed_mbps: float = 5.0,
         top_n: int = 20,
         inherit_existing: bool = True,
-        source_mode: str = "auto"
+        source_mode: str = "auto",
+        max_rounds: int = 3
     ) -> List[CandidateNode]:
         """执行全自动优选排程流程"""
         if self.is_running:
@@ -918,14 +1002,6 @@ class PickerEngine:
                         continue
                     checked_fav_ips.add(node.ip)
 
-                    # 速率门槛校验 (若有测速数据，必须 >= min_speed_mbps)
-                    if min_speed_mbps > 0 and node.speed_mbps > 0 and node.speed_mbps < min_speed_mbps:
-                        reason = f"带宽速率不足 ({node.speed_mbps} Mbps < {min_speed_mbps} Mbps)"
-                        logger.warning(f"🚫 [存量淘汰] 收藏节点 {node.ip:<15} 验身未达标 ({reason})，标记移出收藏")
-                        self.exp_mgr.record_fail(node.ip, reason)
-                        live_evicted_fav_ids.append(fav_id)
-                        continue
-
                     # 探测存量收藏的风控与宽带类型
                     self.current_step = f"正在复检存量收藏质量: {node.ip}"
                     cached = self.inspector.cache.get(node.ip)
@@ -937,9 +1013,29 @@ class PickerEngine:
 
                     q = node.quality
                     exp = self.exp_mgr.get_or_create(node.ip, node.canonical_fav_id, q.isp if q else "")
-                    risk_limit = (max_risk + 3) if exp.consecutive_passes >= 5 else max_risk
+                    risk_limit = (max_risk + 3) if getattr(exp, "consecutive_passes", 0) >= 5 else max_risk
 
                     if q and q.is_residential and q.risk_score <= risk_limit:
+                        # 存量节点真实测速校验 (若低于门槛则淘汰)
+                        if min_speed_mbps > 0:
+                            self.current_step = f"正在实测存量节点带宽: {node.ip}..."
+                            logger.info(f"⚡ [实测存量] 正在通过 Aimili 测试存量节点 {node.ip} 真实带宽...")
+                            self.aimili.set_active_node(node, timeout=12)
+                            time.sleep(1.2)
+                            real_speed = self.probe_speed_func(
+                                proxy_port=self.aimili.proxy_port,
+                                proxy_host=self.aimili.host,
+                                max_duration=3.0
+                            )
+                            node.speed_mbps = real_speed
+                            node.speed_bps = int(real_speed * 1e6)
+                            if real_speed < min_speed_mbps:
+                                reason = f"实测速率不达标 ({real_speed} Mbps < {min_speed_mbps} Mbps)"
+                                logger.warning(f"🚫 [存量淘汰] 收藏节点 {node.ip:<15} {reason}，标记移出收藏")
+                                self.exp_mgr.record_fail(node.ip, reason)
+                                live_evicted_fav_ids.append(fav_id)
+                                continue
+                        
                         updated_exp = self.exp_mgr.record_pass(
                             node.ip, node.canonical_fav_id, q.isp, q.risk_score, node.latency_ms
                         )
@@ -969,94 +1065,343 @@ class PickerEngine:
                     else:
                         dead_evicted_fav_ids.append(fav_id)
 
-            # 3. 阶段二：容量评估与差额智能补位
-            needed = top_n - len(retained_nodes)
-            newly_picked_nodes: List[CandidateNode] = []
+            # 3. 阶段二：容量评估与多轮差额智能补位 (支持最多 max_rounds 轮补足)
 
-            if needed <= 0:
-                logger.info(f"🎉 存量合格收藏数量 ({len(retained_nodes)} 个) 已满员满足目标配额 ({top_n} 个)，无需扫描新节点！")
-                retained_nodes.sort(key=lambda n: (n.experience.reputation_score if n.experience else 0), reverse=True)
-                picked_nodes = retained_nodes[:top_n]
-            else:
-                logger.info(f"🔍 [阶段二] 存量合格 {len(retained_nodes)} 个，需从剩余候选池中补位挑选 {needed} 个黄金家宽节点...")
 
-                retained_ips = {n.ip for n in retained_nodes}
-                retained_ids = {n.canonical_fav_id for n in retained_nodes}
+            picked_nodes = list(retained_nodes)
+
+
+            tested_ips = set(checked_fav_ips)
+
+
+            all_newly_picked: List[CandidateNode] = []
+
+
+            rounds_run = 0
+
+
+
+            for current_round in range(1, max_rounds + 1):
+
+
+                rounds_run = current_round
+
+
+                needed = top_n - len(picked_nodes)
+
+
+                if needed <= 0:
+
+
+                    logger.info(f"🎉 目标配额已满员 ({len(picked_nodes)}/{top_n} 个)，提前完成优选！")
+
+
+                    break
+
+
+
+                logger.info(
+
+
+                    f"🔍 [第 {current_round}/{max_rounds} 轮优选] 当前已入选 {len(picked_nodes)} 个，"
+
+
+                    f"尚缺 {needed} 个目标节点，开始扫描候选并实测带宽 (门槛: ≥{min_speed_mbps} Mbps)..."
+
+
+                )
+
+
+
+                if current_round > 1:
+
+
+                    self.current_step = f"[第 {current_round}/{max_rounds} 轮] 正在触发 Aimili 刷新 VPNGate 节点池..."
+
+
+                    logger.info(f"🔄 [第 {current_round}/{max_rounds} 轮] 触发 Aimili 刷新节点库并等待 5 秒...")
+
+
+                    self.aimili.refresh_nodes(country=country)
+
+
+                    time.sleep(5.0)
+
+
+
+                    candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=200)
+
+
+                    total_candidates = max(total_candidates, len(candidates))
+
+
+
+                picked_ips = {n.ip for n in picked_nodes}
+
+
+                picked_ids = {n.canonical_fav_id for n in picked_nodes}
+
+
                 fresh_candidates = [
+
+
                     c for c in candidates
-                    if c.ip not in retained_ips and c.canonical_fav_id not in retained_ids
+
+
+                    if c.ip not in picked_ips and c.canonical_fav_id not in picked_ids and c.ip not in tested_ips
+
+
                 ]
 
-                valid_fresh: List[CandidateNode] = []
-                for idx, node in enumerate(fresh_candidates, start=1):
-                    # 速率硬性门槛过滤
-                    if min_speed_mbps > 0 and node.speed_mbps > 0 and node.speed_mbps < min_speed_mbps:
-                        logger.debug(f"🚫 淘汰节点 {node.ip}: 带宽不足 ({node.speed_mbps} Mbps < {min_speed_mbps} Mbps)")
-                        continue
 
-                    self.current_step = f"正在扫描补位候选 ({idx}/{len(fresh_candidates)}): {node.ip}"
+
+                logger.info(f"📋 [第 {current_round}/{max_rounds} 轮] 待检测优质候选节点池: {len(fresh_candidates)} 个")
+
+
+
+                for idx, node in enumerate(fresh_candidates, start=1):
+
+
+                    if len(picked_nodes) >= top_n:
+
+
+                        logger.info(f"🎉 本轮已成功补足目标配额 ({len(picked_nodes)}/{top_n} 个)！")
+
+
+                        break
+
+
+
+                    tested_ips.add(node.ip)
+
+
+
+                    # 1. IP 纯净度与家宽属性检测
+
+
+                    self.current_step = f"[第 {current_round}/{max_rounds} 轮] 正在质检 IP ({idx}/{len(fresh_candidates)}): {node.ip}"
+
+
                     cached = self.inspector.cache.get(node.ip)
+
+
                     node.quality = self.inspector.inspect_ip(node.ip, source_mode=source_mode)
 
+
+
                     if not cached and source_mode != "fallback_only" and not self.inspector._ping0_circuit_broken:
+
+
                         time.sleep(random.uniform(1.2, 1.8))
+
+
                     else:
+
+
                         time.sleep(0.05)
 
+
+
                     q = node.quality
+
+
                     if not q or not q.is_residential or q.risk_score > max_risk:
+
+
                         continue
 
-                    # 综合加权评分 (越小排名越靠前)
+
+
+                    # 2. 真实下行带宽测速 (Real Speed Test)
+
+
+                    if min_speed_mbps > 0:
+
+
+                        self.current_step = f"[第 {current_round}/{max_rounds} 轮] 正在真实测速 ({node.ip})..."
+
+
+                        logger.info(f"⚡ [实测开始] 节点 {node.ip:<15} (风控 {q.risk_score}%) 通过初筛，正在连接测试真实带宽...")
+
+
+                        self.aimili.set_active_node(node, timeout=12)
+
+
+                        time.sleep(1.2)
+
+
+                        real_speed = self.probe_speed_func(
+
+
+                            proxy_port=self.aimili.proxy_port,
+
+
+                            proxy_host=self.aimili.host,
+
+
+                            max_duration=3.0
+
+
+                        )
+
+
+                        node.speed_mbps = real_speed
+
+
+                        node.speed_bps = int(real_speed * 1e6)
+
+
+
+                        if real_speed < min_speed_mbps:
+
+
+                            logger.warning(f"🚫 [实测淘汰] 节点 {node.ip:<15} 实测带宽不足 ({real_speed} Mbps < {min_speed_mbps} Mbps)，已淘汰")
+
+
+                            self.exp_mgr.record_fail(node.ip, f"实测速率不足 ({real_speed} Mbps < {min_speed_mbps} Mbps)")
+
+
+                            continue
+
+
+                        else:
+
+
+                            logger.info(f"✅ [实测达标] 节点 {node.ip:<15} 实测速率: {real_speed} Mbps (≥ {min_speed_mbps} Mbps) 达标！")
+
+
+
+                    # 3. 综合加权评分计算
+
+
                     score = q.risk_score * 10.0
+
+
                     if "1 - 10" in q.shared_users:
+
+
                         score += 0.0
+
+
                     elif "10 - 100" in q.shared_users:
+
+
                         score += 15.0
+
+
                     elif "100 - 1000" in q.shared_users:
+
+
                         score += 50.0
+
+
                     else:
+
+
                         score += 100.0
 
+
+
                     if q.is_native:
+
+
                         score -= 10.0
+
+
                     else:
+
+
                         score += 10.0
+
+
 
                     score += node.latency_ms * 0.1
 
-                    # 带宽速率加权奖励 (速率越高排名越靠前)
-                    if node.speed_mbps > 0:
-                        score -= min(15.0, node.speed_mbps * 0.1)
 
-                    # 经验加成：有历史优秀信誉档案的节点优先排在前面
+
+                    # 实测带宽速率加权奖励 (实测带宽越高排名越靠前)
+
+
+                    if node.speed_mbps > 0:
+
+
+                        score -= min(25.0, node.speed_mbps * 0.5)
+
+
+
                     exp_bonus = self.exp_mgr.get_experience_bonus(node.ip)
+
+
                     score -= exp_bonus
 
+
+
                     node.rank_score = round(score, 1)
-                    valid_fresh.append(node)
 
-                # 按综合分升序排序
-                valid_fresh.sort(key=lambda n: n.rank_score)
-                newly_picked_nodes = valid_fresh[:needed]
 
-                for n in newly_picked_nodes:
+
+                    # 4. 入选记录
+
+
                     exp = self.exp_mgr.record_pass(
-                        n.ip, n.canonical_fav_id, n.quality.isp if n.quality else "", n.quality.risk_score if n.quality else 10, n.latency_ms
-                    )
-                    n.experience = exp
-                    n.is_inherited = False
-                    speed_info = f"{n.speed_mbps} Mbps" if n.speed_mbps > 0 else "未测速"
-                    logger.info(
-                        f"🌟 [新晋入选] 补位候选 {n.ip:<15} (速率: {speed_info}, 风控: {n.quality.risk_score}%, 延迟: {n.latency_ms}ms) -> "
-                        f"入选段位: {exp.level_label} (信誉分: {exp.reputation_score})"
+
+
+                        node.ip, node.canonical_fav_id, q.isp if q else "", q.risk_score if q else 10, node.latency_ms
+
+
                     )
 
-                picked_nodes = retained_nodes + newly_picked_nodes
+
+                    node.experience = exp
+
+
+                    node.is_inherited = False
+
+
+
+                    speed_info = f"{node.speed_mbps} Mbps" if node.speed_mbps > 0 else "未测速"
+
+
+                    logger.info(
+
+
+                        f"🌟 [新晋入选] 补位成功 {node.ip:<15} (实测: {speed_info}, 风控: {q.risk_score}%, 延迟: {node.latency_ms}ms) -> "
+
+
+                        f"段位: {exp.level_label} (信誉分: {exp.reputation_score}) [当前总计: {len(picked_nodes) + 1}/{top_n}]"
+
+
+                    )
+
+
+                    picked_nodes.append(node)
+
+
+                    all_newly_picked.append(node)
+
+
+
+                if len(picked_nodes) < top_n and current_round < max_rounds:
+
+
+                    logger.info(
+
+
+                        f"⚠️ [第 {current_round}/{max_rounds} 轮小结] 本轮测完，入选数 ({len(picked_nodes)} 个) 仍不足 {top_n} 个，"
+
+
+                        f"准备进入第 {current_round + 1} 轮补充测试..."
+
+
+                    )
+
+
+
+            picked_nodes.sort(key=lambda n: n.rank_score)
 
             # 4. 阶段三：同步落库 Aimili 收藏夹
             total_evicted_count = len(live_evicted_fav_ids) + len(dead_evicted_fav_ids)
-            self.current_step = f"正在同步 Aimili 收藏状态 (保留: {len(retained_nodes)}, 淘汰清退: {total_evicted_count}, 新入库: {len(newly_picked_nodes)})..."
+            self.current_step = f"正在同步 Aimili 收藏状态 (保留: {len(retained_nodes)}, 淘汰清退: {total_evicted_count}, 新入库: {len(all_newly_picked)})..."
 
             # 移出在线淘汰节点 (离线节点直接由底层配置文件同步清理，无需且不能调用 API，避免 Aimili 阻塞超时)
             if live_evicted_fav_ids:
@@ -1070,13 +1415,13 @@ class PickerEngine:
 
             # 增量写入新入选节点
             added_count = 0
-            for idx, node in enumerate(newly_picked_nodes, start=1):
-                self.current_step = f"正在写入新晋节点到 Aimili 收藏 ({idx}/{len(newly_picked_nodes)}): {node.ip}..."
+            for idx, node in enumerate(all_newly_picked, start=1):
+                self.current_step = f"正在写入新晋节点到 Aimili 收藏 ({idx}/{len(all_newly_picked)}): {node.ip}..."
                 ok = self.aimili.toggle_favorite(node, favorite=True, timeout=30)
                 if ok:
                     added_count += 1
                     speed_info = f"{node.speed_mbps} Mbps" if node.speed_mbps > 0 else "未测速"
-                    logger.info(f"⭐ 成功加星入库 ({idx}/{len(newly_picked_nodes)}) -> IP: {node.ip:<15} (速率: {speed_info}, 延迟: {node.latency_ms}ms, 等级: {node.experience.level_label if node.experience else '新晋'})")
+                    logger.info(f"⭐ 成功加星入库 ({idx}/{len(all_newly_picked)}) -> IP: {node.ip:<15} (速率: {speed_info}, 延迟: {node.latency_ms}ms, 等级: {node.experience.level_label if node.experience else '新晋'})")
                 else:
                     logger.warning(f"⚠️ 节点 [{node.ip}] 接口响应异常，底层持久化文件保障同步")
                 time.sleep(0.2)
@@ -1116,7 +1461,7 @@ class PickerEngine:
                 "total_candidates": total_candidates,
                 "retained_count": len(retained_nodes),
                 "evicted_count": total_evicted_count,
-                "newly_added_count": len(newly_picked_nodes),
+                "newly_added_count": len(all_newly_picked),
                 "picked_count": len(picked_nodes),
                 "active_node_ip": active_node_ip,
                 "nodes": [
@@ -1151,7 +1496,7 @@ class PickerEngine:
             except Exception as e:
                 logger.error(f"❌ 记录历史结果异常: {e}")
 
-            self.current_step = f"优选完成！收藏池就绪: 保持 {len(retained_nodes)} 个, 新增 {len(newly_picked_nodes)} 个 (耗时 {elapsed}s)"
+            self.current_step = f"优选完成！收藏池就绪: 保持 {len(retained_nodes)} 个, 新增 {len(all_newly_picked)} 个 (共完成 {rounds_run}/{max_rounds} 轮，耗时 {elapsed}s)"
 
         except Exception as e:
             logger.exception(f"❌ 执行筛选流程发生未捕获异常: {e}")
@@ -1327,7 +1672,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
       <div class="form-group">
         <label>最低带宽速率要求 (Mbps)</label>
-        <input type="number" id="inpMinSpeed" value="10" min="0" max="1000">
+        <input type="number" id="inpMinSpeed" value="5" min="0" max="1000">
         <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">过滤低于此速率的节点 (填 0 为不限带宽)</div>
       </div>
       <div class="form-group">
@@ -1467,7 +1812,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   async function triggerScan() {
     const country = document.getElementById('selCountry').value;
     const maxRisk = parseInt(document.getElementById('inpMaxRisk').value) || 15;
-    const minSpeed = parseFloat(document.getElementById('inpMinSpeed').value) || 10.0;
+    const minSpeed = parseFloat(document.getElementById('inpMinSpeed').value) || 5.0;
     const topN = parseInt(document.getElementById('inpTopN').value) || 20;
     const sourceMode = document.getElementById('selSourceMode').value || 'auto';
     const inheritExisting = document.getElementById('chkInherit').checked;
@@ -1549,10 +1894,11 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
 
             country = params.get("country", "JP")
             max_risk = int(params.get("max_risk", 15))
-            min_speed_mbps = float(params.get("min_speed_mbps", 10.0))
+            min_speed_mbps = float(params.get("min_speed_mbps", 5.0))
             top_n = int(params.get("top_n", 20))
             source_mode = str(params.get("source_mode", "auto"))
             inherit_existing = bool(params.get("inherit_existing", True))
+            max_rounds = int(params.get("max_rounds", 3))
 
             if self.engine and not self.engine.is_running:
                 threading.Thread(
@@ -1563,7 +1909,8 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                         "min_speed_mbps": min_speed_mbps,
                         "top_n": top_n,
                         "inherit_existing": inherit_existing,
-                        "source_mode": source_mode
+                        "source_mode": source_mode,
+                        "max_rounds": max_rounds
                     },
                     daemon=True
                 ).start()
@@ -1586,7 +1933,7 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 # 8. 主程序入口与定时任务调度
 # ==============================================================================
 
-def cron_worker(engine: PickerEngine, interval_hours: int, country: str, max_risk: int, min_speed_mbps: float, top_n: int, inherit_existing: bool, source_mode: str):
+def cron_worker(engine: PickerEngine, interval_hours: int, country: str, max_risk: int, min_speed_mbps: float, top_n: int, inherit_existing: bool, source_mode: str, max_rounds: int = 3):
     """后台定时巡检任务"""
     logger.info(f"⏰ 定时巡检线程已就绪: 每隔 {interval_hours} 小时全自动重新优选入库一次 (目标: {top_n} 节点，门槛: ≥{min_speed_mbps}Mbps，模式: {source_mode})")
     while True:
@@ -1599,7 +1946,8 @@ def cron_worker(engine: PickerEngine, interval_hours: int, country: str, max_ris
                 min_speed_mbps=min_speed_mbps,
                 top_n=top_n,
                 inherit_existing=inherit_existing,
-                source_mode=source_mode
+                source_mode=source_mode,
+                max_rounds=max_rounds
             )
         except Exception as e:
             logger.error(f"❌ 定时巡检异常: {e}")
@@ -1609,7 +1957,9 @@ def main():
     parser.add_argument("--port", type=int, default=8585, help="Web 控制台服务端口 (默认 8585)")
     parser.add_argument("--country", type=str, default="JP", help="优选地区代码 (默认 JP)")
     parser.add_argument("--max-risk", type=int, default=15, help="最大允许风控分 (默认 15)")
-    parser.add_argument("--min-speed", type=float, default=10.0, help="最低允许带宽速率 Mbps (默认 10.0，填 0 为不限)")
+    parser.add_argument("--min-speed", type=float, default=5.0, help="最低允许实测带宽速率 Mbps (默认 5.0，填 0 为不限)")
+    parser.add_argument("--max-rounds", type=int, default=3, help="节点数量不足时的最大补测轮数 (默认 3 轮)")
+    parser.add_argument("--proxy-port", type=int, default=None, help="Aimili 本地代理端口 (默认自动从 ui_auth.json 读取或使用 7928)")
     parser.add_argument("--top-n", type=int, default=20, help="优选收藏入库节点数 (默认 20)")
     parser.add_argument("--source-mode", type=str, default="auto", choices=["auto", "fallback_only", "ping0_only"], help="风控评估数据源模式 (auto/fallback_only/ping0_only)")
     parser.add_argument("--interval", type=int, default=6, help="定时自动扫描间隔小时 (默认 6 小时)")
@@ -1629,7 +1979,8 @@ def main():
         username=args.username,
         password=args.password,
         secret_path=args.secret_path,
-        port=args.aimili_port
+        port=args.aimili_port,
+        proxy_port=args.proxy_port
     )
     inspector = IpIntelligenceManager()
     exp_mgr = NodeExperienceManager()
@@ -1646,7 +1997,8 @@ def main():
             min_speed_mbps=args.min_speed,
             top_n=args.top_n,
             inherit_existing=inherit_existing,
-            source_mode=args.source_mode
+            source_mode=args.source_mode,
+            max_rounds=args.max_rounds
         )
         print("\n" + "=" * 75)
         print(f"🎉 筛选完毕！最终入选收藏池列表 ({len(picked)} 个):")
@@ -1668,7 +2020,7 @@ def main():
     if args.interval > 0:
         threading.Thread(
             target=cron_worker,
-            args=(engine, args.interval, args.country, args.max_risk, args.min_speed, args.top_n, inherit_existing, args.source_mode),
+            args=(engine, args.interval, args.country, args.max_risk, args.min_speed, args.top_n, inherit_existing, args.source_mode, args.max_rounds),
             daemon=True
         ).start()
 

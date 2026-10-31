@@ -8,3 +8,5 @@ update.log
 *.bak.*
 *.ipk
 dist/
+
+picker_data/
