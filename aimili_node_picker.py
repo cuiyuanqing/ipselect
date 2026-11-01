@@ -2521,12 +2521,29 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             try:
                 if self.engine and (not self.engine.aimili.logged_in):
                     self.engine.aimili.login()
-                raw_url = f"{self.engine.aimili.base_url}/api/ui/nodes?country=JP&limit=2"
+                query_params = urllib.parse.parse_qs(url.query)
+                sub_path = query_params.get("path", [None])[0]
+                if sub_path:
+                    raw_url = f"{self.engine.aimili.base_url}{sub_path}"
+                else:
+                    raw_url = f"{self.engine.aimili.base_url}/api/ui/nodes?country=JP&limit=100"
                 req = urllib.request.Request(raw_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
-                with self.engine.aimili.opener.open(req, timeout=5) as resp:
+                with self.engine.aimili.opener.open(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
-                st = self.engine.aimili.get_state()
-                self._send_json_response({"raw_nodes": data.get("nodes", [])[:2], "state": st})
+                st = self.engine.aimili.get_state() if not sub_path else {}
+                nodes = data.get("nodes", [])
+                proto_stats = {}
+                for n in nodes:
+                    p = n.get("protocol") or n.get("proto") or "unknown"
+                    proto_stats[p] = proto_stats.get(p, 0) + 1
+                self._send_json_response({
+                    "sub_path": sub_path or "/api/ui/nodes?country=JP&limit=100",
+                    "total_nodes": len(nodes),
+                    "proto_stats": proto_stats,
+                    "sample_nodes": nodes[:3],
+                    "raw_response": data if sub_path else None,
+                    "state": st
+                })
             except Exception as e:
                 self._send_json_response({"error": str(e)})
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
