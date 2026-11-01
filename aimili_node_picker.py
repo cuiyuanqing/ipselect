@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # ==============================================================================
 # 1. 日志与基础配置
@@ -280,9 +280,10 @@ class NodeExperienceManager:
 class BlacklistManager:
     """管理永久黑名单 IP，对风控>=10%或违规节点永久拉黑，永不录用"""
 
-    def __init__(self, blacklist_file: str = BLACKLIST_FILE):
+    def __init__(self, blacklist_file: str = BLACKLIST_FILE, on_sync_callback: Optional[Callable[[List[str]], Any]] = None):
         self.blacklist_file = blacklist_file
         self.records: Dict[str, Dict[str, Any]] = {}
+        self.on_sync_callback = on_sync_callback
         self._load()
 
     def _load(self):
@@ -330,13 +331,26 @@ class BlacklistManager:
             }
             self.save()
             logger.warning(f"🚫 [永久拉黑] 节点 IP {ip:<15} (风控 {risk_score}%) 已永久拉黑: {reason}")
+            if self.on_sync_callback:
+                try:
+                    self.on_sync_callback(self.get_blacklisted_ips())
+                except Exception as e:
+                    logger.warning(f"⚠️ 触发黑名单同步回调异常: {e}")
 
     def remove(self, ip: str) -> bool:
         if ip in self.records:
             del self.records[ip]
             self.save()
+            if self.on_sync_callback:
+                try:
+                    self.on_sync_callback(self.get_blacklisted_ips())
+                except Exception as e:
+                    logger.warning(f"⚠️ 触发黑名单同步回调异常: {e}")
             return True
         return False
+
+    def get_blacklisted_ips(self) -> List[str]:
+        return list(self.records.keys())
 
     def get_all(self) -> Dict[str, Any]:
         return dict(self.records)
@@ -1017,6 +1031,122 @@ class AimiliClient:
             logger.info(f"💾 已同步将 {len(fav_ids)} 个节点 ID 写入底层文件 {self.auth_file}")
         except Exception as e:
             logger.warning(f"⚠️ 同步底层 {self.auth_file} 异常: {e}")
+
+    def get_ui_state(self) -> Dict[str, Any]:
+        """获取 Aimili Web UI 完整的系统偏好与路由状态字典"""
+        if not self.logged_in and not self.login():
+            return {}
+        url = f"{self.base_url}/api/ui/state"
+        req = urllib.request.Request(url, headers={"User-Agent": "AimiliPurePicker/1.0"})
+        try:
+            with self.opener.open(req, timeout=8) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                return res.get("state", {})
+        except Exception as e:
+            logger.debug(f"⚠️ 获取 Aimili UI 状态异常: {e}")
+            return {}
+
+    def get_current_blocklist(self) -> List[str]:
+        """获取当前 Aimili 屏蔽列表内容 (优先从 UI 状态，降级从本地 ui_auth.json)"""
+        raw_blocklist = ""
+        try:
+            st = self.get_ui_state()
+            raw_blocklist = st.get("routing_blocklist", "")
+        except Exception:
+            pass
+        if not raw_blocklist and os.path.isfile(self.auth_file):
+            try:
+                with open(self.auth_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                raw_blocklist = data.get("routing_blocklist", "")
+            except Exception:
+                pass
+        lines = [line.strip() for line in (raw_blocklist or "").splitlines() if line.strip()]
+        return lines
+
+    def sync_blocklist(self, blacklist_ips: List[str]) -> bool:
+        """增量合并并将黑名单 IP 同步至 Aimili 代理屏蔽列表 (routing_blocklist)，支持内存即时生效与文件双持久化"""
+        current_lines = self.get_current_blocklist()
+        seen = set()
+        merged = []
+        for item in current_lines:
+            if item not in seen:
+                seen.add(item)
+                merged.append(item)
+        for ip in blacklist_ips:
+            ip = ip.strip()
+            if ip and ip not in seen:
+                seen.add(ip)
+                merged.append(ip)
+
+        merged_text = "\n".join(merged)
+        current_text = "\n".join(current_lines)
+
+        # 1. 始终确保底层持久化文件安全落盘
+        self.sync_auth_file_blocklist(merged_text)
+
+        # 如果内容完全一致且已同步过，直接返回
+        if current_text == merged_text:
+            return True
+
+        # 2. 调用 Aimili 原生 API /api/update_settings 即时刷新内存路由规则
+        st = self.get_ui_state()
+        if not st and os.path.isfile(self.auth_file):
+            try:
+                with open(self.auth_file, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+            except Exception:
+                st = {}
+
+        payload = {
+            "proxy_port": int(st.get("proxy_port") or self.proxy_port or 8500),
+            "proxy_user": str(st.get("proxy_user") or self.proxy_user or "socks5"),
+            "proxy_pass": str(st.get("proxy_pass") or self.proxy_pass or "ilovestudy"),
+            "proxy_allow": st.get("proxy_allow") if isinstance(st.get("proxy_allow"), list) else ["127.0.0.1", "::1"],
+            "routing_mode": str(st.get("routing_mode") or "favorites"),
+            "force_country": str(st.get("force_country") or "日本"),
+            "routing_ip_type": str(st.get("routing_ip_type") or "residential"),
+            "routing_protocol": str(st.get("routing_protocol") or ""),
+            "routing_min_speed_bps": int(st.get("routing_min_speed_bps") or 5000000),
+            "routing_latency": str(st.get("routing_latency") or ""),
+            "routing_blocklist": merged_text,
+            "keep_manual": True
+        }
+
+        try:
+            if not self.logged_in:
+                self.login()
+            if self.logged_in:
+                url = f"{self.base_url}/api/update_settings"
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "User-Agent": "AimiliPurePicker/1.0"}
+                )
+                with self.opener.open(req, timeout=8) as resp:
+                    res_data = json.loads(resp.read().decode("utf-8"))
+                    if res_data.get("ok"):
+                        logger.info(f"🛡️ 成功将黑名单同步至 Aimili 屏蔽列表 (当前共 {len(merged)} 项，含 {len(blacklist_ips)} 个高风险黑名单 IP)")
+                        return True
+        except Exception as e:
+            logger.warning(f"⚠️ 调用 Aimili /api/update_settings 同步屏蔽列表异常: {e}，底层 ui_auth.json 已安全落盘")
+        return True
+
+    def sync_auth_file_blocklist(self, blocklist_text: str):
+        """直接更新本地 ui_auth.json 文件中的 routing_blocklist 字段"""
+        if not os.path.isfile(self.auth_file):
+            return
+        try:
+            with open(self.auth_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            data["routing_blocklist"] = blocklist_text
+            tmp_file = self.auth_file + ".tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, self.auth_file)
+            logger.info(f"💾 已同步将屏蔽列表安全写入底层文件 {self.auth_file}")
+        except Exception as e:
+            logger.warning(f"⚠️ 同步底层 {self.auth_file} 屏蔽列表异常: {e}")
 
 # ==============================================================================
 # 5. IP 质量与风控情报检测器 (多通道: Ping0 + IP-API + IPWho.is 智能熔断矩阵)
@@ -1742,6 +1872,14 @@ class PickerEngine:
         self.last_result: Dict[str, Any] = {}
         self.load_history()
 
+        # 联动 Aimili 代理屏蔽列表：绑定动态拉黑回调并完成初始同步
+        if self.aimili and hasattr(self.aimili, "sync_blocklist"):
+            self.blacklist.on_sync_callback = self.aimili.sync_blocklist
+            try:
+                self.aimili.sync_blocklist(self.blacklist.get_blacklisted_ips())
+            except Exception as e:
+                logger.warning(f"⚠️ 初始对齐 Aimili 屏蔽列表异常: {e}")
+
     def load_history(self):
         if os.path.isfile(HISTORY_FILE):
             try:
@@ -2335,6 +2473,11 @@ class PickerEngine:
 
             # 底层持久化双重保证 (清空所有离线及超标节点，仅保留本次优选的节点)
             self.aimili.sync_auth_file_favorites(final_target_fav_ids)
+            if hasattr(self.aimili, "sync_blocklist"):
+                try:
+                    self.aimili.sync_blocklist(self.blacklist.get_blacklisted_ips())
+                except Exception as e:
+                    logger.warning(f"⚠️ 优选落盘同步 Aimili 屏蔽列表异常: {e}")
 
             # 5. 阶段四：自动切换 Aimili 活动出口为第 1 名最佳节点
             active_node_ip = ""

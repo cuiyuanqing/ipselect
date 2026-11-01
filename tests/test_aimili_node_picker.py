@@ -717,5 +717,117 @@ class TestRemoteDeployEndpoints(unittest.TestCase):
         mock_restart.assert_called_once()
         self.assertIn(b"Git", handler.wfile.getvalue())
 
+class TestAimiliBlocklistSync(unittest.TestCase):
+    """测试黑名单自动同步至 Aimili 代理屏蔽列表功能"""
+
+    def setUp(self):
+        import tempfile
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.auth_file = os.path.join(self.temp_dir.name, "ui_auth.json")
+        self.bl_file = os.path.join(self.temp_dir.name, "ip_blacklist.json")
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_blacklist_manager_on_sync_callback_triggered_on_add_and_remove(self):
+        sync_calls = []
+        def fake_sync(ips):
+            sync_calls.append(list(ips))
+
+        mgr = BlacklistManager(blacklist_file=self.bl_file, on_sync_callback=fake_sync)
+        mgr.add("1.1.1.1", "test reason", 80)
+        self.assertEqual(len(sync_calls), 1)
+        self.assertEqual(sync_calls[0], ["1.1.1.1"])
+
+        mgr.add("2.2.2.2", "another reason", 90)
+        self.assertEqual(len(sync_calls), 2)
+        self.assertEqual(sorted(sync_calls[1]), ["1.1.1.1", "2.2.2.2"])
+
+        mgr.remove("1.1.1.1")
+        self.assertEqual(len(sync_calls), 3)
+        self.assertEqual(sync_calls[2], ["2.2.2.2"])
+
+    def test_aimili_get_current_blocklist_from_file_and_state(self):
+        import json
+        initial_data = {
+            "routing_blocklist": "61.114.197.133\n14.14.148.93\n  \n112.67.*\n"
+        }
+        with open(self.auth_file, "w", encoding="utf-8") as f:
+            json.dump(initial_data, f)
+
+        client = AimiliClient(auth_file=self.auth_file)
+        client.get_ui_state = MagicMock(return_value={})
+
+        lines = client.get_current_blocklist()
+        self.assertEqual(lines, ["61.114.197.133", "14.14.148.93", "112.67.*"])
+
+        # When get_ui_state has data, it takes precedence
+        client.get_ui_state.return_value = {"routing_blocklist": "8.8.8.8\n1.1.1.1"}
+        lines_api = client.get_current_blocklist()
+        self.assertEqual(lines_api, ["8.8.8.8", "1.1.1.1"])
+
+    def test_aimili_sync_blocklist_preserves_custom_and_merges_blacklist(self):
+        import json
+        initial_data = {
+            "routing_blocklist": "61.114.197.133\n14.14.148.93",
+            "proxy_port": 8500,
+            "routing_mode": "favorites"
+        }
+        with open(self.auth_file, "w", encoding="utf-8") as f:
+            json.dump(initial_data, f)
+
+        client = AimiliClient(auth_file=self.auth_file)
+        client.logged_in = True
+        client._working_base_url = "http://127.0.0.1:8501/secret"
+        client.get_ui_state = MagicMock(return_value=initial_data)
+
+        # Mock urllib.request.OpenerDirector.open
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({"ok": True}).encode("utf-8")
+        client.opener = MagicMock()
+        client.opener.open.return_value.__enter__.return_value = mock_response
+
+        # Sync a new blacklisted IP along with an already-present IP (dedup test)
+        res = client.sync_blocklist(["162.43.67.81", "14.14.148.93"])
+        self.assertTrue(res)
+
+        # Check that file was updated
+        with open(self.auth_file, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        saved_lines = saved.get("routing_blocklist", "").splitlines()
+        self.assertEqual(saved_lines, ["61.114.197.133", "14.14.148.93", "162.43.67.81"])
+
+        # Check API payload
+        self.assertTrue(client.opener.open.called)
+        sent_req = client.opener.open.call_args[0][0]
+        self.assertEqual(sent_req.full_url, "http://127.0.0.1:8501/secret/api/update_settings")
+        sent_data = json.loads(sent_req.data.decode("utf-8"))
+        self.assertEqual(sent_data["routing_blocklist"], "61.114.197.133\n14.14.148.93\n162.43.67.81")
+        self.assertEqual(sent_data["routing_mode"], "favorites")
+
+    def test_picker_engine_binds_sync_callback_and_initial_sync(self):
+        mock_aimili = MagicMock(spec=AimiliClient)
+        mock_aimili.sync_blocklist = MagicMock(return_value=True)
+
+        mock_inspector = MagicMock(spec=IpIntelligenceManager)
+        mock_exp = MagicMock(spec=NodeExperienceManager)
+
+        bl_mgr = BlacklistManager(blacklist_file=self.bl_file)
+        bl_mgr.add("198.51.100.1", "high risk", 50)
+
+        # PickerEngine should call sync_blocklist on init with existing blacklisted IPs
+        engine = PickerEngine(
+            aimili=mock_aimili,
+            inspector=mock_inspector,
+            exp_mgr=mock_exp,
+            blacklist=bl_mgr
+        )
+        mock_aimili.sync_blocklist.assert_called_with(["198.51.100.1"])
+
+        # Adding a new blacklisted IP should trigger sync_blocklist dynamically
+        bl_mgr.add("198.51.100.2", "abuse", 80)
+        mock_aimili.sync_blocklist.assert_called_with(["198.51.100.1", "198.51.100.2"])
+
+
 if __name__ == "__main__":
     unittest.main()
