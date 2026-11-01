@@ -2445,9 +2445,10 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     with aimili.opener.open(req, timeout=8) as resp:
                         res = json.loads(resp.read().decode("utf-8"))
                         nodes = res.get("nodes", [])
-                        jp_nodes = [n for n in nodes if str(n.get("country", "")).upper() == "JP"]
                         debug_info["total_nodes_in_db"] = len(nodes)
-                        debug_info["jp_nodes_in_db"] = len(jp_nodes)
+                        if nodes:
+                            debug_info["sample_node_keys"] = list(nodes[0].keys())
+                            debug_info["sample_node_0"] = nodes[0]
                         if jp_nodes:
                             debug_info["sample_jp_node"] = jp_nodes[0]
                             debug_info["sample_jp_nodes_first_5"] = [
