@@ -485,6 +485,20 @@ class AimiliClient:
             rows = cur.fetchall()
             conn.close()
 
+            # 读取 Aimili 本地生成的真实 OpenVPN 配置文件目录 (/opt/aimilivpn/vpngate_data/configs)
+            configs_dir = "/opt/aimilivpn/vpngate_data/configs"
+            existing_configs = set(os.listdir(configs_dir)) if os.path.exists(configs_dir) else None
+            ip_port_to_config = {}
+            if existing_configs:
+                for fn in existing_configs:
+                    if fn.endswith(".ovpn"):
+                        stem = fn[:-5]
+                        parts = stem.split("_")
+                        if len(parts) >= 3:
+                            cip = parts[-3] if len(parts) >= 4 and parts[0] in ["JP", "US", "KR", "RU", "TW", "HK"] else parts[0]
+                            cport = parts[-2]
+                            ip_port_to_config[(cip, cport)] = stem
+
             candidates = []
             seen_ips = set()
             for r in rows:
@@ -504,7 +518,6 @@ class AimiliClient:
                 speed_mbps = round(speed_bps / 1e6, 1)
 
                 pool_id = str(eid)
-                nid = f"pool:{pool_id}"
                 
                 exact_node_id = None
                 try:
@@ -514,22 +527,44 @@ class AimiliClient:
                 except Exception:
                     pass
 
-                aliases = []
-                if exact_node_id:
+                # 寻找 Aimili 底层真实存在的配置文件名 (杜绝任何 Node not found 盲猜)
+                matched_config_id = None
+                if existing_configs:
+                    cand_filenames = [
+                        f"JP_{ip}_{port}_{transport}.ovpn",
+                        f"{ctry or country}_{ip}_{port}_{transport}.ovpn",
+                        f"{ip}_{port}_{transport}.ovpn",
+                        f"JP_{ip}_{port}_udp.ovpn",
+                        f"JP_{ip}_{port}_tcp.ovpn",
+                        f"{ip}_{port}_udp.ovpn",
+                        f"{ip}_{port}_tcp.ovpn"
+                    ]
+                    for fn in cand_filenames:
+                        if fn in existing_configs:
+                            matched_config_id = fn[:-5]
+                            break
+                    if not matched_config_id and (ip, str(port)) in ip_port_to_config:
+                        matched_config_id = ip_port_to_config[(ip, str(port))]
+                    if not matched_config_id and exact_node_id and f"{exact_node_id}.ovpn" in existing_configs:
+                        matched_config_id = exact_node_id
+
+                    # 核心过滤：若 configs 目录存在，但该节点没有现成的 .ovpn 文件，说明 Aimili 无法加载连接此节点，跳过
+                    if not matched_config_id:
+                        continue
+
+                canonical_node_id = matched_config_id or exact_node_id or f"JP_{ip}_{port}_{transport}"
+
+                aliases = [canonical_node_id]
+                if exact_node_id and exact_node_id != canonical_node_id:
                     aliases.append(exact_node_id)
                 aliases.extend([
-                    nid,
-                    pool_id,
                     f"JP_{ip}_{port}_{transport}",
                     f"{ctry or country}_{ip}_{port}_{transport}",
-                    f"{ip}_{port}_{transport}",
-                    f"{ip}_{port}_openvpn",
-                    f"{ip}_{port}_udp",
-                    f"{ip}_{port}_tcp"
+                    f"{ip}_{port}_{transport}"
                 ])
 
                 candidates.append(CandidateNode(
-                    id=exact_node_id if exact_node_id else nid,
+                    id=canonical_node_id,
                     ip=ip,
                     port=port,
                     country=ctry if ctry else country,
@@ -540,7 +575,7 @@ class AimiliClient:
                     pool_endpoint_id=pool_id,
                     aliases=list(set(aliases)),
                     transport=transport,
-                    exact_node_id=exact_node_id
+                    exact_node_id=canonical_node_id
                 ))
             if candidates:
                 logger.info(f"💾 成功从 Aimili 本地 SQLite 读取到 [{country}] 地区存活 OpenVPN 候选节点共 {len(candidates)} 个 (offset={offset})")
@@ -709,7 +744,7 @@ class AimiliClient:
 
         clean_id = expected_node_id.replace("pool:", "")
         start = time.time()
-        max_wait = timeout
+        max_wait = max(float(timeout), 35.0)
         while time.time() - start < max_wait:
             st = self.get_state()
             if not st:
@@ -745,11 +780,11 @@ class AimiliClient:
                 return True
 
             msg = str(st.get("last_check_message") or "")
-            # 2. 状态感知：若 Aimili 处于初始化、切换验证中、或正在建连，动态延长等待上限至 30 秒容纳 OpenVPN TLS 握手
+            # 2. 状态感知：若 Aimili 处于初始化、切换验证中、或正在建连，动态延长等待上限至 45 秒容纳 OpenVPN TLS 握手与 cutover
             is_connecting = bool(st.get("is_connecting")) or any(k in msg for k in ["初始化", "切换中", "后台验证", "验证中", "仍在建立"])
             if is_connecting:
-                if max_wait < 32.0:
-                    max_wait = 32.0
+                if max_wait < 45.0:
+                    max_wait = 45.0
                 time.sleep(1.0)
                 continue
 
@@ -761,7 +796,7 @@ class AimiliClient:
             time.sleep(1.0)
         return False
 
-    def set_active_node(self, node: CandidateNode, timeout: int = 15, max_retries: int = 3) -> bool:
+    def set_active_node(self, node: CandidateNode, timeout: int = 35, max_retries: int = 3) -> bool:
         """调用 Aimili 将指定优选节点切换为当前活动出口节点，带 409 互斥锁感知与重试"""
         if not self.logged_in and not self.login():
             return False
@@ -772,31 +807,38 @@ class AimiliClient:
         url = f"{self.base_url}/api/connect"
         cand_ids = []
 
-        # 1. 极高优先级：若有数据库记录的真实 node_id (例如 JP_110.131.199.23_1404_tcp)
+        # 1. 极高优先级：若有底层实体配置文件 ID (例如 JP_110.131.199.23_1404_tcp)
         exact_id = getattr(node, "exact_node_id", None)
-        if exact_id:
+        if exact_id and not exact_id.startswith("pool:") and len(exact_id) != 32:
             cand_ids.append(exact_id)
 
-        # 2. 第二优先级：Aimili 底层 pool endpoint 格式 (pool:xxxx)
-        if node.pool_endpoint_id:
-            cand_ids.append(f"pool:{node.pool_endpoint_id}")
-            cand_ids.append(node.pool_endpoint_id)
+        # 2. 如果 node.id 不是 pool: 且不是 32 字节 hex，加入
+        if node.id and not str(node.id).startswith("pool:") and len(str(node.id)) != 32:
+            cand_ids.append(str(node.id))
 
-        clean_id = node.id.replace("pool:", "")
-        cand_ids.extend([node.id, f"pool:{clean_id}", clean_id])
-
-        # 3. 第三优先级：带国家前缀或传输层协议的别名
+        # 3. 标准格式 ID (规范前缀别名)
         if node.ip and node.port:
-            transport = getattr(node, "transport", "").lower() or ("tcp" if "_tcp" in node.id else "udp")
+            transport = getattr(node, "transport", "").lower() or ("tcp" if "_tcp" in str(node.id) else "udp")
             cand_ids.append(f"JP_{node.ip}_{node.port}_{transport}")
-            cand_ids.append(f"{node.country}_{node.ip}_{node.port}_{transport}")
             cand_ids.append(f"{node.ip}_{node.port}_{transport}")
-            cand_ids.append(f"{node.ip}_{node.port}_openvpn")
-            cand_ids.append(f"{node.ip}_{node.port}_udp")
-            cand_ids.append(f"{node.ip}_{node.port}_tcp")
+            cand_ids.append(f"{node.country}_{node.ip}_{node.port}_{transport}")
 
-        if hasattr(node, "aliases") and node.aliases:
-            cand_ids.extend(node.aliases)
+        # 4. 严格过滤：绝不将 pool: 前缀或 32 字节 hex 的 endpoint_id 发送给 Aimili /api/connect
+        cand_ids = [cid for cid in cand_ids if cid and not cid.startswith("pool:") and len(cid) != 32]
+
+        # 5. 若本地 configs 目录存在，只保留在 configs 目录下拥有实体 .ovpn 文件的有效 ID
+        configs_dir = "/opt/aimilivpn/vpngate_data/configs"
+        if os.path.exists(configs_dir):
+            try:
+                exist_set = set(os.listdir(configs_dir))
+                cand_ids = [cid for cid in cand_ids if f"{cid}.ovpn" in exist_set]
+            except Exception:
+                pass
+
+        if not cand_ids:
+            # 保底回退：标准格式
+            transport = getattr(node, "transport", "").lower() or "udp"
+            cand_ids = [f"JP_{node.ip}_{node.port}_{transport}", f"{node.ip}_{node.port}_{transport}"]
 
         seen = set()
         unique_ids = [x for x in cand_ids if x and not (x in seen or seen.add(x))]
@@ -823,7 +865,7 @@ class AimiliClient:
                         st = self.get_state()
                         msg = str(st.get("last_check_message") or "") if st else ""
                         if test_id and f"Node not found: {test_id}" in msg:
-                            logger.warning(f"⚠️ Aimili 无法识别 ID [{test_id}] (Node not found)，尝试备选 ID 格式...")
+                            logger.warning(f"⚠️ Aimili 无法识别 ID [{test_id}] (Node not found)，跳过该无效 ID")
                             continue
                         else:
                             logger.warning(f"⚠️ 节点 {node.ip} (ID: {test_id}) 握手未就绪或建连超时，跳过该节点")
@@ -1937,7 +1979,7 @@ class PickerEngine:
                         # Aimili 处于 routing_mode='favorites' (仅限收藏) 模式，切换前必须先加入收藏库 Aimili 方可建立 OpenVPN 隧道
                         self.aimili.toggle_favorite(node, favorite=True)
 
-                        connected = self.aimili.set_active_node(node, timeout=15)
+                        connected = self.aimili.set_active_node(node, timeout=35)
                         if not connected:
                             logger.warning(f"❌ [握手失败] 无法切换到活动节点 {node.ip} (OpenVPN握手失败或Aimili正忙)，标记握手未通")
                             self.aimili.toggle_favorite(node, favorite=False)
