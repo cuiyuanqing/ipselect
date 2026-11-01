@@ -1921,8 +1921,8 @@ class PickerEngine:
                         node.packet_loss_pct = net_q.get("packet_loss_pct", 0)
                         alive_candidates.append(node)
 
-                    # 优先将低延迟节点排在前面测速
-                    alive_candidates.sort(key=lambda n: n.latency_ms)
+                    # 优先将预期带宽速率高且连通记录优秀的家宽节点排在前面实测 (实测带宽优先，延迟为次要参考)
+                    alive_candidates.sort(key=lambda n: (-getattr(n, "speed_mbps", 0.0), n.latency_ms))
                     logger.info(
                         f"✅ [并发预检完成] {len(fresh_candidates)} 个节点中共有 {len(alive_candidates)} 个存活且低抖动达标！"
                     )
