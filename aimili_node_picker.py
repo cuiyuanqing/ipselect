@@ -174,6 +174,7 @@ class CandidateNode:
     real_latency_ms: Optional[int] = None
     jitter_ms: int = 0
     packet_loss_pct: int = 0
+    transport: str = "udp"
 
     @property
     def canonical_fav_id(self) -> str:
@@ -495,15 +496,18 @@ class AimiliClient:
                         if pool_id:
                             aliases.extend([pool_id, f"pool:{pool_id}"])
                         aliases.append(nid.replace("pool:", ""))
-                        if port and proto_name:
-                            aliases.append(f"{ip}_{port}_{proto_name}")
+                        # 提取传输层协议 (Aimili 在 proto 字段中注明 tcp 或 udp)
+                        proto_transport = str(n.get("proto") or ("tcp" if "_tcp" in nid else "udp")).lower()
+                        if port:
+                            aliases.append(f"{ip}_{port}_{proto_transport}")
+                            aliases.append(f"{ip}_{port}_openvpn")
                         aliases = list(set([a for a in aliases if a]))
 
                         # 提取带宽数据 (Aimili speed/speed_bps 单位为 bps)
                         speed_bps = int(n.get("speed_bps") or n.get("speed") or 0)
                         speed_mbps = round(speed_bps / 1e6, 1)
 
-                        protocol = proto_name or ("tcp" if "_tcp" in nid else "udp")
+                        protocol = proto_name or "openvpn"
 
                         candidates.append(CandidateNode(
                             id=nid,
@@ -515,7 +519,8 @@ class AimiliClient:
                             speed_bps=speed_bps,
                             speed_mbps=speed_mbps,
                             pool_endpoint_id=pool_id,
-                            aliases=aliases
+                            aliases=aliases,
+                            transport=proto_transport
                         ))
                     curr_offset += len(raw_nodes)
                     if len(raw_nodes) < batch_size:
@@ -661,8 +666,8 @@ class AimiliClient:
         cand_ids = []
         # 1. 第一优先级：Aimili 底层 OpenVPN 核心引擎真实绑定的别名 ID 格式: {ip}_{port}_{proto}
         if node.ip and node.port:
-            proto_clean = node.protocol.lower().replace("openvpn", "").strip("_-") or "udp"
-            cand_ids.append(f"{node.ip}_{node.port}_{proto_clean}")
+            transport = getattr(node, "transport", "").lower() or ("tcp" if "_tcp" in node.id else "udp")
+            cand_ids.append(f"{node.ip}_{node.port}_{transport}")
             cand_ids.append(f"{node.ip}_{node.port}_openvpn")
             cand_ids.append(f"{node.ip}_{node.port}_udp")
             cand_ids.append(f"{node.ip}_{node.port}_tcp")
