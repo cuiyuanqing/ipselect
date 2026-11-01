@@ -2438,15 +2438,20 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 aimili = self.engine.aimili
                 if not aimili.logged_in:
                     aimili.login()
-                test_url = f"{aimili.base_url}/api/ui/nodes?country=JP&limit=5"
-                try:
-                    req = urllib.request.Request(test_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
-                    with aimili.opener.open(req, timeout=5) as resp:
-                        res = json.loads(resp.read().decode("utf-8"))
-                        nodes = res.get("nodes", [])
-                        debug_info["first_node_full"] = nodes[0] if nodes else {}
-                except Exception as e:
-                    debug_info["error"] = str(e)
+                for lim in [50, 100, 200]:
+                    test_url = f"{aimili.base_url}/api/ui/nodes?country=JP&status=available&offset=0&limit={lim}"
+                    try:
+                        req = urllib.request.Request(test_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
+                        with aimili.opener.open(req, timeout=5) as resp:
+                            res = json.loads(resp.read().decode("utf-8"))
+                            nodes = res.get("nodes", [])
+                            debug_info[f"limit_{lim}"] = {
+                                "count": len(nodes),
+                                "total": res.get("total"),
+                                "protocols": list(set(n.get("protocol") for n in nodes))
+                            }
+                    except Exception as e:
+                        debug_info[f"limit_{lim}"] = str(e)
             self._send_json_response(debug_info)
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
             res = run_git_force_update()
