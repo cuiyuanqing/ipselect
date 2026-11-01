@@ -2438,29 +2438,15 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 aimili = self.engine.aimili
                 if not aimili.logged_in:
                     aimili.login()
-                debug_info["base_url"] = aimili.base_url
-                for test_url in [
-                    f"{aimili.base_url}/api/ui/nodes?country=JP&page=1&limit=30",
-                    f"{aimili.base_url}/api/ui/nodes?country=JP&page=2&limit=30",
-                    f"{aimili.base_url}/api/ui/nodes?country=JP&offset=30",
-                    f"{aimili.base_url}/api/ui/nodes?country=日本&limit=100",
-                    f"{aimili.base_url}/api/nodes?country=JP&limit=20",
-                    f"{aimili.base_url}/api/nodes?country=日本&limit=20"
-                ]:
-                    try:
-                        req = urllib.request.Request(test_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
-                        with aimili.opener.open(req, timeout=5) as resp:
-                            res = json.loads(resp.read().decode("utf-8"))
-                            nodes = res.get("nodes", [])
-                            first_ip = (nodes[0].get("ip") or nodes[0].get("host")) if nodes else None
-                            total_field = res.get("total") or res.get("count")
-                            debug_info[test_url] = {
-                                "returned_nodes_count": len(nodes),
-                                "total_field": total_field,
-                                "first_ip": first_ip
-                            }
-                    except Exception as e:
-                        debug_info[test_url] = {"error": str(e)}
+                test_url = f"{aimili.base_url}/api/ui/nodes?country=JP&limit=5"
+                try:
+                    req = urllib.request.Request(test_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
+                    with aimili.opener.open(req, timeout=5) as resp:
+                        res = json.loads(resp.read().decode("utf-8"))
+                        nodes = res.get("nodes", [])
+                        debug_info["first_node_full"] = nodes[0] if nodes else {}
+                except Exception as e:
+                    debug_info["error"] = str(e)
             self._send_json_response(debug_info)
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
             res = run_git_force_update()
