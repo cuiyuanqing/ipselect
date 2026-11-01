@@ -599,7 +599,8 @@ class AimiliClient:
 
         clean_id = expected_node_id.replace("pool:", "")
         start = time.time()
-        while time.time() - start < timeout:
+        max_wait = timeout
+        while time.time() - start < max_wait:
             st = self.get_state()
             if not st:
                 time.sleep(0.6)
@@ -632,9 +633,11 @@ class AimiliClient:
                 return True
 
             msg = str(st.get("last_check_message") or "")
-            # 2. 状态感知：若 Aimili 处于切换验证中，或正在建连，包容等待
-            is_connecting = bool(st.get("is_connecting")) or ("切换中" in msg) or ("后台验证" in msg) or ("验证中" in msg)
+            # 2. 状态感知：若 Aimili 处于初始化、切换验证中、或正在建连，动态延长等待上限至 30 秒容纳 OpenVPN TLS 握手
+            is_connecting = bool(st.get("is_connecting")) or any(k in msg for k in ["初始化", "切换中", "后台验证", "验证中"])
             if is_connecting:
+                if max_wait < 30.0:
+                    max_wait = 30.0
                 time.sleep(1.0)
                 continue
 
@@ -655,14 +658,21 @@ class AimiliClient:
         self.wait_for_idle(timeout=6.0)
 
         url = f"{self.base_url}/api/connect"
+        cand_ids = []
+        # 1. 第一优先级：Aimili 底层 OpenVPN 核心引擎真实绑定的别名 ID 格式: {ip}_{port}_{proto}
+        if node.ip and node.port:
+            proto_clean = node.protocol.lower().replace("openvpn", "").strip("_-") or "udp"
+            cand_ids.append(f"{node.ip}_{node.port}_{proto_clean}")
+            cand_ids.append(f"{node.ip}_{node.port}_openvpn")
+            cand_ids.append(f"{node.ip}_{node.port}_udp")
+            cand_ids.append(f"{node.ip}_{node.port}_tcp")
+
+        # 2. 第二优先级：候选池与端点别名
         clean_id = node.id.replace("pool:", "")
-        # 必须优先使用带 pool: 前缀的原生 ID！Aimili 候选池节点强依赖 pool: 前缀！
-        cand_ids = [node.id, f"pool:{clean_id}"]
+        cand_ids.extend([node.id, f"pool:{clean_id}"])
         if node.pool_endpoint_id:
-            cand_ids.insert(0, f"pool:{node.pool_endpoint_id}")
+            cand_ids.append(f"pool:{node.pool_endpoint_id}")
             cand_ids.append(node.pool_endpoint_id)
-        if node.ip and node.port and node.protocol:
-            cand_ids.append(f"{node.ip}_{node.port}_{node.protocol.lower()}")
         cand_ids.append(clean_id)
         seen = set()
         unique_ids = [x for x in cand_ids if x and not (x in seen or seen.add(x))]
