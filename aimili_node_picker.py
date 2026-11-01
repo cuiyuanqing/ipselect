@@ -2522,6 +2522,57 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 if self.engine and (not self.engine.aimili.logged_in):
                     self.engine.aimili.login()
                 query_params = urllib.parse.parse_qs(url.query)
+                if "test_socks5" in query_params:
+                    import socket
+                    res_info = {}
+                    for auth_item in [None, ("socks5", "ilovestudy")]:
+                        tag = "no_auth" if not auth_item else "with_auth"
+                        try:
+                            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            s.settimeout(4.0)
+                            s.connect(("127.0.0.1", self.engine.aimili.proxy_port or 8500))
+                            if auth_item:
+                                s.sendall(b"\x05\x02\x00\x02")
+                            else:
+                                s.sendall(b"\x05\x01\x00")
+                            resp = s.recv(2)
+                            if resp[1] == 2 and auth_item:
+                                u, p = auth_item
+                                s.sendall(bytes([1, len(u)]) + u.encode() + bytes([len(p)]) + p.encode())
+                                auth_resp = s.recv(2)
+                                if auth_resp[1] != 0:
+                                    res_info[tag] = f"Auth failed: {auth_resp.hex()}"
+                                    s.close()
+                                    continue
+                            elif resp[1] != 0:
+                                res_info[tag] = f"Handshake failed: {resp.hex()}"
+                                s.close()
+                                continue
+                            # connect cachefly
+                            thost = "cachefly.cachefly.net"
+                            tport = 80
+                            s.sendall(b"\x05\x01\x00\x03" + bytes([len(thost)]) + thost.encode() + tport.to_bytes(2, "big"))
+                            cresp = s.recv(10)
+                            if len(cresp) < 4 or cresp[1] != 0:
+                                res_info[tag] = f"Connect failed: {cresp.hex()}"
+                                s.close()
+                                continue
+                            s.sendall(b"GET /1mb.test HTTP/1.1\r\nHost: cachefly.cachefly.net\r\nConnection: close\r\n\r\n")
+                            st_time = time.time()
+                            rbytes = 0
+                            while time.time() - st_time < 3.0:
+                                b = s.recv(16384)
+                                if not b:
+                                    break
+                                rbytes += len(b)
+                            dur = max(0.05, time.time() - st_time)
+                            s.close()
+                            speed = round((rbytes * 8.0) / (dur * 1e6), 2)
+                            res_info[tag] = f"SUCCESS: {rbytes} bytes in {dur:.2f}s ({speed} Mbps)"
+                        except Exception as e:
+                            res_info[tag] = f"Exception: {e}"
+                    self._send_json_response(res_info)
+                    return
                 view_file = query_params.get("file", [None])[0]
                 if view_file:
                     safe_path = os.path.abspath(view_file)
