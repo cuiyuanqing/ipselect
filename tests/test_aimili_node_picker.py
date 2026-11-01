@@ -6,6 +6,9 @@ Aimili 节点优选器实测测速与多轮补位单元测试
 
 import os
 import sys
+import tempfile
+import shutil
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -921,6 +924,121 @@ class TestAimiliActiveInfoAndSwitchNode(unittest.TestCase):
         self.assertIn("当前连接中", rendered)
         self.assertIn("🚀 设为出口", rendered)
         self.assertIn("switchAimiliNode", rendered)
+
+
+
+
+class TestMultiSourceIpRiskIntelligence(unittest.TestCase):
+    """测试多源权威风控融合质检矩阵 (GetIPIntel + AbuseIPDB + IPQS)"""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.cache_file = os.path.join(self.tmp_dir, "test_cache.json")
+        self.keys_file = os.path.join(self.tmp_dir, "test_keys.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_load_api_keys_from_file(self):
+        with open(self.keys_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "abuseipdb_key": "test_abuse_key",
+                "ipqs_key": "test_ipqs_key",
+                "contact_email": "test@example.com"
+            }, f)
+
+        mgr = IpIntelligenceManager(
+            cache_file=self.cache_file,
+            api_keys_file=self.keys_file
+        )
+        self.assertEqual(mgr.abuseipdb_key, "test_abuse_key")
+        self.assertEqual(mgr.ipqs_key, "test_ipqs_key")
+        self.assertEqual(mgr.contact_email, "test@example.com")
+
+    def test_getipintel_proxy_prob_1_triggers_high_risk(self):
+        mgr = IpIntelligenceManager(
+            cache_file=self.cache_file,
+            api_keys_file=self.keys_file
+        )
+        # 模拟 IP-API 返回住宅宽带
+        mgr._query_ip_api = MagicMock(return_value=IpQuality(
+            ip="118.156.88.5",
+            isp="KDDI",
+            ip_type="家庭宽带 IP",
+            is_residential=True,
+            risk_score=0
+        ))
+        # 模拟 GetIPIntel 判定为 100% 代理 (如 118.156.88.5 实测)
+        mgr._query_getipintel = MagicMock(return_value=(IpQuality(
+            ip="118.156.88.5",
+            isp="KDDI",
+            ip_type="家庭宽带 IP",
+            is_residential=True,
+            is_proxy=True,
+            risk_score=100,
+            risk_label="高危公共代理(GetIPIntel:1.0)"
+        ), True))
+
+        q = mgr.inspect_ip("118.156.88.5")
+        self.assertTrue(q.is_proxy)
+        self.assertGreaterEqual(q.risk_score, 10)
+        self.assertIn("代理", q.risk_label)
+
+    def test_abuseipdb_reports_elevate_risk_score(self):
+        mgr = IpIntelligenceManager(
+            cache_file=self.cache_file,
+            api_keys_file=self.keys_file,
+            abuseipdb_key="fake_key"
+        )
+        mgr._query_ip_api = MagicMock(return_value=IpQuality(
+            ip="1.2.3.4",
+            isp="NTT",
+            ip_type="家庭宽带 IP",
+            is_residential=True,
+            risk_score=0
+        ))
+        # GetIPIntel 认为是纯净的
+        mgr._query_getipintel = MagicMock(return_value=(IpQuality(
+            ip="1.2.3.4",
+            risk_score=0
+        ), True))
+        # 模拟 AbuseIPDB 存在 3 次恶意滥用举报
+        fake_abuse_data = {"data": {"abuseConfidenceScore": 25, "totalReports": 3}}
+        with patch.object(mgr, "_query_abuseipdb") as mock_abuse:
+            mock_abuse.return_value = (IpQuality(
+                ip="1.2.3.4",
+                isp="NTT",
+                ip_type="家庭宽带 IP",
+                is_residential=True,
+                risk_score=60,
+                risk_label="历史恶意滥用(AbuseIPDB:25%,举报:3次)",
+                abuse_score=25,
+                abuse_reports=3
+            ), True)
+            q = mgr.inspect_ip("1.2.3.4")
+            self.assertGreaterEqual(q.risk_score, 10)
+            self.assertEqual(q.abuse_reports, 3)
+
+    def test_pure_residential_node_evaluates_low_risk(self):
+        mgr = IpIntelligenceManager(
+            cache_file=self.cache_file,
+            api_keys_file=self.keys_file
+        )
+        mgr._query_ip_api = MagicMock(return_value=IpQuality(
+            ip="42.124.87.38",
+            isp="NTT",
+            ip_type="家庭宽带 IP",
+            is_residential=True,
+            risk_score=0
+        ))
+        mgr._query_getipintel = MagicMock(return_value=(IpQuality(
+            ip="42.124.87.38",
+            risk_score=0
+        ), True))
+
+        q = mgr.inspect_ip("42.124.87.38")
+        self.assertLessEqual(q.risk_score, 7)
+        self.assertIn("纯净家宽", q.risk_label)
 
 
 if __name__ == "__main__":

@@ -103,6 +103,7 @@ CONFIG_FILE = os.path.join(DATA_DIR, "picker_config.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "latest_picked_nodes.json")
 EXPERIENCE_FILE = os.path.join(DATA_DIR, "node_experience.json")
 BLACKLIST_FILE = os.path.join(DATA_DIR, "ip_blacklist.json")
+API_KEYS_FILE = os.path.join(DATA_DIR, "api_keys.json")
 
 # ==============================================================================
 # 2. 数据结构定义
@@ -122,6 +123,10 @@ class IpQuality:
     is_native: bool = False       # 原生 IP
     shared_users: str = "未知"    # e.g., "1 - 10 (极好)", "10 - 100 (一般)"
     updated_at: float = 0.0
+    abuse_score: int = 0          # AbuseIPDB 滥用置信度 (0 ~ 100)
+    abuse_reports: int = 0        # AbuseIPDB 全球被举报滥用次数
+    ipqs_fraud_score: int = -1    # IPQualityScore 欺诈评分 (0 ~ 100)
+    is_proxy: bool = False        # 是否为代理/VPN
 
 @dataclass
 class NodeExperience:
@@ -1197,7 +1202,7 @@ class AimiliClient:
 # ==============================================================================
 
 class IpIntelligenceManager:
-    """负责并发查询各目标 IP 的风控分、家庭宽带属性与共享人数，带防反爬自愈与多备选源降级矩阵"""
+    """负责并发查询各目标 IP 的风控分、家庭宽带属性与共享人数，融合 AbuseIPDB + IPQS + GetIPIntel + Ping0 + IP-API"""
 
     RESIDENTIAL_ISP_KEYWORDS = [
         "sony", "so-net", "tokai", "kddi", "softbank", "ocn", "ntt",
@@ -1210,15 +1215,55 @@ class IpIntelligenceManager:
         "singtel", "starhub", "myrepublic", "chunghwa", "hkt", "hkbn", "kt", "sk broadband", "lgu+"
     ]
 
-    def __init__(self, cache_file: str = CACHE_FILE, ttl_hours: int = 24):
+    def __init__(self, cache_file: str = CACHE_FILE, ttl_hours: int = 24 * 7,
+                 api_keys_file: str = API_KEYS_FILE,
+                 abuseipdb_key: str = "104fe58ff3cf6ef689dbc74472fb0187bc14b0cdff9eb5dddbbeed53c804b29252dc49ab81d7b8e4",
+                 ipqs_key: str = "3QEDwQNx93b3WgUHbrfjCvQAqDncdsqT",
+                 contact_email: str = "cuiyuanqing@gmail.com"):
         self.cache_file = cache_file
+        self.api_keys_file = api_keys_file
         self.ttl_seconds = ttl_hours * 3600
         self.cache: Dict[str, Dict[str, Any]] = {}
         self._cookie_jar = http.cookiejar.CookieJar()
         self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._cookie_jar))
         self._ping0_block_count: int = 0
         self._ping0_circuit_broken: bool = False
+
+        self.abuseipdb_key = abuseipdb_key
+        self.ipqs_key = ipqs_key
+        self.contact_email = contact_email
+        self._load_api_keys()
         self._load_cache()
+
+    def _load_api_keys(self):
+        """加载 AbuseIPDB 与 IPQualityScore API 凭据"""
+        keys = {}
+        if os.path.isfile(self.api_keys_file):
+            try:
+                with open(self.api_keys_file, "r", encoding="utf-8") as f:
+                    keys = json.load(f)
+            except Exception as e:
+                logger.warning(f"⚠️ 读取 {self.api_keys_file} 失败: {e}")
+
+        self.abuseipdb_key = os.environ.get("ABUSEIPDB_KEY") or keys.get("abuseipdb_key", "") or self.abuseipdb_key
+        self.ipqs_key = os.environ.get("IPQS_KEY") or keys.get("ipqs_key", "") or self.ipqs_key
+        self.contact_email = os.environ.get("CONTACT_EMAIL") or keys.get("contact_email", "") or self.contact_email or "cuiyuanqing@gmail.com"
+
+        # 同步写入/更新到底层 api_keys.json
+        try:
+            os.makedirs(os.path.dirname(self.api_keys_file), exist_ok=True)
+            with open(self.api_keys_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "abuseipdb_key": self.abuseipdb_key,
+                    "ipqs_key": self.ipqs_key,
+                    "contact_email": self.contact_email
+                }, f, ensure_ascii=False, indent=2)
+            if self.abuseipdb_key:
+                logger.info(f"🔑 [风控配置] 已载入 AbuseIPDB API Key (前缀: {self.abuseipdb_key[:8]}...)")
+            if self.ipqs_key:
+                logger.info(f"🔑 [风控配置] 已载入 IPQualityScore API Key (前缀: {self.ipqs_key[:8]}...)")
+        except Exception as e:
+            logger.warning(f"⚠️ 同步 {self.api_keys_file} 失败: {e}")
 
     def reset_circuit_breaker(self):
         """重置熔断器状态，供新一轮扫描开始时调用"""
@@ -1233,13 +1278,9 @@ class IpIntelligenceManager:
                     clean = {}
                     for ip, entry in raw_cache.items():
                         if entry.get("ip_type") != "未知宽带类型" and entry.get("risk_label") not in ["未知", "检测超时", "反爬拦截"]:
-                            # 自动修正历史缓存中被赋为 12% 的家宽条目
-                            if entry.get("risk_score") == 12 and entry.get("is_residential"):
-                                entry["risk_score"] = 5
-                                entry["risk_label"] = "纯净家宽"
                             clean[ip] = entry
                     self.cache = clean
-                    logger.info(f"📂 成功加载 IP 情报有效缓存共 {len(self.cache)} 条 (已自动净化历史异常条目)")
+                    logger.info(f"📂 成功加载 IP 情报有效缓存共 {len(self.cache)} 条")
             except Exception as e:
                 logger.warning(f"⚠️ 读取 IP 缓存失败: {e}")
 
@@ -1252,10 +1293,14 @@ class IpIntelligenceManager:
 
     def inspect_ip(self, ip: str, source_mode: str = "auto") -> IpQuality:
         """
-        查询单个 IP 的风控质量，支持多源模式：
-          - auto: 智能自动降级 (Ping0 优先 -> 熔断直通 / IP-API 兜底 -> IPWho.is 补偿)
-          - fallback_only: 极速备选源通道 (仅走 IP-API + IPWho.is，完全规避 Ping0 频控)
-          - ping0_only: 严格主通道 (仅走 Ping0.cc)
+        多源权威联合质检 IP：
+        1. 命中本地有效缓存直接复用；
+        2. 物理网络属性前置提取 (IP-API / IPWhois)：机房 IDC 直接阻断，不浪费第三方 API 配额；
+        3. 权威反代理检测 (GetIPIntel)：识别公共 VPN/代理概率；
+        4. 全球黑名单与滥用举报检测 (AbuseIPDB 官方 API)；
+        5. 深度欺诈风控检测 (IPQualityScore 官方 API)；
+        6. 辅助家宽标签补充 (Ping0.cc)；
+        7. 综合评定：若任一权威源判定超标 (≥10% 或代理命中)，一票否决拉黑！
         """
         now = time.time()
         cached = self.cache.get(ip)
@@ -1266,37 +1311,160 @@ class IpIntelligenceManager:
 
         quality = IpQuality(ip=ip, updated_at=time.time())
 
-        if source_mode == "fallback_only":
-            # 极速备用源模式
-            quality = self._query_ip_api(ip, quality)
-            if quality.ip_type == "未知宽带类型":
-                quality = self._query_ipwhois(ip, quality)
-        elif source_mode == "ping0_only":
-            # 仅主数据源
-            quality = self._query_ping0_with_retry(ip)
-        else:
-            # 智能自动融合降级模式 (auto)
-            if self._ping0_circuit_broken:
-                # 熔断直通：避免每节点耗时 6 秒等待无效的 Ping0 反爬重试
-                logger.debug(f"⚡ [熔断直通] IP {ip} 直通备选源 (IP-API)...")
-                quality = self._query_ip_api(ip, quality)
-                if quality.risk_label in ["未知", "反爬拦截", "检测超时"] or quality.ip_type == "未知宽带类型":
-                    quality = self._query_ipwhois(ip, quality)
-            else:
-                quality = self._query_ping0_with_retry(ip)
-                if quality.risk_label in ["未知", "反爬拦截", "检测超时"] or quality.ip_type == "未知宽带类型":
-                    logger.info(f"🔄 触发自动降级：无缝切换备选接口 1 (IP-API) 复检 IP: {ip}...")
-                    quality = self._query_ip_api(ip, quality)
-                    if quality.risk_label in ["未知", "反爬拦截", "检测超时"] or quality.ip_type == "未知宽带类型":
-                        logger.info(f"🔄 触发二级自动降级：切换备选接口 2 (IPWho.is) 复检 IP: {ip}...")
-                        quality = self._query_ipwhois(ip, quality)
+        # 第一步：物理属性检测 (IP-API / IPWho.is)
+        quality = self._query_ip_api(ip, quality)
+        if quality.ip_type == "未知宽带类型" or quality.risk_label in ["未知", "检测超时"]:
+            quality = self._query_ipwhois(ip, quality)
 
-        # 仅当结果为有效数据时才写入持久化缓存
+        # 若判定为机房 IDC 或非住宅宽带，直接标记高风险机房并返回 (零消耗第三方风控 API 额度)
+        if not quality.is_residential or "机房" in quality.ip_type or "IDC" in quality.ip_type:
+            logger.info(f"🚫 [机房拦截] IP {ip:<15} 为数据中心 IDC (Hosting)，直接淘汰，免查风控 API")
+            quality.risk_score = 90
+            quality.risk_label = "数据中心 IDC"
+            self._save_valid_cache(quality)
+            return quality
+
+        # 第二步：GetIPIntel 权威代理/VPN 检测 (无需 Key，免费 500 次/天)
+        quality, intel_ok = self._query_getipintel(ip, quality)
+        if quality.risk_score >= 10:
+            logger.warning(f"🚨 [GetIPIntel 拦截] IP {ip:<15} 确认为高危公共代理/VPN节点 (风控: {quality.risk_score}%)，立即一票否决！")
+            self._save_valid_cache(quality)
+            return quality
+
+        # 第三步：AbuseIPDB 官方 API 恶意滥用与举报核验 (官方 Key，1000 次/天)
+        if self.abuseipdb_key:
+            quality, abuse_ok = self._query_abuseipdb(ip, quality)
+            if quality.risk_score >= 10:
+                logger.warning(f"🚨 [AbuseIPDB 拦截] IP {ip:<15} 存在恶意滥用/举报记录 (风控: {quality.risk_score}%, 举报: {quality.abuse_reports}次)，立即一票否决！")
+                self._save_valid_cache(quality)
+                return quality
+
+        # 第四步：IPQualityScore (IPQS) 官方 API 深度欺诈核验 (官方 Key，1000 次/月)
+        if self.ipqs_key:
+            quality, ipqs_ok = self._query_ipqs(ip, quality)
+            if quality.risk_score >= 10:
+                logger.warning(f"🚨 [IPQS 拦截] IP {ip:<15} 欺诈分/活跃VPN超标 (风控: {quality.risk_score}%)，立即一票否决！")
+                self._save_valid_cache(quality)
+                return quality
+
+        # 第五步：Ping0.cc 辅助宽带标签补充 (若未熔断)
+        if not self._ping0_circuit_broken and source_mode != "fallback_only":
+            pq, ok = self._query_ping0(ip)
+            if ok:
+                if pq.risk_score > quality.risk_score:
+                    quality.risk_score = pq.risk_score
+                    quality.risk_label = pq.risk_label
+                if pq.shared_users and pq.shared_users != "未知":
+                    quality.shared_users = pq.shared_users
+                if pq.is_native:
+                    quality.is_native = True
+                if "100 - 1000" in str(pq.shared_users) or "1000" in str(pq.shared_users):
+                    quality.risk_score = max(quality.risk_score, 16)
+                    quality.risk_label = "高共享节点(Ping0:16%)"
+
+        # 综合判定评级
+        if quality.risk_score <= 5 and not quality.is_proxy:
+            quality.risk_label = "极度纯净家宽"
+        elif quality.risk_score <= 7 and not quality.is_proxy:
+            quality.risk_label = "优质纯净家宽"
+        elif quality.risk_score >= 10:
+            if "高" not in quality.risk_label and "滥用" not in quality.risk_label:
+                quality.risk_label = f"超标风险({quality.risk_score}%)"
+
+        logger.info(f"🔍 [多源质检完毕] IP {ip:<15} -> 类型: {quality.ip_type:<10} | 风控: {quality.risk_score}% ({quality.risk_label}) | 共享: {quality.shared_users} | ISP: {quality.isp}")
+        self._save_valid_cache(quality)
+        return quality
+
+    def _save_valid_cache(self, quality: IpQuality):
+        """保存有效检测记录到缓存"""
         if quality.ip_type != "未知宽带类型" and quality.risk_label not in ["未知", "检测超时", "反爬拦截"]:
-            self.cache[ip] = asdict(quality)
+            self.cache[quality.ip] = asdict(quality)
             self._save_cache()
 
-        return quality
+    def _query_getipintel(self, ip: str, quality: IpQuality) -> Tuple[IpQuality, bool]:
+        """通过 GetIPIntel 官方服务检测代理与不良 IP 概率 (0.00 ~ 1.00)"""
+        url = f"http://check.getipintel.net/check.php?ip={ip}&contact={urllib.parse.quote(self.contact_email)}&flags=m"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "AimiliNodePicker/1.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                val_str = resp.read().decode("utf-8", errors="ignore").strip()
+                prob = float(val_str)
+                if prob >= 0.80:
+                    quality.is_proxy = True
+                    calc_risk = max(quality.risk_score, int(prob * 100))
+                    quality.risk_score = calc_risk
+                    quality.risk_label = f"高危公共代理(GetIPIntel:{prob})"
+                    quality.shared_users = "100 - 1000 (高危代理)"
+                elif prob >= 0.20:
+                    calc_risk = max(quality.risk_score, int(prob * 30))
+                    quality.risk_score = calc_risk
+                return quality, True
+        except Exception as e:
+            logger.debug(f"⚠️ [GetIPIntel] 查询 IP {ip} 失败: {e}")
+        return quality, False
+
+    def _query_abuseipdb(self, ip: str, quality: IpQuality) -> Tuple[IpQuality, bool]:
+        """通过 AbuseIPDB 官方 API 查询全球黑名单与恶意滥用举报历史"""
+        if not self.abuseipdb_key:
+            return quality, False
+        url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip}&maxAgeInDays=90&verbose"
+        headers = {
+            "Key": self.abuseipdb_key,
+            "Accept": "application/json",
+            "User-Agent": "AimiliNodePicker/1.0"
+        }
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8")).get("data", {})
+                conf_score = int(data.get("abuseConfidenceScore") or 0)
+                reports = int(data.get("totalReports") or 0)
+                quality.abuse_score = conf_score
+                quality.abuse_reports = reports
+
+                if conf_score >= 10 or reports >= 2:
+                    calc_risk = max(quality.risk_score, conf_score, 60)
+                    quality.risk_score = calc_risk
+                    quality.risk_label = f"历史恶意滥用(AbuseIPDB:{conf_score}%,举报:{reports}次)"
+                    quality.shared_users = "100+ (被举报共享)"
+                elif reports == 1:
+                    quality.risk_score = max(quality.risk_score, 12)
+                    quality.risk_label = "历史举报节点(AbuseIPDB:1次)"
+                return quality, True
+        except Exception as e:
+            logger.warning(f"⚠️ [AbuseIPDB] 查询 IP {ip} 失败: {e}")
+        return quality, False
+
+    def _query_ipqs(self, ip: str, quality: IpQuality) -> Tuple[IpQuality, bool]:
+        """通过 IPQualityScore (IPQS) 官方 API 查询欺诈分与活跃 VPN 属性"""
+        if not self.ipqs_key:
+            return quality, False
+        url = f"https://ipqualityscore.com/api/json/ip/{self.ipqs_key}/{ip}?strictness=1&allow_public_access_points=true"
+        headers = {"User-Agent": "AimiliNodePicker/1.0"}
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if data.get("success"):
+                    fraud_score = int(data.get("fraud_score") or 0)
+                    is_vpn = bool(data.get("vpn") or data.get("active_vpn"))
+                    is_proxy = bool(data.get("proxy"))
+                    quality.ipqs_fraud_score = fraud_score
+
+                    if is_vpn or is_proxy:
+                        quality.is_proxy = True
+                        quality.risk_score = max(quality.risk_score, max(fraud_score, 80))
+                        quality.risk_label = f"活跃代理/VPN(IPQS:{fraud_score}%)"
+                        quality.shared_users = "100+ (公共VPN)"
+                    elif fraud_score >= 10:
+                        quality.risk_score = max(quality.risk_score, fraud_score)
+                        quality.risk_label = f"高欺诈风险(IPQS:{fraud_score}%)"
+                    return quality, True
+                else:
+                    logger.debug(f"⚠️ [IPQS] 查询 IP {ip} 未成功: {data.get('message')}")
+        except Exception as e:
+            logger.debug(f"⚠️ [IPQS] 查询 IP {ip} 失败: {e}")
+        return quality, False
 
     def _query_ping0_with_retry(self, ip: str, max_retries: int = 2) -> IpQuality:
         """带重试保护的 Ping0 查询与连续失败智能熔断"""
@@ -1304,7 +1472,7 @@ class IpIntelligenceManager:
         for attempt in range(1, max_retries + 1):
             q, ok = self._query_ping0(ip)
             if ok:
-                self._ping0_block_count = 0  # 恢复正常，计数器归零
+                self._ping0_block_count = 0
                 return q
             quality = q
             self._ping0_block_count += 1
@@ -1325,15 +1493,7 @@ class IpIntelligenceManager:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,ja;q=0.7",
-            "Referer": "https://ping0.cc/",
-            "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-User": "?1",
-            "Upgrade-Insecure-Requests": "1"
+            "Referer": "https://ping0.cc/"
         }
         quality = IpQuality(ip=ip, updated_at=time.time())
 
@@ -1343,7 +1503,6 @@ class IpIntelligenceManager:
                 html = resp.read().decode("utf-8", errors="ignore")
 
             if len(html) < 15000 or any(k in html for k in ["Just a moment...", "429 Too Many Requests", "访问过于频繁", "cf-turnstile", "人机验证"]):
-                logger.warning(f"⚠️ [Ping0] IP {ip} 响应疑似被反爬或频控拦截 (长度: {len(html)} 字节)")
                 quality.risk_label = "反爬拦截"
                 return quality, False
 
@@ -1371,11 +1530,9 @@ class IpIntelligenceManager:
             else:
                 quality.ip_type = "未知宽带类型"
 
-            # 3. 提取原生 IP
             if "原生 IP" in html:
                 quality.is_native = True
 
-            # 4. 提取共享人数
             usecount_match = re.search(r'usecount="([^"]+)"', html)
             if usecount_match:
                 quality.shared_users = usecount_match.group(1).strip()
@@ -1384,7 +1541,6 @@ class IpIntelligenceManager:
                 if uc_fallback:
                     quality.shared_users = uc_fallback.group(1).strip()
 
-            # 5. 提取 ISP / ASN
             asn_match = re.search(r'name="description" content="[^"]*?-([^"]+)"', html)
             if asn_match:
                 desc_parts = asn_match.group(1).split("-")
@@ -1393,17 +1549,16 @@ class IpIntelligenceManager:
                     quality.isp = desc_parts[1].strip()
 
             if quality.ip_type != "未知宽带类型" and quality.risk_label not in ["未知", "反爬拦截"]:
-                logger.info(f"🔍 [Ping0] IP {ip:<15} -> 类型: {quality.ip_type:<10} | 风控: {quality.risk_score}% ({quality.risk_label}) | 共享人数: {quality.shared_users} | 原生: {quality.is_native}")
                 return quality, True
 
         except Exception as e:
-            logger.warning(f"⚠️ 查询 Ping0 [{ip}] 异常: {e}")
+            logger.debug(f"⚠️ 查询 Ping0 [{ip}] 异常: {e}")
             quality.risk_label = "检测超时"
 
         return quality, False
 
     def _query_ip_api(self, ip: str, fallback_quality: IpQuality) -> IpQuality:
-        """备选通道 1: 通过 ip-api.com 高速精准识别住宅 ISP 与机房属性"""
+        """基础网络通道 1: 通过 ip-api.com 精准识别住宅宽带与机房 IDC 物理属性"""
         url = f"http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,regionName,city,isp,org,as,mobile,proxy,hosting"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -1424,34 +1579,25 @@ class IpIntelligenceManager:
 
                     is_isp_match = any(k in isp.lower() or k in org.lower() for k in self.RESIDENTIAL_ISP_KEYWORDS)
 
-                    if not hosting and is_isp_match:
-                        fallback_quality.ip_type = "家庭宽带 IP"
+                    if not hosting:
+                        fallback_quality.ip_type = "家庭宽带 IP" if is_isp_match else "住宅/商业宽带"
                         fallback_quality.is_residential = True
-                        fallback_quality.risk_score = 3
-                        fallback_quality.risk_label = "极度纯净(IP-API)"
-                        fallback_quality.shared_users = "1 - 10 (极好)"
-                        fallback_quality.is_native = True
-                    elif not hosting:
-                        fallback_quality.ip_type = "住宅/商业宽带"
-                        fallback_quality.is_residential = True
-                        fallback_quality.risk_score = 5
-                        fallback_quality.risk_label = "纯净家宽(IP-API)"
-                        fallback_quality.shared_users = "1 - 10 (极好)"
+                        fallback_quality.risk_score = 0  # 物理属性基础分 0，等待权威风控源验身
+                        fallback_quality.risk_label = "物理家宽"
+                        fallback_quality.shared_users = "1 - 10"
                         fallback_quality.is_native = True
                     else:
                         fallback_quality.ip_type = "数据中心 IDC"
                         fallback_quality.is_residential = False
-                        fallback_quality.risk_score = 85
-                        fallback_quality.risk_label = "高风险机房"
+                        fallback_quality.risk_score = 90
+                        fallback_quality.risk_label = "数据中心 IDC"
 
-                    logger.info(f"🔍 [备选源: IP-API] IP {ip:<15} -> 类型: {fallback_quality.ip_type:<10} | 风控: {fallback_quality.risk_score}% ({fallback_quality.risk_label}) | ISP: {isp}")
                     return fallback_quality
         except Exception as e:
-            logger.warning(f"⚠️ [IP-API] 查询 IP {ip} 失败: {e}")
-        return fallback_quality
+            logger.debug(f"⚠️ [IP-API] 查询 IP {ip} 失败: {e}")
 
     def _query_ipwhois(self, ip: str, fallback_quality: IpQuality) -> IpQuality:
-        """备选通道 2: 通过 ipwho.is 国际威胁情报精准识别 Hosting 与 VPN 状态"""
+        """基础网络通道 2: 通过 ipwho.is 识别 Hosting 与基础属性"""
         url = f"https://ipwho.is/{ip}"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -1471,36 +1617,24 @@ class IpIntelligenceManager:
                     fallback_quality.updated_at = time.time()
 
                     is_hosting = bool(sec.get("hosting", False))
-                    is_vpn = bool(sec.get("vpn", False))
-                    is_proxy = bool(sec.get("proxy", False))
-
                     is_isp_match = any(k in isp.lower() for k in self.RESIDENTIAL_ISP_KEYWORDS)
 
-                    if not is_hosting and is_isp_match:
-                        fallback_quality.ip_type = "家庭宽带 IP"
+                    if not is_hosting:
+                        fallback_quality.ip_type = "家庭宽带 IP" if is_isp_match else "住宅/商业宽带"
                         fallback_quality.is_residential = True
-                        fallback_quality.risk_score = 3
-                        fallback_quality.risk_label = "极度纯净(IPWhois)"
-                        fallback_quality.shared_users = "1 - 10 (极好)"
-                        fallback_quality.is_native = True
-                    elif not is_hosting and not is_vpn and not is_proxy:
-                        fallback_quality.ip_type = "住宅/商业宽带"
-                        fallback_quality.is_residential = True
-                        fallback_quality.risk_score = 5
-                        fallback_quality.risk_label = "纯净家宽(IPWhois)"
-                        fallback_quality.shared_users = "1 - 10 (极好)"
+                        fallback_quality.risk_score = 0
+                        fallback_quality.risk_label = "物理家宽"
+                        fallback_quality.shared_users = "1 - 10"
                         fallback_quality.is_native = True
                     else:
                         fallback_quality.ip_type = "数据中心 IDC"
                         fallback_quality.is_residential = False
-                        fallback_quality.risk_score = 85
-                        fallback_quality.risk_label = "高风险机房"
+                        fallback_quality.risk_score = 90
+                        fallback_quality.risk_label = "数据中心 IDC"
 
-                    logger.info(f"🔍 [备选源: IPWhois] IP {ip:<15} -> 类型: {fallback_quality.ip_type:<10} | 风控: {fallback_quality.risk_score}% ({fallback_quality.risk_label}) | ISP: {isp}")
                     return fallback_quality
         except Exception as e:
-            logger.warning(f"⚠️ [IPWhois] 查询 IP {ip} 失败: {e}")
-        return fallback_quality
+            logger.debug(f"⚠️ [IPWho.is] 查询 IP {ip} 失败: {e}")
 
 # ==============================================================================
 # 6. 核心优选排程器 (三阶段智能流水线: 速率过滤 + 存量验身 + 经验加权补位)
