@@ -2439,48 +2439,28 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 if not aimili.logged_in:
                     aimili.login()
                 debug_info["base_url"] = aimili.base_url
-                try:
-                    q_url = f"{aimili.base_url}/api/nodes"
-                    req = urllib.request.Request(q_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
-                    with aimili.opener.open(req, timeout=8) as resp:
-                        res = json.loads(resp.read().decode("utf-8"))
-                        nodes = res.get("nodes", [])
-                        jp_nodes = [
-                            n for n in nodes
-                            if n.get("country") in ("日本", "JP", "Japan")
-                            or str(n.get("country_short", "")).upper() == "JP"
-                            or "jp" in str(n.get("host_name", "")).lower()
-                            or "japan" in str(n.get("location", "")).lower()
-                        ]
-                        debug_info["total_nodes_in_db"] = len(nodes)
-                        debug_info["jp_nodes_in_db"] = len(jp_nodes)
-                        if jp_nodes:
-                            debug_info["sample_jp_node"] = {
-                                "id": jp_nodes[0].get("id"),
-                                "ip": jp_nodes[0].get("ip"),
-                                "port": jp_nodes[0].get("port") or jp_nodes[0].get("remote_port"),
-                                "proto": jp_nodes[0].get("proto") or jp_nodes[0].get("protocol"),
-                                "country": jp_nodes[0].get("country"),
-                                "speed": jp_nodes[0].get("speed"),
-                                "pool_endpoint_id": jp_nodes[0].get("pool_endpoint_id")
+                for test_url in [
+                    f"{aimili.base_url}/api/ui/nodes?country=JP&page=1&limit=30",
+                    f"{aimili.base_url}/api/ui/nodes?country=JP&page=2&limit=30",
+                    f"{aimili.base_url}/api/ui/nodes?country=JP&offset=30",
+                    f"{aimili.base_url}/api/ui/nodes?country=日本&limit=100",
+                    f"{aimili.base_url}/api/nodes?country=JP&limit=20",
+                    f"{aimili.base_url}/api/nodes?country=日本&limit=20"
+                ]:
+                    try:
+                        req = urllib.request.Request(test_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
+                        with aimili.opener.open(req, timeout=5) as resp:
+                            res = json.loads(resp.read().decode("utf-8"))
+                            nodes = res.get("nodes", [])
+                            first_ip = (nodes[0].get("ip") or nodes[0].get("host")) if nodes else None
+                            total_field = res.get("total") or res.get("count")
+                            debug_info[test_url] = {
+                                "returned_nodes_count": len(nodes),
+                                "total_field": total_field,
+                                "first_ip": first_ip
                             }
-                        if jp_nodes:
-                            debug_info["sample_jp_node"] = jp_nodes[0]
-                            debug_info["sample_jp_nodes_first_5"] = [
-                                {
-                                    "id": n.get("id"),
-                                    "ip": n.get("ip") or n.get("host"),
-                                    "port": n.get("port"),
-                                    "country": n.get("country"),
-                                    "protocol": n.get("protocol"),
-                                    "speed": n.get("speed") or n.get("speed_bps"),
-                                    "ping": n.get("ping") or n.get("latency"),
-                                    "operator": n.get("operator") or n.get("isp")
-                                }
-                                for n in jp_nodes[:5]
-                            ]
-                except Exception as e:
-                    debug_info["error"] = str(e)
+                    except Exception as e:
+                        debug_info[test_url] = {"error": str(e)}
             self._send_json_response(debug_info)
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
             res = run_git_force_update()
