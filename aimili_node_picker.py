@@ -176,6 +176,7 @@ class CandidateNode:
     packet_loss_pct: int = 0
     transport: str = "udp"
     exact_node_id: Optional[str] = None
+    is_verified_speed: bool = False
 
     @property
     def canonical_fav_id(self) -> str:
@@ -474,10 +475,9 @@ class AimiliClient:
                   {status_clause}
                   AND LOWER(e.protocol)='openvpn'
                   AND e.port > 0
-                ORDER BY e.fail_streak ASC,
-                         (CASE WHEN e.success_count > 0 THEN 1 ELSE 0 END) DESC,
+                  AND e.fail_streak = 0
+                ORDER BY (CASE WHEN e.success_count > 0 THEN 1 ELSE 0 END) DESC,
                          COALESCE(json_extract(e.metadata_json, '$.switch_speed_bps'), 0) DESC,
-                         json_extract(s.metadata_json, '$.speed') DESC,
                          e.success_streak DESC,
                          e.ui_latency_ms ASC
                 LIMIT ? OFFSET ?
@@ -513,13 +513,16 @@ class AimiliClient:
 
                 speed_bps = 0
                 exact_node_id = None
+                is_real_speed = False
                 try:
                     e_meta = json.loads(e_meta_str) if e_meta_str else {}
                     if e_meta.get("switch_speed_bps"):
                         speed_bps = int(e_meta.get("switch_speed_bps"))
+                        is_real_speed = True
                     elif s_meta_str:
                         s_meta = json.loads(s_meta_str)
-                        speed_bps = int(s_meta.get("speed") or 0)
+                        # 未实测过的节点，公布速率通常虚高，折算作为参考底分以防抢占实测优质节点
+                        speed_bps = int(int(s_meta.get("speed") or 0) * 0.005)
                     if e_meta.get("node_id"):
                         exact_node_id = str(e_meta.get("node_id"))
                 except Exception:
@@ -576,7 +579,8 @@ class AimiliClient:
                     pool_endpoint_id=pool_id,
                     aliases=list(set(aliases)),
                     transport=transport,
-                    exact_node_id=canonical_node_id
+                    exact_node_id=canonical_node_id,
+                    is_verified_speed=is_real_speed
                 ))
             if candidates:
                 logger.info(f"💾 成功从 Aimili 本地 SQLite 读取到 [{country}] 地区存活 OpenVPN 候选节点共 {len(candidates)} 个 (offset={offset})")
@@ -698,7 +702,18 @@ class AimiliClient:
                 res = json.loads(resp.read().decode("utf-8"))
                 return bool(res.get("ok"))
         except Exception as e:
-            logger.error(f"❌ 收藏节点 [{node.ip}] (ID: {fav_id}) 异常: {e}")
+            logger.warning(f"⚠️ 调用 API 收藏节点 [{node.ip}] (ID: {fav_id}) 异常: {e}，同步写入本地 ui_auth.json 兜底")
+            try:
+                cur_favs = self.get_current_favorites()
+                if favorite:
+                    if fav_id not in cur_favs:
+                        cur_favs.append(fav_id)
+                else:
+                    cur_favs = [fid for fid in cur_favs if fid != fav_id and fid != node.id and fid != node.pool_endpoint_id]
+                self.sync_auth_file_favorites(cur_favs)
+                return True
+            except Exception:
+                pass
             return False
 
     def get_state(self) -> Dict[str, Any]:
@@ -745,7 +760,7 @@ class AimiliClient:
 
         clean_id = expected_node_id.replace("pool:", "")
         start = time.time()
-        max_wait = max(float(timeout), 35.0)
+        max_wait = max(float(timeout), 60.0)
         while time.time() - start < max_wait:
             st = self.get_state()
             if not st:
@@ -781,18 +796,27 @@ class AimiliClient:
                 return True
 
             msg = str(st.get("last_check_message") or "")
-            # 2. 状态感知：若 Aimili 处于初始化、切换验证中、或正在建连，动态延长等待上限至 45 秒容纳 OpenVPN TLS 握手与 cutover
-            is_connecting = bool(st.get("is_connecting")) or any(k in msg for k in ["初始化", "切换中", "后台验证", "验证中", "仍在建立"])
-            if is_connecting:
-                if max_wait < 45.0:
-                    max_wait = 45.0
-                time.sleep(1.0)
-                continue
+            manual_msg = str(st.get("manual_switch_message") or "")
+            full_msg = f"{msg} | {manual_msg}"
 
-            # 3. 明确终态建连失败：只有确认已结束切换且消息明确匹配当前目标节点时才提前退出
-            if (expected_ip in msg or clean_id in msg) and any(k in msg for k in ["连不上", "Node not found", "失败", "不可用"]) and not is_tunnel_ok:
-                logger.warning(f"⚠️ 节点 {expected_node_id} 隧道建连失败: {msg}")
+            # 2. 状态感知：若 Aimili 处于正在建连、切换验证中、或接管 8500 代理中，动态延长等待上限至 85 秒容纳完整 OpenVPN TLS 握手与 cutover
+            is_connecting = bool(st.get("is_connecting")) or bool(st.get("manual_switch_active")) or any(k in full_msg for k in ["初始化", "切换中", "后台验证", "验证中", "仍在建立", "正在接管", "正在建立"])
+            if is_connecting:
+                if max_wait < 85.0:
+                    max_wait = 85.0
+
+            # 3. 明确终态建连失败：消息明确指示当前节点建连失败，或 Aimili 保持原连接不变
+            has_fail_signal = any(k in full_msg for k in ["连不上", "Node not found", "失败", "不可用", "AUTH_FAILED", "ERR_OVPN", "保持不变", "握手未完成", "No route to host"])
+            is_target_in_msg = (expected_ip and expected_ip in full_msg) or (clean_id and clean_id in full_msg)
+
+            if is_target_in_msg and has_fail_signal:
+                logger.warning(f"⚠️ 节点 {expected_node_id} 明确建连失败: {full_msg.strip(' |')}")
                 return False
+
+            if not is_connecting and time.time() - start > 10.0:
+                if expected_ip and proxy_ip and proxy_ip != expected_ip and has_fail_signal:
+                    logger.warning(f"⚠️ 节点 {expected_node_id} 切换结束但未生效: {full_msg.strip(' |')}")
+                    return False
 
             time.sleep(1.0)
         return False
@@ -935,6 +959,15 @@ class AimiliClient:
 
     def get_current_favorites(self) -> List[str]:
         """获取 Aimili 当前已收藏的节点 ID 列表"""
+        if not self.logged_in and not self.login():
+            if os.path.isfile(self.auth_file):
+                try:
+                    with open(self.auth_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    return list(data.get("favorite_node_ids", []))
+                except Exception:
+                    pass
+            return []
         url = f"{self.base_url}/api/ui/state"
         req = urllib.request.Request(url, headers={"User-Agent": "AimiliPurePicker/1.0"})
         try:
@@ -944,6 +977,13 @@ class AimiliClient:
                 return list(state.get("favorite_node_ids", []))
         except Exception as e:
             logger.warning(f"⚠️ 获取当前收藏列表异常: {e}")
+            if os.path.isfile(self.auth_file):
+                try:
+                    with open(self.auth_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    return list(data.get("favorite_node_ids", []))
+                except Exception:
+                    pass
             return []
 
     def sync_auth_file_favorites(self, fav_ids: List[str]):
@@ -1921,8 +1961,12 @@ class PickerEngine:
                         node.packet_loss_pct = net_q.get("packet_loss_pct", 0)
                         alive_candidates.append(node)
 
-                    # 优先将预期带宽速率高且连通记录优秀的家宽节点排在前面实测 (实测带宽优先，延迟为次要参考)
-                    alive_candidates.sort(key=lambda n: (-getattr(n, "speed_mbps", 0.0), n.latency_ms))
+                    # 优先将历史实测带宽达标、高信誉且连通记录优秀的家宽节点排在前面实测
+                    alive_candidates.sort(key=lambda n: (
+                        -1 if getattr(n, "is_verified_speed", False) else 0,
+                        -getattr(n, "speed_mbps", 0.0),
+                        n.latency_ms
+                    ))
                     logger.info(
                         f"✅ [并发预检完成] {len(fresh_candidates)} 个节点中共有 {len(alive_candidates)} 个存活且低抖动达标！"
                     )
