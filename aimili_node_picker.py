@@ -2522,6 +2522,27 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 if self.engine and (not self.engine.aimili.logged_in):
                     self.engine.aimili.login()
                 query_params = urllib.parse.parse_qs(url.query)
+                view_file = query_params.get("file", [None])[0]
+                if view_file:
+                    safe_path = os.path.abspath(view_file)
+                    if os.path.exists(safe_path) and os.path.isfile(safe_path):
+                        with open(safe_path, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read(50000)
+                        self._send_json_response({"file": safe_path, "content": content})
+                        return
+                    else:
+                        self._send_json_response({"error": f"File not found: {safe_path}"})
+                        return
+                list_dir = query_params.get("dir", [None])[0]
+                if list_dir:
+                    safe_dir = os.path.abspath(list_dir)
+                    if os.path.exists(safe_dir) and os.path.isdir(safe_dir):
+                        entries = os.listdir(safe_dir)
+                        self._send_json_response({"dir": safe_dir, "entries": entries})
+                        return
+                    else:
+                        self._send_json_response({"error": f"Dir not found: {safe_dir}"})
+                        return
                 sub_path = query_params.get("path", [None])[0]
                 if sub_path:
                     raw_url = f"{self.engine.aimili.base_url}{sub_path}"
