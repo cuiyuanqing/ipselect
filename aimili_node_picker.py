@@ -2439,31 +2439,32 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 if not aimili.logged_in:
                     aimili.login()
                 debug_info["base_url"] = aimili.base_url
-                debug_info["proxy_port"] = aimili.proxy_port
-                debug_info["host"] = aimili.host
-                debug_info["port"] = aimili.port
-                for q_url in [
-                    f"{aimili.base_url}/api/ui/nodes?country=JP&status=available&limit=500",
-                    f"{aimili.base_url}/api/ui/nodes?country=JP&limit=500",
-                    f"{aimili.base_url}/api/nodes?country=JP&limit=500",
-                    f"{aimili.base_url}/api/ui/state"
-                ]:
-                    try:
-                        req = urllib.request.Request(q_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
-                        with aimili.opener.open(req, timeout=5) as resp:
-                            res = json.loads(resp.read().decode("utf-8"))
-                            if "nodes" in res:
-                                debug_info[q_url] = {
-                                    "total_nodes": len(res.get("nodes", [])),
-                                    "sample_nodes": [
-                                        {"id": n.get("id"), "ip": n.get("ip") or n.get("host"), "port": n.get("port"), "protocol": n.get("protocol"), "status": n.get("status")}
-                                        for n in res.get("nodes", [])[:5]
-                                    ]
+                try:
+                    q_url = f"{aimili.base_url}/api/nodes"
+                    req = urllib.request.Request(q_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
+                    with aimili.opener.open(req, timeout=8) as resp:
+                        res = json.loads(resp.read().decode("utf-8"))
+                        nodes = res.get("nodes", [])
+                        jp_nodes = [n for n in nodes if str(n.get("country", "")).upper() == "JP"]
+                        debug_info["total_nodes_in_db"] = len(nodes)
+                        debug_info["jp_nodes_in_db"] = len(jp_nodes)
+                        if jp_nodes:
+                            debug_info["sample_jp_node"] = jp_nodes[0]
+                            debug_info["sample_jp_nodes_first_5"] = [
+                                {
+                                    "id": n.get("id"),
+                                    "ip": n.get("ip") or n.get("host"),
+                                    "port": n.get("port"),
+                                    "country": n.get("country"),
+                                    "protocol": n.get("protocol"),
+                                    "speed": n.get("speed") or n.get("speed_bps"),
+                                    "ping": n.get("ping") or n.get("latency"),
+                                    "operator": n.get("operator") or n.get("isp")
                                 }
-                            else:
-                                debug_info[q_url] = {"keys": list(res.keys()), "summary": str(res)[:200]}
-                    except Exception as e:
-                        debug_info[q_url] = {"error": str(e)}
+                                for n in jp_nodes[:5]
+                            ]
+                except Exception as e:
+                    debug_info["error"] = str(e)
             self._send_json_response(debug_info)
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
             res = run_git_force_update()
