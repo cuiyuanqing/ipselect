@@ -472,7 +472,11 @@ class AimiliClient:
                 WHERE s.country IN ({placeholders})
                   {status_clause}
                   AND LOWER(e.protocol)='openvpn'
-                ORDER BY e.fail_streak ASC, e.success_streak DESC, e.ui_latency_ms ASC
+                ORDER BY e.fail_streak ASC, 
+                         (CASE WHEN LOWER(e.transport)='udp' THEN 0 ELSE 1 END), 
+                         json_extract(s.metadata_json, '$.speed') DESC, 
+                         e.success_streak DESC, 
+                         e.ui_latency_ms ASC
                 LIMIT ? OFFSET ?
             """
             params = list(country_names) + [limit, offset]
@@ -799,7 +803,8 @@ class AimiliClient:
                         if ready:
                             return True
                         else:
-                            logger.warning(f"⚠️ 节点 {node.ip} (ID: {test_id}) 握手未就绪或建连超时，继续尝试备选标识...")
+                            logger.warning(f"⚠️ 节点 {node.ip} (ID: {test_id}) 握手未就绪或建连超时，跳过该节点")
+                            return False
                 except urllib.error.HTTPError as e:
                     if e.code == 409:
                         logger.warning(f"⏳ Aimili 正在执行前序建连 (HTTP 409 互斥)，等待 2.5 秒后重试 (第 {attempt}/{max_retries} 次)...")
