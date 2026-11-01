@@ -2542,10 +2542,10 @@ def run_filter_and_export(tag="公司", output_file="best_us.txt", interface=Non
     if vip_file is None:
         vip_file = DEFAULT_VIP_FILE
 
+    workdir = os.path.dirname(os.path.abspath(output_file)) if os.path.isabs(output_file) else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if mock_mode and mock_candidates:
         candidates = mock_candidates
     else:
-        workdir = os.path.dirname(os.path.abspath(output_file)) if os.path.isabs(output_file) else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         candidates = fetch_candidates(
             workdir=workdir,
             output_file=output_file,

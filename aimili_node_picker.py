@@ -466,7 +466,12 @@ class AimiliClient:
 
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             cur = conn.cursor()
-            status_clause = "AND UPPER(e.status) = 'AVAILABLE'" if status.lower() == "available" else ""
+            status_clause = ""
+            if status.lower() == "available":
+                status_clause = "AND (UPPER(e.status) != 'DEAD' OR e.status IS NULL)"
+            elif status.lower() != "all":
+                status_clause = f"AND UPPER(e.status) = '{status.upper()}'"
+
             sql = f"""
                 SELECT e.endpoint_id, s.current_ip, e.port, e.protocol, e.transport, e.status, s.country, e.ui_latency_ms, s.metadata_json, e.metadata_json
                 FROM endpoints e 
@@ -475,8 +480,9 @@ class AimiliClient:
                   {status_clause}
                   AND LOWER(e.protocol)='openvpn'
                   AND e.port > 0
-                  AND e.fail_streak = 0
-                ORDER BY (CASE WHEN e.success_count > 0 THEN 1 ELSE 0 END) DESC,
+                  AND (e.fail_streak <= 5 OR e.fail_streak IS NULL)
+                ORDER BY (CASE WHEN LOWER(e.transport) = 'udp' THEN 1 ELSE 0 END) DESC,
+                         (CASE WHEN e.success_count > 0 THEN 1 ELSE 0 END) DESC,
                          COALESCE(json_extract(e.metadata_json, '$.switch_speed_bps'), 0) DESC,
                          e.success_streak DESC,
                          e.ui_latency_ms ASC
@@ -769,7 +775,7 @@ class AimiliClient:
 
         clean_id = expected_node_id.replace("pool:", "")
         start = time.time()
-        max_wait = max(float(timeout), 60.0)
+        max_wait = float(timeout) if float(timeout) > 0 else 60.0
         while time.time() - start < max_wait:
             st = self.get_state()
             if not st:
@@ -1596,16 +1602,20 @@ def probe_real_download_speed(
 
     urls = test_urls or TEST_SPEED_URLS
 
-    # 1. 优先尝试原生 SOCKS5 Socket 测速 (带用户名密码认证，精准兼容 Aimili 本地代理)
-    for url in urls:
+    def _socks5_single_stream_fetch(url_target: str, stream_id: int) -> Tuple[int, float]:
         try:
-            parsed = urllib.parse.urlparse(url)
+            parsed = urllib.parse.urlparse(url_target)
             target_host = parsed.hostname
             target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
             target_path = (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "")
 
             if parsed.scheme == "http":
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
+                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except Exception:
+                    pass
                 s.settimeout(max_duration + 2.5)
                 s.connect((proxy_host, proxy_port))
 
@@ -1624,12 +1634,11 @@ def probe_real_download_speed(
                         aresp = s.recv(2)
                         if len(aresp) < 2 or aresp[1] != 0:
                             s.close()
-                            continue
+                            return 0, 0.0
                     elif resp[1] != 0:
                         s.close()
-                        continue
+                        return 0, 0.0
 
-                    # SOCKS5 CONNECT
                     thost_b = target_host.encode("utf-8")
                     req_pkt = b"\x05\x01\x00\x03" + bytes([len(thost_b)]) + thost_b + target_port.to_bytes(2, "big")
                     s.sendall(req_pkt)
@@ -1647,7 +1656,7 @@ def probe_real_download_speed(
                                 break
                             if start_t is not None and (now - start_t) >= max_duration:
                                 break
-                            chunk = s.recv(16384)
+                            chunk = s.recv(32768)
                             if not chunk:
                                 break
                             if start_t is None:
@@ -1655,15 +1664,34 @@ def probe_real_download_speed(
                             received += len(chunk)
                             if received >= max_bytes:
                                 break
-                        duration = max(0.08, time.time() - (start_t or req_send_t))
+                        elapsed = max(0.08, time.time() - (start_t or req_send_t))
                         s.close()
-                        if received > 2048:
-                            speed_mbps = round((received * 8.0) / (duration * 1e6), 2)
-                            logger.info(f"⚡ [SOCKS5测速成功] 源: {target_host} -> 传输 {received} 字节，耗时 {duration:.2f}s，流速: {speed_mbps} Mbps")
-                            return speed_mbps
+                        return received, elapsed
                 s.close()
         except Exception as e:
-            logger.debug(f"⚠️ SOCKS5 测速异常 ({url}): {e}")
+            logger.debug(f"⚠️ SOCKS5 stream {stream_id} 测速异常 ({url_target}): {e}")
+        return 0, 0.0
+
+    # 1. 优先尝试高并发 SOCKS5 双流并行测速 (模拟现代客户端多路并发，突破单流高延迟 BDP 窗口限制)
+    test_target_urls = urls[:2] if len(urls) >= 2 else (urls * 2)[:2]
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as stream_executor:
+            futures = [
+                stream_executor.submit(_socks5_single_stream_fetch, u, idx + 1)
+                for idx, u in enumerate(test_target_urls)
+            ]
+            stream_results = [f.result() for f in futures]
+
+        total_received = sum(r[0] for r in stream_results)
+        max_elapsed = max([r[1] for r in stream_results] + [0.0])
+        effective_duration = max(0.08, max_elapsed or max_duration)
+
+        if total_received > 2048:
+            speed_mbps = round((total_received * 8.0) / (effective_duration * 1e6), 2)
+            logger.info(f"⚡ [SOCKS5测速成功] 双流并行传输 {total_received} 字节，耗时 {effective_duration:.2f}s，聚合流速: {speed_mbps} Mbps")
+            return speed_mbps
+    except Exception as e:
+        logger.debug(f"⚠️ SOCKS5 并发测速异常: {e}")
 
     # 2. 备用回退机制：标准 urllib ProxyHandler (若运行在支持 HTTP 代理的网关环境下)
     proxy_url = f"http://{proxy_host}:{proxy_port}"
@@ -1749,8 +1777,9 @@ class PickerEngine:
                 f"风控上限: {max_risk}%, 评估模式: {source_mode}, 优先继承存量: {inherit_existing})..."
             )
 
-            # 1. 获取在库候选池 (初始加载前 150 个存活候选)
-            candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=150, offset=0)
+            # 1. 获取在库候选池 (大容量加载全部有效候选)
+            candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=300, offset=0)
+
             if not candidates:
                 logger.error("❌ 未从 Aimili 获取到任何存活节点，请先确认 Aimili 后台节点扫描是否完成！")
                 self.current_step = "未获取到候选节点"
@@ -1929,14 +1958,8 @@ class PickerEngine:
                     self.aimili.refresh_nodes(country=country)
                     time.sleep(5.0)
 
-                    candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=150, offset=(current_round - 1) * 150)
-                    try:
-                        db_mgr_inst = AimiliDbManager(db_path=self.aimili.db_file)
-                        db_more = db_mgr_inst.load_candidates_from_db(country=country, limit=300)
-                        existing_ips = {c.ip for c in candidates}
-                        candidates.extend([c for c in db_more if c.ip not in existing_ips])
-                    except Exception:
-                        pass
+                    # 多轮补位时，扩大抓取范围，获取最新刷新后的候选节点
+                    candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=300, offset=0)
                     total_candidates = max(total_candidates, len(candidates))
 
                 picked_ips = {n.ip for n in picked_nodes}
@@ -3088,9 +3111,9 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             params = json.loads(body) if body else {}
 
             country = params.get("country", "JP")
-            max_risk = int(params.get("max_risk", 15))
+            max_risk = int(params.get("max_risk", 7))
             min_speed_mbps = float(params.get("min_speed_mbps", 5.0))
-            top_n = int(params.get("top_n", 20))
+            top_n = int(params.get("top_n", 10))
             source_mode = str(params.get("source_mode", "auto"))
             inherit_existing = bool(params.get("inherit_existing", True))
             max_rounds = int(params.get("max_rounds", 3))

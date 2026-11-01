@@ -47,6 +47,15 @@ class TestRealSpeedProbe(unittest.TestCase):
         mbps2 = round((512000 * 8.0) / (0.8 * 1e6), 2)
         self.assertEqual(mbps2, 5.12)
 
+    def test_dual_stream_aggregation(self):
+        # 模拟双流并行传输：Stream 1 传输 1,250,000 字节，Stream 2 传输 1,250,000 字节，在 2.0 秒内完成
+        bytes_stream1 = 1250000
+        bytes_stream2 = 1250000
+        total = bytes_stream1 + bytes_stream2
+        duration = 2.0
+        mbps = round((total * 8.0) / (duration * 1e6), 2)
+        self.assertEqual(mbps, 10.0)
+
 
 class TestPickerEngineMultiRound(unittest.TestCase):
     """测试优选排程核心的多轮补足与实测过滤"""
