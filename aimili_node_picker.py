@@ -474,9 +474,11 @@ class AimiliClient:
                   {status_clause}
                   AND LOWER(e.protocol)='openvpn'
                   AND e.port > 0
-                ORDER BY e.fail_streak ASC, 
-                         json_extract(s.metadata_json, '$.speed') DESC, 
-                         e.success_streak DESC, 
+                ORDER BY e.fail_streak ASC,
+                         (CASE WHEN e.success_count > 0 THEN 1 ELSE 0 END) DESC,
+                         COALESCE(json_extract(e.metadata_json, '$.switch_speed_bps'), 0) DESC,
+                         json_extract(s.metadata_json, '$.speed') DESC,
+                         e.success_streak DESC,
                          e.ui_latency_ms ASC
                 LIMIT ? OFFSET ?
             """
@@ -510,22 +512,21 @@ class AimiliClient:
                 transport = str(transport or "udp").lower()
 
                 speed_bps = 0
+                exact_node_id = None
                 try:
-                    s_meta = json.loads(s_meta_str) if s_meta_str else {}
-                    speed_bps = int(s_meta.get("speed") or 0)
+                    e_meta = json.loads(e_meta_str) if e_meta_str else {}
+                    if e_meta.get("switch_speed_bps"):
+                        speed_bps = int(e_meta.get("switch_speed_bps"))
+                    elif s_meta_str:
+                        s_meta = json.loads(s_meta_str)
+                        speed_bps = int(s_meta.get("speed") or 0)
+                    if e_meta.get("node_id"):
+                        exact_node_id = str(e_meta.get("node_id"))
                 except Exception:
                     pass
                 speed_mbps = round(speed_bps / 1e6, 1)
 
                 pool_id = str(eid)
-                
-                exact_node_id = None
-                try:
-                    e_meta = json.loads(e_meta_str) if e_meta_str else {}
-                    if e_meta.get("node_id"):
-                        exact_node_id = str(e_meta.get("node_id"))
-                except Exception:
-                    pass
 
                 # 寻找 Aimili 底层真实存在的配置文件名 (杜绝任何 Node not found 盲猜)
                 matched_config_id = None
