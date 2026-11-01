@@ -2518,12 +2518,15 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             }
             self._send_json_response(data)
         elif url.path == "/api/debug_aimili":
-            raw_url = f"{self.engine.aimili.base_url}/api/ui/nodes?country=JP&limit=2"
             try:
+                if self.engine and (not self.engine.aimili.logged_in):
+                    self.engine.aimili.login()
+                raw_url = f"{self.engine.aimili.base_url}/api/ui/nodes?country=JP&limit=2"
                 req = urllib.request.Request(raw_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
                 with self.engine.aimili.opener.open(req, timeout=5) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
-                    self._send_json_response({"raw_nodes": data.get("nodes", [])[:2]})
+                st = self.engine.aimili.get_state()
+                self._send_json_response({"raw_nodes": data.get("nodes", [])[:2], "state": st})
             except Exception as e:
                 self._send_json_response({"error": str(e)})
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
