@@ -2438,20 +2438,32 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 aimili = self.engine.aimili
                 if not aimili.logged_in:
                     aimili.login()
-                for lim in [50, 100, 200]:
-                    test_url = f"{aimili.base_url}/api/ui/nodes?country=JP&status=available&offset=0&limit={lim}"
-                    try:
-                        req = urllib.request.Request(test_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
-                        with aimili.opener.open(req, timeout=5) as resp:
-                            res = json.loads(resp.read().decode("utf-8"))
-                            nodes = res.get("nodes", [])
-                            debug_info[f"limit_{lim}"] = {
-                                "count": len(nodes),
-                                "total": res.get("total"),
-                                "protocols": list(set(n.get("protocol") for n in nodes))
-                            }
-                    except Exception as e:
-                        debug_info[f"limit_{lim}"] = str(e)
+                test_url = f"{aimili.base_url}/api/ui/nodes?country=JP&status=available&offset=0&limit=5"
+                try:
+                    req = urllib.request.Request(test_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
+                    with aimili.opener.open(req, timeout=5) as resp:
+                        res = json.loads(resp.read().decode("utf-8"))
+                        nodes = res.get("nodes", [])
+                        debug_info["nodes_tested"] = []
+                        for n in nodes[:5]:
+                            ip = n.get("ip") or n.get("host")
+                            port = int(n.get("port") or n.get("remote_port") or 1194)
+                            proto = n.get("protocol") or "openvpn"
+                            # 1. 当前 probe_network_quality
+                            res_current = probe_network_quality(ip, port, proto)
+                            # 2. 修正后的 Linux ping: -c 2 -W 1 -w 2
+                            cmd = ["ping", "-c", "2", "-W", "1", "-w", "2", ip]
+                            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3.0)
+                            debug_info["nodes_tested"].append({
+                                "ip": ip,
+                                "port": port,
+                                "proto": proto,
+                                "res_current": res_current,
+                                "ping_out": p.stdout.strip()[:200],
+                                "ping_rc": p.returncode
+                            })
+                except Exception as e:
+                    debug_info["error"] = str(e)
             self._send_json_response(debug_info)
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
             res = run_git_force_update()
