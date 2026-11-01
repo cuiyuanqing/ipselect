@@ -682,8 +682,17 @@ class AimiliClient:
         if not self.logged_in and not self.login():
             return False
 
-        url = f"{self.base_url}/api/toggle_favorite"
         fav_id = node.canonical_fav_id
+        if not favorite:
+            try:
+                cur_favs = self.get_current_favorites()
+                fav_candidates = {fav_id, node.id, node.pool_endpoint_id}
+                if not any(f in cur_favs for f in fav_candidates):
+                    return True
+            except Exception:
+                pass
+
+        url = f"{self.base_url}/api/toggle_favorite"
         aliases = list(set([node.id, fav_id, node.pool_endpoint_id] + node.aliases))
         aliases = [a for a in aliases if a]
 
@@ -790,22 +799,23 @@ class AimiliClient:
                 or (not clean_id and not expected_ip)
             )
 
-            # 1. 严格握手验证：OpenVPN 隧道就绪，且活动节点匹配
-            if is_tunnel_ok and is_matching:
-                logger.info(f"✅ [隧道握手成功] 目标节点 {expected_ip or expected_node_id} 已成功上线并就绪 (出口: {proxy_ip or active_ip})")
-                return True
-
             msg = str(st.get("last_check_message") or "")
             manual_msg = str(st.get("manual_switch_message") or "")
             full_msg = f"{msg} | {manual_msg}"
 
-            # 2. 状态感知：若 Aimili 处于正在建连、切换验证中、或接管 8500 代理中，动态延长等待上限至 85 秒容纳完整 OpenVPN TLS 握手与 cutover
+            # 状态感知：若 Aimili 处于正在建连、切换验证中、或接管 8500 代理中，动态延长等待上限至 85 秒容纳完整 OpenVPN TLS 握手与 cutover
             is_connecting = bool(st.get("is_connecting")) or bool(st.get("manual_switch_active")) or any(k in full_msg for k in ["初始化", "切换中", "后台验证", "验证中", "仍在建立", "正在接管", "正在建立"])
             if is_connecting:
                 if max_wait < 85.0:
                     max_wait = 85.0
 
-            # 3. 明确终态建连失败：消息明确指示当前节点建连失败，或 Aimili 保持原连接不变
+            # 1. 严格握手验证：OpenVPN 隧道就绪，活动节点匹配，不在正在切换中，且出口 IP 确实已切至目标节点 (防旧节点残留)
+            proxy_mismatch = bool(expected_ip and proxy_ip and proxy_ip != expected_ip)
+            if not is_connecting and is_tunnel_ok and is_matching and not proxy_mismatch:
+                logger.info(f"✅ [隧道握手成功] 目标节点 {expected_ip or expected_node_id} 已成功上线并就绪 (出口: {proxy_ip or active_ip})")
+                return True
+
+            # 2. 明确终态建连失败：消息明确指示当前节点建连失败，或 Aimili 保持原连接不变
             has_fail_signal = any(k in full_msg for k in ["连不上", "Node not found", "失败", "不可用", "AUTH_FAILED", "ERR_OVPN", "保持不变", "握手未完成", "No route to host"])
             is_target_in_msg = (expected_ip and expected_ip in full_msg) or (clean_id and clean_id in full_msg)
 
@@ -1321,9 +1331,10 @@ class IpIntelligenceManager:
 # ==============================================================================
 
 TEST_SPEED_URLS = [
+    "http://cachefly.cachefly.net/5mb.test",
+    "http://cachefly.cachefly.net/10mb.test",
     "http://cachefly.cachefly.net/1mb.test",
-    "https://speed.cloudflare.com/__down?bytes=1572864",
-    "http://speedtest.tele2.net/1MB.zip"
+    "http://speedtest.tele2.net/10MB.zip"
 ]
 
 def probe_network_quality(
@@ -1571,14 +1582,14 @@ def probe_real_download_speed(
     proxy_host: str = "127.0.0.1",
     proxy_user: Optional[str] = "socks5",
     proxy_pass: Optional[str] = "ilovestudy",
-    max_bytes: int = 2 * 1024 * 1024,
-    max_duration: float = 3.0,
+    max_bytes: int = 4 * 1024 * 1024,
+    max_duration: float = 3.5,
     test_urls: Optional[List[str]] = None,
     mock_speed: Optional[float] = None
 ) -> float:
     """
     通过 Aimili 本地 SOCKS5 代理进行真实微吞吐测速：
-    支持 SOCKS5 用户名密码认证与原生 HTTP 代理回退，限制在 max_duration 秒内测算实际下行速率 (Mbps)。
+    支持 SOCKS5 用户名密码认证与原生 HTTP 代理回退，首字节到达后在 max_duration 秒内测算真实持续下行速率 (Mbps)。
     """
     if mock_speed is not None:
         return round(float(mock_speed), 2)
@@ -1595,7 +1606,7 @@ def probe_real_download_speed(
 
             if parsed.scheme == "http":
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(max_duration + 1.5)
+                s.settimeout(max_duration + 2.5)
                 s.connect((proxy_host, proxy_port))
 
                 # SOCKS5 认证协商
@@ -1627,14 +1638,24 @@ def probe_real_download_speed(
                         http_req = f"GET {target_path} HTTP/1.1\r\nHost: {target_host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n".encode("utf-8")
                         s.sendall(http_req)
 
-                        start_t = time.time()
+                        start_t = None
                         received = 0
-                        while (time.time() - start_t) < max_duration and received < max_bytes:
+                        req_send_t = time.time()
+                        while True:
+                            now = time.time()
+                            if (now - req_send_t) > (max_duration + 2.5):
+                                break
+                            if start_t is not None and (now - start_t) >= max_duration:
+                                break
                             chunk = s.recv(16384)
                             if not chunk:
                                 break
+                            if start_t is None:
+                                start_t = time.time()
                             received += len(chunk)
-                        duration = max(0.08, time.time() - start_t)
+                            if received >= max_bytes:
+                                break
+                        duration = max(0.08, time.time() - (start_t or req_send_t))
                         s.close()
                         if received > 2048:
                             speed_mbps = round((received * 8.0) / (duration * 1e6), 2)
@@ -1909,6 +1930,13 @@ class PickerEngine:
                     time.sleep(5.0)
 
                     candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=150, offset=(current_round - 1) * 150)
+                    try:
+                        db_mgr_inst = AimiliDbManager(db_path=self.aimili.db_file)
+                        db_more = db_mgr_inst.load_candidates_from_db(country=country, limit=300)
+                        existing_ips = {c.ip for c in candidates}
+                        candidates.extend([c for c in db_more if c.ip not in existing_ips])
+                    except Exception:
+                        pass
                     total_candidates = max(total_candidates, len(candidates))
 
                 picked_ips = {n.ip for n in picked_nodes}
