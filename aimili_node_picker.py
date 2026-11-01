@@ -2432,6 +2432,39 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         elif url.path == "/api/logs":
             logs = ring_handler.get_logs()
             self._send_json_response(logs)
+        elif url.path == "/api/debug":
+            debug_info = {}
+            if self.engine and self.engine.aimili:
+                aimili = self.engine.aimili
+                if not aimili.logged_in:
+                    aimili.login()
+                debug_info["base_url"] = aimili.base_url
+                debug_info["proxy_port"] = aimili.proxy_port
+                debug_info["host"] = aimili.host
+                debug_info["port"] = aimili.port
+                for q_url in [
+                    f"{aimili.base_url}/api/ui/nodes?country=JP&status=available&limit=500",
+                    f"{aimili.base_url}/api/ui/nodes?country=JP&limit=500",
+                    f"{aimili.base_url}/api/nodes?country=JP&limit=500",
+                    f"{aimili.base_url}/api/ui/state"
+                ]:
+                    try:
+                        req = urllib.request.Request(q_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
+                        with aimili.opener.open(req, timeout=5) as resp:
+                            res = json.loads(resp.read().decode("utf-8"))
+                            if "nodes" in res:
+                                debug_info[q_url] = {
+                                    "total_nodes": len(res.get("nodes", [])),
+                                    "sample_nodes": [
+                                        {"id": n.get("id"), "ip": n.get("ip") or n.get("host"), "port": n.get("port"), "protocol": n.get("protocol"), "status": n.get("status")}
+                                        for n in res.get("nodes", [])[:5]
+                                    ]
+                                }
+                            else:
+                                debug_info[q_url] = {"keys": list(res.keys()), "summary": str(res)[:200]}
+                    except Exception as e:
+                        debug_info[q_url] = {"error": str(e)}
+            self._send_json_response(debug_info)
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
             res = run_git_force_update()
             self._send_json_response(res, status_code=200 if res.get("ok") else 500)
