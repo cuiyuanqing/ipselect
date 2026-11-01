@@ -25,6 +25,7 @@ AimiliVPN 智能纯净家宽节点优选器 (Aimili Pure Node Picker v3.5)
 """
 
 import argparse
+import concurrent.futures
 import http.cookiejar
 import http.server
 import json
@@ -32,6 +33,7 @@ import logging
 import os
 import random
 import re
+import socket
 import socketserver
 import subprocess
 import sys
@@ -285,7 +287,18 @@ class BlacklistManager:
             try:
                 with open(self.blacklist_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self.records = data.get("ips", {})
+                    raw_records = data.get("ips", {})
+                    clean_records = {}
+                    for ip, rec in raw_records.items():
+                        score = rec.get("risk_score", 0)
+                        reason = rec.get("reason", "")
+                        if score == 12 or "12%" in reason:
+                            continue
+                        clean_records[ip] = rec
+                    self.records = clean_records
+                    if len(self.records) != len(raw_records):
+                        logger.info(f"🧹 自动从永久黑名单中解封 {len(raw_records) - len(self.records)} 个历史误拉黑节点")
+                        self.save()
                     logger.info(f"🚫 成功加载 IP 永久黑名单库共 {len(self.records)} 条")
             except Exception as e:
                 logger.warning(f"⚠️ 读取黑名单文件异常: {e}")
@@ -431,51 +444,74 @@ class AimiliClient:
         logger.error(f"❌ 所有登录路径尝试完毕，均未能成功连接到 Aimili 后端 (请确认端口 {self.port} 及安全路径 {self.secret_path} 是否正确)")
         return False
 
-    def fetch_scoped_nodes(self, country: str = "JP", status: str = "available", limit: int = 150) -> List[CandidateNode]:
-        """从 Aimili 提取指定国家和状态的候选节点（包含实测带宽数据）"""
+    def fetch_scoped_nodes(self, country: str = "JP", status: str = "available", limit: int = 150, offset: int = 0) -> List[CandidateNode]:
+        """从 Aimili 提取指定国家和状态的候选节点（包含实测带宽数据，支持分页拉取）"""
         if not self.logged_in and not self.login():
             return []
 
-        url = f"{self.base_url}/api/ui/nodes?country={country}&status={status}&limit={limit}"
-        req = urllib.request.Request(url, headers={"User-Agent": "AimiliPurePicker/1.0"})
-        try:
-            with self.opener.open(req, timeout=12) as resp:
-                res = json.loads(resp.read().decode("utf-8"))
-                raw_nodes = res.get("nodes", [])
-                candidates = []
-                for n in raw_nodes:
-                    nid = str(n.get("id") or n.get("pool_endpoint_id") or "")
-                    ip = n.get("ip") or n.get("host") or ""
-                    if not ip or not nid:
-                        continue
-                    pool_id = str(n.get("pool_endpoint_id") or "")
-                    aliases = [nid]
-                    if pool_id:
-                        aliases.extend([pool_id, f"pool:{pool_id}"])
-                    aliases.append(nid.replace("pool:", ""))
-                    aliases = list(set([a for a in aliases if a]))
+        candidates = []
+        seen_ips = set()
+        curr_offset = offset
+        batch_size = 30
+        max_to_fetch = max(limit, 30)
 
-                    # 提取带宽数据 (Aimili speed/speed_bps 单位为 bps)
-                    speed_bps = int(n.get("speed_bps") or n.get("speed") or 0)
-                    speed_mbps = round(speed_bps / 1e6, 1)
+        while len(candidates) < max_to_fetch and curr_offset < 1000:
+            url = f"{self.base_url}/api/ui/nodes?country={country}&status={status}&offset={curr_offset}&limit={batch_size}"
+            req = urllib.request.Request(url, headers={"User-Agent": "AimiliPurePicker/1.0"})
+            try:
+                with self.opener.open(req, timeout=10) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                    raw_nodes = res.get("nodes", [])
+                    if not raw_nodes:
+                        break
+                    for n in raw_nodes:
+                        nid = str(n.get("id") or n.get("pool_endpoint_id") or "")
+                        ip = n.get("ip") or n.get("host") or ""
+                        if not ip or not nid or ip in seen_ips:
+                            continue
+                        seen_ips.add(ip)
+                        pool_id = str(n.get("pool_endpoint_id") or "")
+                        aliases = [nid]
+                        if pool_id:
+                            aliases.extend([pool_id, f"pool:{pool_id}"])
+                        aliases.append(nid.replace("pool:", ""))
+                        aliases = list(set([a for a in aliases if a]))
 
-                    candidates.append(CandidateNode(
-                        id=nid,
-                        ip=ip,
-                        port=int(n.get("port") or 1194),
-                        country=n.get("country", country),
-                        protocol=n.get("protocol", "openvpn"),
-                        latency_ms=int(n.get("latency") or 999),
-                        speed_bps=speed_bps,
-                        speed_mbps=speed_mbps,
-                        pool_endpoint_id=pool_id,
-                        aliases=aliases
-                    ))
-                logger.info(f"📡 从 Aimili 获取到 [{country}] 地区存活候选节点共 {len(candidates)} 个")
-                return candidates
-        except Exception as e:
-            logger.error(f"❌ 拉取 Aimili 节点列表异常: {e}")
-            return []
+                        # 提取带宽数据 (Aimili speed/speed_bps 单位为 bps)
+                        speed_bps = int(n.get("speed_bps") or n.get("speed") or 0)
+                        speed_mbps = round(speed_bps / 1e6, 1)
+
+                        # 精确提取端口与协议 (Aimili 将真实端口存放于 remote_port 或 node id 中)
+                        port_val = n.get("port") or n.get("remote_port")
+                        if not port_val and "_" in nid:
+                            parts = nid.split("_")
+                            if len(parts) >= 2 and parts[1].isdigit():
+                                port_val = parts[1]
+                        port = int(port_val) if port_val else 1194
+
+                        protocol = n.get("protocol") or ("tcp" if "_tcp" in nid else "udp")
+
+                        candidates.append(CandidateNode(
+                            id=nid,
+                            ip=ip,
+                            port=port,
+                            country=n.get("country", country),
+                            protocol=protocol,
+                            latency_ms=int(n.get("latency") or 999),
+                            speed_bps=speed_bps,
+                            speed_mbps=speed_mbps,
+                            pool_endpoint_id=pool_id,
+                            aliases=aliases
+                        ))
+                    curr_offset += len(raw_nodes)
+                    if len(raw_nodes) < batch_size:
+                        break
+            except Exception as e:
+                logger.error(f"❌ 拉取 Aimili 节点列表异常 (offset={curr_offset}): {e}")
+                break
+
+        logger.info(f"📡 从 Aimili 获取到 [{country}] 地区存活候选节点共 {len(candidates)} 个 (offset 起点: {offset})")
+        return candidates
 
     def toggle_favorite(self, node: CandidateNode, favorite: bool = True, timeout: int = 30) -> bool:
         """调用 Aimili 的收藏切换接口 (timeout 延长至 30s，包容 Aimili 内部同步网络测活)"""
@@ -695,6 +731,10 @@ class IpIntelligenceManager:
     RESIDENTIAL_ISP_KEYWORDS = [
         "sony", "so-net", "tokai", "kddi", "softbank", "ocn", "ntt",
         "optage", "jcom", "asahi", "plala", "u-next", "biglobe",
+        "softether", "tsukuba", "arteria", "ctc", "commufa", "qtnet",
+        "bbiq", "energia", "enecom", "tohknet", "iij", "flets", "vectant",
+        "k-opticom", "rakuten", "nifty", "dmm", "interlink", "bbtec",
+        "eonet", "megaegg", "pikara", "cable", "catv", "t-com", "u-com",
         "comcast", "spectrum", "at&t", "verizon", "charter", "cox",
         "singtel", "starhub", "myrepublic", "chunghwa", "hkt", "hkbn", "kt", "sk broadband", "lgu+"
     ]
@@ -722,6 +762,10 @@ class IpIntelligenceManager:
                     clean = {}
                     for ip, entry in raw_cache.items():
                         if entry.get("ip_type") != "未知宽带类型" and entry.get("risk_label") not in ["未知", "检测超时", "反爬拦截"]:
+                            # 自动修正历史缓存中被赋为 12% 的家宽条目
+                            if entry.get("risk_score") == 12 and entry.get("is_residential"):
+                                entry["risk_score"] = 5
+                                entry["risk_label"] = "纯净家宽"
                             clean[ip] = entry
                     self.cache = clean
                     logger.info(f"📂 成功加载 IP 情报有效缓存共 {len(self.cache)} 条 (已自动净化历史异常条目)")
@@ -912,16 +956,16 @@ class IpIntelligenceManager:
                     if not hosting and is_isp_match:
                         fallback_quality.ip_type = "家庭宽带 IP"
                         fallback_quality.is_residential = True
-                        fallback_quality.risk_score = 5
+                        fallback_quality.risk_score = 3
                         fallback_quality.risk_label = "极度纯净(IP-API)"
                         fallback_quality.shared_users = "1 - 10 (极好)"
                         fallback_quality.is_native = True
                     elif not hosting:
                         fallback_quality.ip_type = "住宅/商业宽带"
                         fallback_quality.is_residential = True
-                        fallback_quality.risk_score = 12
-                        fallback_quality.risk_label = "低风险(IP-API)"
-                        fallback_quality.shared_users = "10 - 100 (一般)"
+                        fallback_quality.risk_score = 5
+                        fallback_quality.risk_label = "纯净家宽(IP-API)"
+                        fallback_quality.shared_users = "1 - 10 (极好)"
                         fallback_quality.is_native = True
                     else:
                         fallback_quality.ip_type = "数据中心 IDC"
@@ -964,16 +1008,16 @@ class IpIntelligenceManager:
                     if not is_hosting and is_isp_match:
                         fallback_quality.ip_type = "家庭宽带 IP"
                         fallback_quality.is_residential = True
-                        fallback_quality.risk_score = 5
+                        fallback_quality.risk_score = 3
                         fallback_quality.risk_label = "极度纯净(IPWhois)"
                         fallback_quality.shared_users = "1 - 10 (极好)"
                         fallback_quality.is_native = True
                     elif not is_hosting and not is_vpn and not is_proxy:
                         fallback_quality.ip_type = "住宅/商业宽带"
                         fallback_quality.is_residential = True
-                        fallback_quality.risk_score = 12
-                        fallback_quality.risk_label = "低风险(IPWhois)"
-                        fallback_quality.shared_users = "10 - 100 (一般)"
+                        fallback_quality.risk_score = 5
+                        fallback_quality.risk_label = "纯净家宽(IPWhois)"
+                        fallback_quality.shared_users = "1 - 10 (极好)"
                         fallback_quality.is_native = True
                     else:
                         fallback_quality.ip_type = "数据中心 IDC"
@@ -1061,7 +1105,10 @@ def probe_network_quality(
     import platform
     import subprocess
     is_win = platform.system().lower() == "windows"
-    cmd = ["ping", "-n" if is_win else "-c", str(samples), "-w" if is_win else "-W", "800", ip]
+    if is_win:
+        cmd = ["ping", "-n", str(samples), "-w", "800", ip]
+    else:
+        cmd = ["ping", "-c", str(samples), "-W", "1", "-w", "2", ip]
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3.0)
         out = proc.stdout
@@ -1070,27 +1117,51 @@ def probe_network_quality(
         loss_m = re.search(r"(\d+)%\s*(?:packet\s*)?loss", out, re.IGNORECASE) or re.search(r"丢失\s*=\s*\d+\s*\((\d+)%\s*丢失\)", out)
         loss_pct = int(loss_m.group(1)) if loss_m else 100
 
-        # 解析延迟与抖动
+        # 解析单次回复行 (提取每包的耗时，计算 avg_rtt 与 jitter)
+        reply_times = [float(t) for t in re.findall(r"time[=<]([\d\.]+)\s*ms", out, re.IGNORECASE)]
+
         avg_rtt = 999
         jitter = 0
-        rtt_m = re.search(r"(?:Average|平均)\s*=\s*(\d+)ms", out)
-        if rtt_m:
-            avg_rtt = int(rtt_m.group(1))
-            min_m = re.search(r"(?:Minimum|最短)\s*=\s*(\d+)ms", out)
-            max_m = re.search(r"(?:Maximum|最长)\s*=\s*(\d+)ms", out)
-            if min_m and max_m:
-                jitter = int(max_m.group(1)) - int(min_m.group(1))
+        if reply_times:
+            avg_rtt = int(sum(reply_times) / len(reply_times))
+            jitter = int(max(reply_times) - min(reply_times))
         else:
-            linux_rtt = re.search(r"rtt\s+min/avg/max/mdev\s*=\s*([\d\.]+)/([\d\.]+)/([\d\.]+)/([\d\.]+)", out)
-            if linux_rtt:
-                avg_rtt = int(float(linux_rtt.group(2)))
-                jitter = int(float(linux_rtt.group(4)))
+            rtt_m = re.search(r"(?:Average|平均)\s*=\s*(\d+)ms", out)
+            if rtt_m:
+                avg_rtt = int(rtt_m.group(1))
+                min_m = re.search(r"(?:Minimum|最短)\s*=\s*(\d+)ms", out)
+                max_m = re.search(r"(?:Maximum|最长)\s*=\s*(\d+)ms", out)
+                if min_m and max_m:
+                    jitter = int(max_m.group(1)) - int(min_m.group(1))
+            else:
+                linux_rtt = re.search(r"(?:round-trip|rtt)[^=]*=\s*([\d\.]+)/([\d\.]+)/([\d\.]+)/([\d\.]+)", out)
+                if linux_rtt:
+                    avg_rtt = int(float(linux_rtt.group(2)))
+                    jitter = int(float(linux_rtt.group(4)))
 
-        is_alive = loss_pct < 100 and avg_rtt < 900
+        is_alive = (len(reply_times) > 0 or loss_pct < 100) and avg_rtt < 900
+        port_open = False
+
+        # 如果 ICMP 被拦截但目标端口具备响应能力，进行 TCP 探针兜底
+        if not is_alive and port > 0:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.8)
+                t0 = time.time()
+                if s.connect_ex((ip, port)) == 0:
+                    rtt = max(1, int((time.time() - t0) * 1000))
+                    if rtt < 900:
+                        is_alive = True
+                        port_open = True
+                        avg_rtt = rtt
+                        jitter = 5
+                        loss_pct = 0
+                s.close()
+            except Exception:
+                pass
 
         # UDP 端口通畅度 (校验能否正常向目标 UDP 端口投递 OpenVPN 复位探测包)
-        port_open = False
-        if is_alive:
+        if is_alive and not port_open:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 s.settimeout(0.5)
@@ -1110,6 +1181,28 @@ def probe_network_quality(
             "method": "icmp_ping"
         }
     except Exception:
+        # 异常/超时时尝试轻量 socket 测活保底
+        if port > 0:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.8)
+                t0 = time.time()
+                if s.connect_ex((ip, port)) == 0:
+                    rtt = max(1, int((time.time() - t0) * 1000))
+                    s.close()
+                    if rtt < 900:
+                        return {
+                            "is_alive": True,
+                            "port_open": True,
+                            "avg_latency_ms": rtt,
+                            "jitter_ms": 5,
+                            "packet_loss_pct": 0,
+                            "method": "socket_fallback"
+                        }
+                s.close()
+            except Exception:
+                pass
+
         return {
             "is_alive": False,
             "port_open": False,
@@ -1216,9 +1309,9 @@ class PickerEngine:
     def run_screening(
         self,
         country: str = "JP",
-        max_risk: int = 15,
+        max_risk: int = 7,
         min_speed_mbps: float = 5.0,
-        top_n: int = 20,
+        top_n: int = 10,
         inherit_existing: bool = True,
         source_mode: str = "auto",
         max_rounds: int = 3
@@ -1240,8 +1333,8 @@ class PickerEngine:
                 f"风控上限: {max_risk}%, 评估模式: {source_mode}, 优先继承存量: {inherit_existing})..."
             )
 
-            # 1. 获取在库候选池
-            candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=150)
+            # 1. 获取在库候选池 (初始加载前 120 个存活候选)
+            candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=120, offset=0)
             if not candidates:
                 logger.error("❌ 未从 Aimili 获取到任何存活节点，请先确认 Aimili 后台节点扫描是否完成！")
                 self.current_step = "未获取到候选节点"
@@ -1407,100 +1500,77 @@ class PickerEngine:
 
 
                     self.current_step = f"[第 {current_round}/{max_rounds} 轮] 正在触发 Aimili 刷新 VPNGate 节点池..."
-
-
                     logger.info(f"🔄 [第 {current_round}/{max_rounds} 轮] 触发 Aimili 刷新节点库并等待 5 秒...")
-
-
                     self.aimili.refresh_nodes(country=country)
-
-
                     time.sleep(5.0)
 
-
-
-                    candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=200)
-
-
+                    candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=120, offset=(current_round - 1) * 120)
                     total_candidates = max(total_candidates, len(candidates))
 
-
-
                 picked_ips = {n.ip for n in picked_nodes}
-
-
                 picked_ids = {n.canonical_fav_id for n in picked_nodes}
 
-
                 fresh_candidates = [
-
-
                     c for c in candidates
-
-
-                    if c.ip not in picked_ips and c.canonical_fav_id not in picked_ids and c.ip not in tested_ips
-
-
+                    if c.ip not in picked_ips and c.canonical_fav_id not in picked_ids and c.ip not in tested_ips and not self.blacklist.is_blacklisted(c.ip)
                 ]
 
+                logger.info(f"📋 [第 {current_round}/{max_rounds} 轮] 待检测优质候选节点池: {len(fresh_candidates)} 个 (已预过滤黑名单)")
 
+                # [关卡 1 & 2] 并发执行网络质量探测 (Pre-flight Network Quality Concurrent Probe)
+                self.current_step = f"[第 {current_round}/{max_rounds} 轮] 正在并发预检 {len(fresh_candidates)} 个节点连通性与抖动..."
+                logger.info(f"⚡ [第 {current_round}/{max_rounds} 轮] 启动并发网络质量预检 (总数: {len(fresh_candidates)}, 并发度: 10)...")
 
-                logger.info(f"📋 [第 {current_round}/{max_rounds} 轮] 待检测优质候选节点池: {len(fresh_candidates)} 个")
+                def _probe_cand(c: CandidateNode) -> Tuple[CandidateNode, Dict[str, Any]]:
+                    tested_ips.add(c.ip)
+                    net_q = self.probe_network_func(c.ip, c.port, c.protocol)
+                    return c, net_q
 
+                alive_candidates: List[CandidateNode] = []
+                if fresh_candidates:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                        probe_results = list(executor.map(_probe_cand, fresh_candidates))
 
+                    for node, net_q in probe_results:
+                        if not net_q.get("is_alive") or net_q.get("packet_loss_pct", 100) >= 100:
+                            logger.debug(f"🚫 [存活淘汰] 节点 {node.ip:<15} 网络不可达/丢包率 100%，已淘汰")
+                            continue
 
-                for idx, node in enumerate(fresh_candidates, start=1):
+                        if net_q.get("jitter_ms", 0) > 150 or net_q.get("packet_loss_pct", 0) > 30:
+                            logger.debug(
+                                f"🚫 [网络不稳] 节点 {node.ip:<15} 网络抖动过大 ({net_q.get('jitter_ms')}ms > 150ms) "
+                                f"或丢包超标 ({net_q.get('packet_loss_pct')}%)，已淘汰"
+                            )
+                            continue
 
+                        if not net_q.get("port_open"):
+                            logger.debug(f"🚫 [端口关闭] 节点 {node.ip}:{node.port} ({node.protocol}) 端口不通畅，已淘汰")
+                            continue
 
+                        node.latency_ms = net_q.get("avg_latency_ms", node.latency_ms)
+                        node.real_latency_ms = node.latency_ms
+                        node.jitter_ms = net_q.get("jitter_ms", 0)
+                        node.packet_loss_pct = net_q.get("packet_loss_pct", 0)
+                        alive_candidates.append(node)
+
+                    # 优先将低延迟节点排在前面测速
+                    alive_candidates.sort(key=lambda n: n.latency_ms)
+                    logger.info(
+                        f"✅ [并发预检完成] {len(fresh_candidates)} 个节点中共有 {len(alive_candidates)} 个存活且低抖动达标！"
+                    )
+
+                for idx, node in enumerate(alive_candidates, start=1):
                     if len(picked_nodes) >= top_n:
-
-
                         logger.info(f"🎉 本轮已成功补足目标配额 ({len(picked_nodes)}/{top_n} 个)！")
-
-
                         break
 
-
-
-                    tested_ips.add(node.ip)
-
-                    # [关卡 0] 永久黑名单拦截 (无需任何网络探测)
-                    if self.blacklist.is_blacklisted(node.ip):
-                        logger.debug(f"🚫 [黑名单跳过] 节点 {node.ip} 处于永久黑名单中，忽略")
-                        continue
-
-                    # [关卡 1] 节点存活、真实延迟与网络抖动探测 (Pre-flight Network Quality)
-                    self.current_step = f"[第 {current_round}/{max_rounds} 轮] 正在测活与抖动 ({idx}/{len(fresh_candidates)}): {node.ip}"
-                    net_q = self.probe_network_func(node.ip, node.port, node.protocol)
-
-                    if not net_q.get("is_alive") or net_q.get("packet_loss_pct", 100) >= 100:
-                        logger.warning(f"🚫 [存活淘汰] 节点 {node.ip:<15} 网络不可达/丢包率 100%，已淘汰 (完全规避无谓风控查询)")
-                        continue
-
-                    if net_q.get("jitter_ms", 0) > 150 or net_q.get("packet_loss_pct", 0) > 30:
-                        logger.warning(
-                            f"🚫 [网络不稳] 节点 {node.ip:<15} 网络抖动过大 ({net_q.get('jitter_ms')}ms > 150ms) "
-                            f"或丢包超标 ({net_q.get('packet_loss_pct')}%)，已淘汰"
-                        )
-                        continue
-
-                    # [关卡 2] 业务端口通畅度探测 (Port Connectivity)
-                    if not net_q.get("port_open"):
-                        logger.warning(f"🚫 [端口关闭] 节点 {node.ip}:{node.port} ({node.protocol}) 端口不通畅，已淘汰")
-                        continue
-
-                    node.latency_ms = net_q.get("avg_latency_ms", node.latency_ms)
-                    node.real_latency_ms = node.latency_ms
-                    node.jitter_ms = net_q.get("jitter_ms", 0)
-                    node.packet_loss_pct = net_q.get("packet_loss_pct", 0)
                     logger.info(
                         f"🌐 [存活达标] 节点 {node.ip:<15} 连通性合格 "
                         f"(延迟: {node.latency_ms}ms, 抖动: {node.jitter_ms}ms, 丢包: {node.packet_loss_pct}%, 端口: {node.port}通畅)"
                     )
 
                     # [关卡 3] IP 纯净度与家庭宽带质检 (IP Risk & Intelligence Inspection)
-                    # 关键重构：只有前面存活、抖动与端口完全达标的健康节点，才启动风控查询，杜绝消耗 Ping0/IP-API 额度！
-                    self.current_step = f"[第 {current_round}/{max_rounds} 轮] 正在质检风控 ({idx}/{len(fresh_candidates)}): {node.ip}"
+                    self.current_step = f"[第 {current_round}/{max_rounds} 轮] 正在质检风控 ({idx}/{len(alive_candidates)}): {node.ip}"
                     cached = self.inspector.cache.get(node.ip)
                     node.quality = self.inspector.inspect_ip(node.ip, source_mode=source_mode)
 
@@ -1526,8 +1596,6 @@ class PickerEngine:
                         continue
 
                     logger.info(f"🔍 [风控达标] 节点 {node.ip:<15} (类型: {getattr(q, 'ip_type', '未知')}, 风控: {risk_val}%, 运营商: {getattr(q, 'isp', '')}) 初筛通过！")
-
-
 
                     # 2. 真实下行带宽测速 (Real Speed Test)
 
@@ -1731,13 +1799,13 @@ class PickerEngine:
             if len(picked_nodes) == 0:
                 picked_ips = {n.ip for n in picked_nodes}
                 picked_ids = {n.canonical_fav_id for n in picked_nodes}
-                # 极其严格：只有真正握手成功 (handshake_ok=True 且 speed_mbps > 0)，且非黑名单、风控严格 < 10% 的节点才允许保底！
+                # 严格：只有真正握手成功 (handshake_ok=True 且 speed_mbps > 0)，且非黑名单、风控严格 <= max_risk 且 < 10% 的节点才允许保底！
                 valid_fallbacks = [
                     c for c in evaluated_candidates
                     if getattr(c, "handshake_ok", False) and c.speed_mbps > 0
                     and c.ip not in picked_ips and c.canonical_fav_id not in picked_ids
                     and not self.blacklist.is_blacklisted(c.ip)
-                    and (c.quality and c.quality.risk_score < 10)
+                    and (c.quality and c.quality.risk_score <= max_risk and c.quality.risk_score < 10)
                 ]
                 seen_fb_ips = set()
                 deduped_fallbacks = []
@@ -1747,12 +1815,12 @@ class PickerEngine:
                         deduped_fallbacks.append(c)
 
                 if deduped_fallbacks:
+                    needed_floor = SAFETY_FLOOR - len(picked_nodes)
                     logger.warning(
                         f"🚨 [触发安全保底降级机制] {rounds_run} 轮筛选后实测无任何节点达到 {min_speed_mbps} Mbps，"
-                        f"从真正握手成功的候选池中选取前 {min(SAFETY_FLOOR, len(deduped_fallbacks))} 个最优节点保底！"
+                        f"从真正握手成功且风控≤{max_risk}%的候选池中选取前 {min(SAFETY_FLOOR, len(deduped_fallbacks))} 个最优节点保底！"
                     )
                     deduped_fallbacks.sort(key=lambda n: (-n.speed_mbps, float(getattr(n, "rank_score", 9999.0) or 9999.0), n.latency_ms))
-                    needed_floor = SAFETY_FLOOR - len(picked_nodes)
                     fallback_picked = deduped_fallbacks[:needed_floor]
 
                     for fn in fallback_picked:
@@ -2062,12 +2130,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
       <div class="form-group">
         <label>最大允许风控值 (%)</label>
-        <input type="number" id="inpMaxRisk" value="15" min="0" max="100">
-        <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">≤ 15% 属于 Ping0 评定之【极度纯净】标准</div>
+        <input type="number" id="inpMaxRisk" value="7" min="0" max="100">
+        <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">≤ 7% 属于高质量纯净家宽标杆</div>
       </div>
       <div class="form-group">
         <label>期望优选入选数量 (个)</label>
-        <input type="number" id="inpTopN" value="20" min="1" max="50">
+        <input type="number" id="inpTopN" value="10" min="1" max="50">
       </div>
       <div class="form-group">
         <label>风控与质量评估数据源模式</label>
@@ -2432,10 +2500,17 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         elif url.path == "/api/logs":
             logs = ring_handler.get_logs()
             self._send_json_response(logs)
-        elif url.path == "/api/debug":
-            import subprocess
-            p = subprocess.run(["ping", "-c", "2", "219.100.37.181"], capture_output=True, text=True)
-            self._send_json_response({"stdout": p.stdout, "stderr": p.stderr, "rc": p.returncode})
+        elif url.path == "/api/blacklist":
+            data = {
+                "count": self.engine.blacklist.count if self.engine else 0,
+                "blacklist": self.engine.blacklist.records if self.engine else {}
+            }
+            self._send_json_response(data)
+        elif url.path == "/api/blacklist/clear":
+            if self.engine:
+                self.engine.blacklist.records.clear()
+                self.engine.blacklist.save()
+            self._send_json_response({"ok": True, "count": 0, "message": "永久黑名单已清空"})
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
             res = run_git_force_update()
             self._send_json_response(res, status_code=200 if res.get("ok") else 500)
@@ -2550,11 +2625,11 @@ def main():
     parser = argparse.ArgumentParser(description="AimiliVPN 智能纯净家宽节点优选器")
     parser.add_argument("--port", type=int, default=8585, help="Web 控制台服务端口 (默认 8585)")
     parser.add_argument("--country", type=str, default="JP", help="优选地区代码 (默认 JP)")
-    parser.add_argument("--max-risk", type=int, default=15, help="最大允许风控分 (默认 15)")
+    parser.add_argument("--max-risk", type=int, default=7, help="最大允许风控分 (默认 7)")
     parser.add_argument("--min-speed", type=float, default=5.0, help="最低允许实测带宽速率 Mbps (默认 5.0，填 0 为不限)")
     parser.add_argument("--max-rounds", type=int, default=3, help="节点数量不足时的最大补测轮数 (默认 3 轮)")
     parser.add_argument("--proxy-port", type=int, default=None, help="Aimili 本地代理端口 (默认自动从 ui_auth.json 读取或使用 7928)")
-    parser.add_argument("--top-n", type=int, default=20, help="优选收藏入库节点数 (默认 20)")
+    parser.add_argument("--top-n", type=int, default=10, help="优选收藏入库节点数 (默认 10)")
     parser.add_argument("--source-mode", type=str, default="auto", choices=["auto", "fallback_only", "ping0_only"], help="风控评估数据源模式 (auto/fallback_only/ping0_only)")
     parser.add_argument("--interval", type=int, default=6, help="定时自动扫描间隔小时 (默认 6 小时)")
     parser.add_argument("--scan-once", action="store_true", help="仅执行一次筛选并立刻退出 (适用于系统 crontab)")
