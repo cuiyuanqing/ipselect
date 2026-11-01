@@ -570,28 +570,36 @@ class AimiliClient:
             time.sleep(0.8)
         return False
 
-    def wait_for_tunnel_ready(self, expected_node_id: str, timeout: float = 10.0) -> bool:
+    def wait_for_tunnel_ready(self, expected_node_id: str, timeout: float = 12.0) -> bool:
         """等待 Aimili 成功建立 OpenVPN 隧道与本地代理通道"""
         clean_id = expected_node_id.replace("pool:", "")
         start = time.time()
         while time.time() - start < timeout:
             st = self.get_state()
             if not st:
-                time.sleep(0.5)
+                time.sleep(0.6)
                 continue
-            if st.get("is_connecting"):
-                time.sleep(0.8)
-                continue
+
             active_id = str(st.get("active_openvpn_node_id") or "")
-            # 严格握手验证：必须是 OpenVPN 隧道真正就绪，绝不能被本地 proxy_ready 敷衍
             tunnel_ready = bool(st.get("tunnel_ready"))
+            msg = str(st.get("last_check_message") or "")
+
+            # 1. 严格握手验证：OpenVPN 隧道就绪，且活动节点 ID 匹配
             if tunnel_ready and (clean_id in active_id or active_id in clean_id or not clean_id):
                 return True
-            if not st.get("is_connecting") and not tunnel_ready:
-                msg = st.get("last_check_message", "")
+
+            # 2. 状态感知：若 Aimili 处于切换验证中，或正在建连，包容等待
+            is_connecting = bool(st.get("is_connecting")) or ("切换中" in msg) or ("后台验证" in msg) or ("验证中" in msg)
+            if is_connecting:
+                time.sleep(1.0)
+                continue
+
+            # 3. 明确终态建连失败：只有确认已结束切换且不是正在验证时才提前退出
+            if any(k in msg for k in ["连不上", "Node not found", "失败", "不可用"]):
                 logger.warning(f"⚠️ 节点 {expected_node_id} 隧道建连失败: {msg}")
                 return False
-            time.sleep(0.8)
+
+            time.sleep(1.0)
         return False
 
     def set_active_node(self, node: CandidateNode, timeout: int = 15, max_retries: int = 3) -> bool:
@@ -604,7 +612,12 @@ class AimiliClient:
 
         url = f"{self.base_url}/api/connect"
         clean_id = node.id.replace("pool:", "")
-        cand_ids = [clean_id, node.id, f"pool:{clean_id}"]
+        # 必须优先使用带 pool: 前缀的原生 ID！Aimili 候选池节点强依赖 pool: 前缀！
+        cand_ids = [node.id, f"pool:{clean_id}"]
+        if node.pool_endpoint_id:
+            cand_ids.insert(0, f"pool:{node.pool_endpoint_id}")
+            cand_ids.append(node.pool_endpoint_id)
+        cand_ids.append(clean_id)
         seen = set()
         unique_ids = [x for x in cand_ids if x and not (x in seen or seen.add(x))]
 
@@ -619,17 +632,15 @@ class AimiliClient:
                 try:
                     with self.opener.open(req, timeout=timeout) as resp:
                         res = json.loads(resp.read().decode("utf-8"))
-                        ok = bool(res.get("ok") or res.get("running") or "state" in res)
-                        if ok:
-                            logger.info(f"🚀 成功向 Aimili 下发节点切换指令 -> 活动出口: {node.ip} (ID: {test_id})")
-                            ready = self.wait_for_tunnel_ready(test_id, timeout=8.0)
-                            if ready:
-                                return True
-                            else:
-                                logger.warning(f"⚠️ 节点 {node.ip} 握手未就绪或建连超时")
-                                return False
+                        if res.get("error"):
+                            logger.debug(f"⚠️ 切换 ID [{test_id}] 返回错误: {res.get('error')}")
+                            continue
+                        logger.info(f"🚀 成功向 Aimili 下发节点切换指令 -> 活动出口: {node.ip} (ID: {test_id})")
+                        ready = self.wait_for_tunnel_ready(test_id, timeout=12.0)
+                        if ready:
+                            return True
                         else:
-                            logger.warning(f"⚠️ 切换节点返回异常: {res.get('message', res)}")
+                            logger.warning(f"⚠️ 节点 {node.ip} (ID: {test_id}) 握手未就绪或建连超时，继续尝试备选标识...")
                 except urllib.error.HTTPError as e:
                     if e.code == 409:
                         logger.warning(f"⏳ Aimili 正在执行前序建连 (HTTP 409 互斥)，等待 2.5 秒后重试 (第 {attempt}/{max_retries} 次)...")
