@@ -356,12 +356,16 @@ class AimiliClient:
         password: Optional[str] = None,
         secret_path: Optional[str] = None,
         port: Optional[int] = None,
-        proxy_port: Optional[int] = None
+        proxy_port: Optional[int] = None,
+        proxy_user: Optional[str] = None,
+        proxy_pass: Optional[str] = None
     ):
         self.auth_file = auth_file
         self.host = "127.0.0.1"
         self.port = port or 8501
-        self.proxy_port = proxy_port or 7928
+        self.proxy_port = proxy_port or 8500
+        self.proxy_user = proxy_user or "socks5"
+        self.proxy_pass = proxy_pass or "ilovestudy"
         self.username = username or "admin"
         self.password = password or ""
         self.secret_path = secret_path or ""
@@ -382,7 +386,9 @@ class AimiliClient:
                     if not port:
                         self.port = int(data.get("port", 8501))
                     if not proxy_port:
-                        self.proxy_port = int(data.get("proxy_port", 7928))
+                        self.proxy_port = int(data.get("proxy_port", 8500))
+                    self.proxy_user = data.get("proxy_user", self.proxy_user)
+                    self.proxy_pass = data.get("proxy_pass", self.proxy_pass)
                     if not username:
                         self.username = data.get("username", "admin")
                     if not password:
@@ -445,7 +451,7 @@ class AimiliClient:
         return False
 
     def fetch_scoped_nodes(self, country: str = "JP", status: str = "available", limit: int = 150, offset: int = 0) -> List[CandidateNode]:
-        """从 Aimili 提取指定国家和状态的候选节点（包含实测带宽数据，支持分页拉取）"""
+        """从 Aimili 获取指定国家和状态的候选节点（真实数据，支持分页拉取，锁定 OpenVPN 协议）"""
         if not self.logged_in and not self.login():
             return []
 
@@ -456,7 +462,7 @@ class AimiliClient:
         max_to_fetch = max(limit, 30)
 
         while len(candidates) < max_to_fetch and curr_offset < 1000:
-            url = f"{self.base_url}/api/ui/nodes?country={country}&status={status}&offset={curr_offset}&limit={batch_size}"
+            url = f"{self.base_url}/api/ui/nodes?country={country}&status={status}&protocol=OpenVPN&offset={curr_offset}&limit={batch_size}"
             req = urllib.request.Request(url, headers={"User-Agent": "AimiliPurePicker/1.0"})
             try:
                 with self.opener.open(req, timeout=10) as resp:
@@ -467,19 +473,11 @@ class AimiliClient:
                     for n in raw_nodes:
                         nid = str(n.get("id") or n.get("pool_endpoint_id") or "")
                         ip = n.get("ip") or n.get("host") or ""
+                        proto_name = str(n.get("protocol") or "").lower()
+                        if proto_name and proto_name != "openvpn":
+                            continue
                         if not ip or not nid or ip in seen_ips:
                             continue
-                        seen_ips.add(ip)
-                        pool_id = str(n.get("pool_endpoint_id") or "")
-                        aliases = [nid]
-                        if pool_id:
-                            aliases.extend([pool_id, f"pool:{pool_id}"])
-                        aliases.append(nid.replace("pool:", ""))
-                        aliases = list(set([a for a in aliases if a]))
-
-                        # 提取带宽数据 (Aimili speed/speed_bps 单位为 bps)
-                        speed_bps = int(n.get("speed_bps") or n.get("speed") or 0)
-                        speed_mbps = round(speed_bps / 1e6, 1)
 
                         # 精确提取端口与协议 (Aimili 将真实端口存放于 remote_port 或 node id 中)
                         port_val = n.get("port") or n.get("remote_port")
@@ -488,8 +486,24 @@ class AimiliClient:
                             if len(parts) >= 2 and parts[1].isdigit():
                                 port_val = parts[1]
                         port = int(port_val) if port_val else 1194
+                        if port <= 0:
+                            continue
 
-                        protocol = n.get("protocol") or ("tcp" if "_tcp" in nid else "udp")
+                        seen_ips.add(ip)
+                        pool_id = str(n.get("pool_endpoint_id") or "")
+                        aliases = [nid]
+                        if pool_id:
+                            aliases.extend([pool_id, f"pool:{pool_id}"])
+                        aliases.append(nid.replace("pool:", ""))
+                        if port and proto_name:
+                            aliases.append(f"{ip}_{port}_{proto_name}")
+                        aliases = list(set([a for a in aliases if a]))
+
+                        # 提取带宽数据 (Aimili speed/speed_bps 单位为 bps)
+                        speed_bps = int(n.get("speed_bps") or n.get("speed") or 0)
+                        speed_mbps = round(speed_bps / 1e6, 1)
+
+                        protocol = proto_name or ("tcp" if "_tcp" in nid else "udp")
 
                         candidates.append(CandidateNode(
                             id=nid,
@@ -570,8 +584,19 @@ class AimiliClient:
             time.sleep(0.8)
         return False
 
-    def wait_for_tunnel_ready(self, expected_node_id: str, timeout: float = 12.0) -> bool:
-        """等待 Aimili 成功建立 OpenVPN 隧道与本地代理通道"""
+    def wait_for_tunnel_ready(self, expected_target: Any, timeout: float = 15.0) -> bool:
+        """等待 Aimili 成功建立 OpenVPN 隧道与本地代理通道（基于 Aimili 真实运行状态多维判定）"""
+        if isinstance(expected_target, CandidateNode):
+            expected_node_id = expected_target.id
+            expected_ip = expected_target.ip
+        elif isinstance(expected_target, str):
+            expected_node_id = expected_target
+            parts = expected_target.replace("pool:", "").split("_")
+            expected_ip = parts[0] if parts and ("." in parts[0]) else ""
+        else:
+            expected_node_id = str(expected_target)
+            expected_ip = ""
+
         clean_id = expected_node_id.replace("pool:", "")
         start = time.time()
         while time.time() - start < timeout:
@@ -581,13 +606,32 @@ class AimiliClient:
                 continue
 
             active_id = str(st.get("active_openvpn_node_id") or "")
-            tunnel_ready = bool(st.get("tunnel_ready"))
-            msg = str(st.get("last_check_message") or "")
+            active_endpoint = str(st.get("active_connected_endpoint") or "")
+            proxy_ip = str(st.get("proxy_ip") or "")
+            active_node_info = st.get("active_openvpn_node") or {}
+            active_ip = str(active_node_info.get("ip") or "")
 
-            # 1. 严格握手验证：OpenVPN 隧道就绪，且活动节点 ID 匹配
-            if tunnel_ready and (clean_id in active_id or active_id in clean_id or not clean_id):
+            # 隧道就绪判断 (基于 Aimili state.json 真实运行状态字段)
+            is_tunnel_ok = bool(
+                st.get("active_tunnel_ok")
+                or st.get("tunnel_forward_ok")
+                or (st.get("connection_status") == "connected" and st.get("client_proxy_ok"))
+                or st.get("tunnel_ready")
+            )
+
+            # 目标节点匹配判断 (通过 IP 或 endpoint ID 匹配)
+            is_matching = (
+                (expected_ip and (expected_ip in active_id or expected_ip == proxy_ip or expected_ip == active_ip))
+                or (clean_id and (clean_id in active_endpoint or clean_id in active_id))
+                or (not clean_id and not expected_ip)
+            )
+
+            # 1. 严格握手验证：OpenVPN 隧道就绪，且活动节点匹配
+            if is_tunnel_ok and is_matching:
+                logger.info(f"✅ [隧道握手成功] 目标节点 {expected_ip or expected_node_id} 已成功上线并就绪 (出口: {proxy_ip or active_ip})")
                 return True
 
+            msg = str(st.get("last_check_message") or "")
             # 2. 状态感知：若 Aimili 处于切换验证中，或正在建连，包容等待
             is_connecting = bool(st.get("is_connecting")) or ("切换中" in msg) or ("后台验证" in msg) or ("验证中" in msg)
             if is_connecting:
@@ -595,7 +639,7 @@ class AimiliClient:
                 continue
 
             # 3. 明确终态建连失败：只有确认已结束切换且不是正在验证时才提前退出
-            if any(k in msg for k in ["连不上", "Node not found", "失败", "不可用"]):
+            if any(k in msg for k in ["连不上", "Node not found", "失败", "不可用"]) and not is_tunnel_ok:
                 logger.warning(f"⚠️ 节点 {expected_node_id} 隧道建连失败: {msg}")
                 return False
 
@@ -617,6 +661,8 @@ class AimiliClient:
         if node.pool_endpoint_id:
             cand_ids.insert(0, f"pool:{node.pool_endpoint_id}")
             cand_ids.append(node.pool_endpoint_id)
+        if node.ip and node.port and node.protocol:
+            cand_ids.append(f"{node.ip}_{node.port}_{node.protocol.lower()}")
         cand_ids.append(clean_id)
         seen = set()
         unique_ids = [x for x in cand_ids if x and not (x in seen or seen.add(x))]
@@ -636,7 +682,7 @@ class AimiliClient:
                             logger.debug(f"⚠️ 切换 ID [{test_id}] 返回错误: {res.get('error')}")
                             continue
                         logger.info(f"🚀 成功向 Aimili 下发节点切换指令 -> 活动出口: {node.ip} (ID: {test_id})")
-                        ready = self.wait_for_tunnel_ready(test_id, timeout=12.0)
+                        ready = self.wait_for_tunnel_ready(node, timeout=15.0)
                         if ready:
                             return True
                         else:
@@ -1246,21 +1292,84 @@ def probe_socket_reachability(ip: str, port: int, protocol: str = "tcp", timeout
         return True, 999
 
 def probe_real_download_speed(
-    proxy_port: int = 7928,
+    proxy_port: int = 8500,
     proxy_host: str = "127.0.0.1",
+    proxy_user: Optional[str] = "socks5",
+    proxy_pass: Optional[str] = "ilovestudy",
     max_bytes: int = 2 * 1024 * 1024,
     max_duration: float = 3.0,
     test_urls: Optional[List[str]] = None,
     mock_speed: Optional[float] = None
 ) -> float:
     """
-    通过 Aimili 本地代理进行真实微吞吐测速：
-    拉取数据切片，限制在 max_duration 秒内，测算实际下行速率 (Mbps)。
+    通过 Aimili 本地 SOCKS5 代理进行真实微吞吐测速：
+    支持 SOCKS5 用户名密码认证与原生 HTTP 代理回退，限制在 max_duration 秒内测算实际下行速率 (Mbps)。
     """
     if mock_speed is not None:
         return round(float(mock_speed), 2)
 
     urls = test_urls or TEST_SPEED_URLS
+
+    # 1. 优先尝试原生 SOCKS5 Socket 测速 (带用户名密码认证，精准兼容 Aimili 本地代理)
+    for url in urls:
+        try:
+            parsed = urllib.parse.urlparse(url)
+            target_host = parsed.hostname
+            target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            target_path = (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "")
+
+            if parsed.scheme == "http":
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(max_duration + 1.5)
+                s.connect((proxy_host, proxy_port))
+
+                # SOCKS5 认证协商
+                if proxy_user and proxy_pass:
+                    s.sendall(b"\x05\x02\x00\x02")
+                else:
+                    s.sendall(b"\x05\x01\x00")
+
+                resp = s.recv(2)
+                if len(resp) >= 2 and resp[0] == 5:
+                    if resp[1] == 2 and proxy_user and proxy_pass:
+                        u, p = proxy_user.encode("utf-8"), proxy_pass.encode("utf-8")
+                        auth_pkt = bytes([1, len(u)]) + u + bytes([len(p)]) + p
+                        s.sendall(auth_pkt)
+                        aresp = s.recv(2)
+                        if len(aresp) < 2 or aresp[1] != 0:
+                            s.close()
+                            continue
+                    elif resp[1] != 0:
+                        s.close()
+                        continue
+
+                    # SOCKS5 CONNECT
+                    thost_b = target_host.encode("utf-8")
+                    req_pkt = b"\x05\x01\x00\x03" + bytes([len(thost_b)]) + thost_b + target_port.to_bytes(2, "big")
+                    s.sendall(req_pkt)
+                    cresp = s.recv(10)
+                    if len(cresp) >= 4 and cresp[1] == 0:
+                        http_req = f"GET {target_path} HTTP/1.1\r\nHost: {target_host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n".encode("utf-8")
+                        s.sendall(http_req)
+
+                        start_t = time.time()
+                        received = 0
+                        while (time.time() - start_t) < max_duration and received < max_bytes:
+                            chunk = s.recv(16384)
+                            if not chunk:
+                                break
+                            received += len(chunk)
+                        duration = max(0.08, time.time() - start_t)
+                        s.close()
+                        if received > 2048:
+                            speed_mbps = round((received * 8.0) / (duration * 1e6), 2)
+                            logger.info(f"⚡ [SOCKS5测速成功] 源: {target_host} -> 传输 {received} 字节，耗时 {duration:.2f}s，流速: {speed_mbps} Mbps")
+                            return speed_mbps
+                s.close()
+        except Exception as e:
+            logger.debug(f"⚠️ SOCKS5 测速异常 ({url}): {e}")
+
+    # 2. 备用回退机制：标准 urllib ProxyHandler (若运行在支持 HTTP 代理的网关环境下)
     proxy_url = f"http://{proxy_host}:{proxy_port}"
     proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
     opener = urllib.request.build_opener(proxy_handler)
@@ -1286,10 +1395,10 @@ def probe_real_download_speed(
             duration = max(0.08, time.time() - start_t)
             if received > 2048:
                 speed_mbps = round((received * 8.0) / (duration * 1e6), 2)
-                logger.debug(f"⚡ [测速成功] 源: {url} -> 传输 {received} 字节，耗时 {duration:.2f}s，流速: {speed_mbps} Mbps")
+                logger.debug(f"⚡ [HTTP代理测速成功] 源: {url} -> 传输 {received} 字节，耗时 {duration:.2f}s，流速: {speed_mbps} Mbps")
                 return speed_mbps
         except Exception as e:
-            logger.debug(f"⚠️ [测速异常] 源 {url} 请求失败: {e}，尝试下一个备用源...")
+            logger.debug(f"⚠️ [HTTP代理测速异常] 源 {url} 请求失败: {e}，尝试下一个备用源...")
             continue
 
     return 0.0
@@ -1415,11 +1524,20 @@ class PickerEngine:
                             logger.info(f"⚡ [实测存量] 正在通过 Aimili 测试存量节点 {node.ip} 真实带宽...")
                             self.aimili.set_active_node(node, timeout=12)
                             time.sleep(1.2)
-                            real_speed = self.probe_speed_func(
-                                proxy_port=self.aimili.proxy_port,
-                                proxy_host=self.aimili.host,
-                                max_duration=3.0
-                            )
+                            try:
+                                real_speed = self.probe_speed_func(
+                                    proxy_port=self.aimili.proxy_port,
+                                    proxy_host=self.aimili.host,
+                                    proxy_user=getattr(self.aimili, "proxy_user", "socks5"),
+                                    proxy_pass=getattr(self.aimili, "proxy_pass", "ilovestudy"),
+                                    max_duration=3.0
+                                )
+                            except TypeError:
+                                real_speed = self.probe_speed_func(
+                                    proxy_port=self.aimili.proxy_port,
+                                    proxy_host=self.aimili.host,
+                                    max_duration=3.0
+                                )
                             node.speed_mbps = real_speed
                             node.speed_bps = int(real_speed * 1e6)
                             evaluated_candidates.append(node)
@@ -1628,22 +1746,20 @@ class PickerEngine:
                             continue
 
                         time.sleep(1.2)
-
-
-                        real_speed = self.probe_speed_func(
-
-
-                            proxy_port=self.aimili.proxy_port,
-
-
-                            proxy_host=self.aimili.host,
-
-
-                            max_duration=3.0
-
-
-                        )
-
+                        try:
+                            real_speed = self.probe_speed_func(
+                                proxy_port=self.aimili.proxy_port,
+                                proxy_host=self.aimili.host,
+                                proxy_user=getattr(self.aimili, "proxy_user", "socks5"),
+                                proxy_pass=getattr(self.aimili, "proxy_pass", "ilovestudy"),
+                                max_duration=3.0
+                            )
+                        except TypeError:
+                            real_speed = self.probe_speed_func(
+                                proxy_port=self.aimili.proxy_port,
+                                proxy_host=self.aimili.host,
+                                max_duration=3.0
+                            )
 
                         node.speed_mbps = real_speed
                         node.speed_bps = int(real_speed * 1e6)
