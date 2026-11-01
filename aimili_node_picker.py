@@ -1276,11 +1276,16 @@ class IpIntelligenceManager:
                 with open(self.cache_file, "r", encoding="utf-8") as f:
                     raw_cache = json.load(f)
                     clean = {}
+                    purged_count = 0
                     for ip, entry in raw_cache.items():
-                        if entry.get("ip_type") != "未知宽带类型" and entry.get("risk_label") not in ["未知", "检测超时", "反爬拦截"]:
+                        rlabel = str(entry.get("risk_label") or "")
+                        if "IP-API" in rlabel or rlabel in ["未知", "检测超时", "反爬拦截"]:
+                            purged_count += 1
+                            continue
+                        if entry.get("ip_type") != "未知宽带类型":
                             clean[ip] = entry
                     self.cache = clean
-                    logger.info(f"📂 成功加载 IP 情报有效缓存共 {len(self.cache)} 条")
+                    logger.info(f"📂 成功加载 IP 情报有效缓存共 {len(self.cache)} 条 (已自动净化历史 IP-API 估算缓存共 {purged_count} 条)")
             except Exception as e:
                 logger.warning(f"⚠️ 读取 IP 缓存失败: {e}")
 
@@ -2205,6 +2210,9 @@ class PickerEngine:
                         logger.warning(f"🚫 [存量淘汰] 收藏节点 {node.ip:<15} 验身未达标 ({reason})，标记移出收藏")
                         self.exp_mgr.record_fail(node.ip, reason)
                         live_evicted_fav_ids.append(fav_id)
+                        if q and getattr(q, "risk_score", 0) >= 10:
+                            self.blacklist.add(node.ip, reason=f"存量验身风控超标 ({q.risk_score}% >= 10%)", risk_score=q.risk_score, isp=getattr(q, "isp", ""))
+                            logger.warning(f"🚫 [存量拉黑] 收藏节点 {node.ip:<15} 风控超标 ({q.risk_score}% ≥ 10%)，已加入永久黑名单！")
 
                 total_evicted = len(live_evicted_fav_ids) + len(dead_evicted_fav_ids)
                 logger.info(
