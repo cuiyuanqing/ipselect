@@ -18,6 +18,8 @@ import time
 import urllib.request
 import urllib.error
 
+sys.stdout.reconfigure(encoding='utf-8')
+
 VPS_URL = "http://jiakuan.19940407.xyz:8585"
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
