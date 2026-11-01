@@ -1738,9 +1738,13 @@ class PickerEngine:
                         logger.info(f"⚡ [实测开始] 节点 {node.ip:<15} (风控 {q.risk_score}%) 通过初筛，正在连接测试真实带宽...")
 
 
-                        connected = self.aimili.set_active_node(node, timeout=12)
+                        # Aimili 处于 routing_mode='favorites' (仅限收藏) 模式，切换前必须先加入收藏库 Aimili 方可建立 OpenVPN 隧道
+                        self.aimili.toggle_favorite(node, favorite=True)
+
+                        connected = self.aimili.set_active_node(node, timeout=15)
                         if not connected:
                             logger.warning(f"❌ [握手失败] 无法切换到活动节点 {node.ip} (OpenVPN握手失败或Aimili正忙)，标记握手未通")
+                            self.aimili.toggle_favorite(node, favorite=False)
                             node.handshake_ok = False
                             self.exp_mgr.record_fail(node.ip, "OpenVPN握手或建连失败")
                             continue
@@ -1766,6 +1770,7 @@ class PickerEngine:
 
                         if real_speed <= 0.0:
                             logger.warning(f"❌ [出站不通] 节点 {node.ip:<15} 虽已建立隧道但代理出站流量为 0.0 Mbps，握手未真正打通，已淘汰")
+                            self.aimili.toggle_favorite(node, favorite=False)
                             node.handshake_ok = False
                             self.exp_mgr.record_fail(node.ip, "出站流量不通(0.0Mbps)")
                             continue
@@ -1773,23 +1778,12 @@ class PickerEngine:
                         node.handshake_ok = True
                         evaluated_candidates.append(node)
 
-
-
                         if real_speed < min_speed_mbps:
-
-
                             logger.warning(f"🚫 [实测淘汰] 节点 {node.ip:<15} 实测带宽不足 ({real_speed} Mbps < {min_speed_mbps} Mbps)，已淘汰")
-
-
+                            self.aimili.toggle_favorite(node, favorite=False)
                             self.exp_mgr.record_fail(node.ip, f"实测速率不足 ({real_speed} Mbps < {min_speed_mbps} Mbps)")
-
-
                             continue
-
-
                         else:
-
-
                             logger.info(f"✅ [实测达标] 节点 {node.ip:<15} 实测速率: {real_speed} Mbps (≥ {min_speed_mbps} Mbps) 达标！")
 
 
