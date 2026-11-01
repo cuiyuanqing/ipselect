@@ -885,8 +885,14 @@ class AimiliClient:
         configs_dir = "/opt/aimilivpn/vpngate_data/configs"
         if os.path.exists(configs_dir):
             try:
-                exist_set = set(os.listdir(configs_dir))
+                all_files = os.listdir(configs_dir)
+                exist_set = set(all_files)
                 cand_ids = [cid for cid in cand_ids if f"{cid}.ovpn" in exist_set]
+                # 若未精确匹配到，但 configs 目录下存在该 IP 的 .ovpn 配置文件，自动提取真实文件名
+                if not cand_ids and node.ip:
+                    for fn in all_files:
+                        if fn.endswith(".ovpn") and (f"_{node.ip}_" in fn or fn.startswith(f"{node.ip}_")):
+                            cand_ids.append(fn[:-5])
             except Exception:
                 pass
 
@@ -3582,19 +3588,27 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     exact_node_id=target_id
                 )
 
-            switched = self.engine.aimili.set_active_node(node_obj, timeout=25)
-            if switched:
-                self.engine.last_result["active_node_ip"] = target_ip
-                for n in self.engine.last_result.get("nodes", []):
-                    n["is_active"] = (n.get("ip") == target_ip)
-                try:
-                    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                        json.dump(self.engine.last_result, f, ensure_ascii=False, indent=2)
-                except Exception as e:
-                    logger.warning(f"更新历史活动出口异常: {e}")
-                self._send_json_response({"ok": True, "message": f"成功将 Aimili 活动出口切换为 {target_ip}！", "active_ip": target_ip})
-            else:
-                self._send_json_response({"ok": False, "message": f"切换活动出口指令下发失败或节点握手超时，Aimili 正在恢复中，请稍后刷新查看"}, status_code=500)
+            def _async_switch():
+                switched = self.engine.aimili.set_active_node(node_obj, timeout=35)
+                if switched:
+                    self.engine.last_result["active_node_ip"] = target_ip
+                    for n in self.engine.last_result.get("nodes", []):
+                        n["is_active"] = (n.get("ip") == target_ip)
+                    try:
+                        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                            json.dump(self.engine.last_result, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        logger.warning(f"更新历史活动出口异常: {e}")
+                    logger.info(f"✅ 后台成功将 Aimili 活动出口切换为 {target_ip}")
+                else:
+                    logger.warning(f"⚠️ 后台切换节点 {target_ip} 握手超时或失败")
+
+            threading.Thread(target=_async_switch, daemon=True).start()
+            self._send_json_response({
+                "ok": True,
+                "message": f"已成功向 Aimili 下发切换指令，正在建立 OpenVPN 隧道并接管出口 ({target_ip})，请留意顶部看板状态！",
+                "active_ip": target_ip
+            })
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
             res = run_git_force_update()
             self._send_json_response(res, status_code=200 if res.get("ok") else 500)
