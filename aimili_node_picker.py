@@ -2517,11 +2517,15 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 "blacklist": self.engine.blacklist.records if self.engine else {}
             }
             self._send_json_response(data)
-        elif url.path == "/api/blacklist/clear":
-            if self.engine:
-                self.engine.blacklist.records.clear()
-                self.engine.blacklist.save()
-            self._send_json_response({"ok": True, "count": 0, "message": "永久黑名单已清空"})
+        elif url.path == "/api/debug_aimili":
+            raw_url = f"{self.engine.aimili.base_url}/api/ui/nodes?country=JP&limit=2"
+            try:
+                req = urllib.request.Request(raw_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
+                with self.engine.aimili.opener.open(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    self._send_json_response({"raw_nodes": data.get("nodes", [])[:2]})
+            except Exception as e:
+                self._send_json_response({"error": str(e)})
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
             res = run_git_force_update()
             self._send_json_response(res, status_code=200 if res.get("ok") else 500)
