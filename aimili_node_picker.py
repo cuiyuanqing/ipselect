@@ -2543,7 +2543,22 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     else:
                         self._send_json_response({"error": f"Dir not found: {safe_dir}"})
                         return
-                sub_path = query_params.get("path", [None])[0]
+                sql = query_params.get("sql", [None])[0]
+                if sql:
+                    import sqlite3
+                    db_path = query_params.get("db", ["/opt/aimilivpn/vpngate_data/node_pool.sqlite3"])[0]
+                    if os.path.exists(db_path):
+                        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                        cur = conn.cursor()
+                        cur.execute(sql)
+                        cols = [d[0] for d in cur.description] if cur.description else []
+                        rows = cur.fetchall()
+                        conn.close()
+                        self._send_json_response({"db": db_path, "cols": cols, "rows": rows[:100], "count": len(rows)})
+                        return
+                    else:
+                        self._send_json_response({"error": f"DB not found: {db_path}"})
+                        return
                 if sub_path:
                     raw_url = f"{self.engine.aimili.base_url}{sub_path}"
                 else:
