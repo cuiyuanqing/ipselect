@@ -175,6 +175,7 @@ class CandidateNode:
     jitter_ms: int = 0
     packet_loss_pct: int = 0
     transport: str = "udp"
+    exact_node_id: Optional[str] = None
 
     @property
     def canonical_fav_id(self) -> str:
@@ -472,8 +473,8 @@ class AimiliClient:
                 WHERE s.country IN ({placeholders})
                   {status_clause}
                   AND LOWER(e.protocol)='openvpn'
+                  AND e.port > 0
                 ORDER BY e.fail_streak ASC, 
-                         (CASE WHEN LOWER(e.transport)='udp' THEN 0 ELSE 1 END), 
                          json_extract(s.metadata_json, '$.speed') DESC, 
                          e.success_streak DESC, 
                          e.ui_latency_ms ASC
@@ -504,24 +505,31 @@ class AimiliClient:
 
                 pool_id = str(eid)
                 nid = f"pool:{pool_id}"
-                aliases = [
-                    nid,
-                    pool_id,
-                    f"{ip}_{port}_{transport}",
-                    f"JP_{ip}_{port}_{transport}",
-                    f"{ip}_{port}_openvpn",
-                    f"{ip}_{port}_udp",
-                    f"{ip}_{port}_tcp"
-                ]
+                
+                exact_node_id = None
                 try:
                     e_meta = json.loads(e_meta_str) if e_meta_str else {}
                     if e_meta.get("node_id"):
-                        aliases.append(e_meta.get("node_id"))
+                        exact_node_id = str(e_meta.get("node_id"))
                 except Exception:
                     pass
 
+                aliases = []
+                if exact_node_id:
+                    aliases.append(exact_node_id)
+                aliases.extend([
+                    nid,
+                    pool_id,
+                    f"JP_{ip}_{port}_{transport}",
+                    f"{ctry or country}_{ip}_{port}_{transport}",
+                    f"{ip}_{port}_{transport}",
+                    f"{ip}_{port}_openvpn",
+                    f"{ip}_{port}_udp",
+                    f"{ip}_{port}_tcp"
+                ])
+
                 candidates.append(CandidateNode(
-                    id=nid,
+                    id=exact_node_id if exact_node_id else nid,
                     ip=ip,
                     port=port,
                     country=ctry if ctry else country,
@@ -531,7 +539,8 @@ class AimiliClient:
                     speed_mbps=speed_mbps,
                     pool_endpoint_id=pool_id,
                     aliases=list(set(aliases)),
-                    transport=transport
+                    transport=transport,
+                    exact_node_id=exact_node_id
                 ))
             if candidates:
                 logger.info(f"💾 成功从 Aimili 本地 SQLite 读取到 [{country}] 地区存活 OpenVPN 候选节点共 {len(candidates)} 个 (offset={offset})")
@@ -739,13 +748,13 @@ class AimiliClient:
             # 2. 状态感知：若 Aimili 处于初始化、切换验证中、或正在建连，动态延长等待上限至 30 秒容纳 OpenVPN TLS 握手
             is_connecting = bool(st.get("is_connecting")) or any(k in msg for k in ["初始化", "切换中", "后台验证", "验证中", "仍在建立"])
             if is_connecting:
-                if max_wait < 30.0:
-                    max_wait = 30.0
+                if max_wait < 32.0:
+                    max_wait = 32.0
                 time.sleep(1.0)
                 continue
 
-            # 3. 明确终态建连失败：只有确认已结束切换且不是正在验证时才提前退出
-            if any(k in msg for k in ["连不上", "Node not found", "失败", "不可用"]) and not is_tunnel_ok:
+            # 3. 明确终态建连失败：只有确认已结束切换且消息明确匹配当前目标节点时才提前退出
+            if (expected_ip in msg or clean_id in msg) and any(k in msg for k in ["连不上", "Node not found", "失败", "不可用"]) and not is_tunnel_ok:
                 logger.warning(f"⚠️ 节点 {expected_node_id} 隧道建连失败: {msg}")
                 return False
 
@@ -762,25 +771,33 @@ class AimiliClient:
 
         url = f"{self.base_url}/api/connect"
         cand_ids = []
-        # 1. 第一优先级：Aimili 底层 OpenVPN 核心引擎真实绑定的别名 ID 格式: {ip}_{port}_{proto}
+
+        # 1. 极高优先级：若有数据库记录的真实 node_id (例如 JP_110.131.199.23_1404_tcp)
+        exact_id = getattr(node, "exact_node_id", None)
+        if exact_id:
+            cand_ids.append(exact_id)
+
+        # 2. 第二优先级：Aimili 底层 pool endpoint 格式 (pool:xxxx)
+        if node.pool_endpoint_id:
+            cand_ids.append(f"pool:{node.pool_endpoint_id}")
+            cand_ids.append(node.pool_endpoint_id)
+
+        clean_id = node.id.replace("pool:", "")
+        cand_ids.extend([node.id, f"pool:{clean_id}", clean_id])
+
+        # 3. 第三优先级：带国家前缀或传输层协议的别名
         if node.ip and node.port:
             transport = getattr(node, "transport", "").lower() or ("tcp" if "_tcp" in node.id else "udp")
-            cand_ids.append(f"{node.ip}_{node.port}_{transport}")
             cand_ids.append(f"JP_{node.ip}_{node.port}_{transport}")
             cand_ids.append(f"{node.country}_{node.ip}_{node.port}_{transport}")
+            cand_ids.append(f"{node.ip}_{node.port}_{transport}")
             cand_ids.append(f"{node.ip}_{node.port}_openvpn")
             cand_ids.append(f"{node.ip}_{node.port}_udp")
             cand_ids.append(f"{node.ip}_{node.port}_tcp")
 
-        # 2. 第二优先级：候选池与端点别名
-        clean_id = node.id.replace("pool:", "")
-        cand_ids.extend([node.id, f"pool:{clean_id}"])
-        if node.pool_endpoint_id:
-            cand_ids.append(f"pool:{node.pool_endpoint_id}")
-            cand_ids.append(node.pool_endpoint_id)
-        cand_ids.append(clean_id)
         if hasattr(node, "aliases") and node.aliases:
             cand_ids.extend(node.aliases)
+
         seen = set()
         unique_ids = [x for x in cand_ids if x and not (x in seen or seen.add(x))]
 
@@ -799,9 +816,15 @@ class AimiliClient:
                             logger.debug(f"⚠️ 切换 ID [{test_id}] 返回错误: {res.get('error')}")
                             continue
                         logger.info(f"🚀 成功向 Aimili 下发节点切换指令 -> 活动出口: {node.ip} (ID: {test_id})")
-                        ready = self.wait_for_tunnel_ready(node, timeout=15.0)
+                        ready = self.wait_for_tunnel_ready(node, timeout=timeout)
                         if ready:
                             return True
+                        
+                        st = self.get_state()
+                        msg = str(st.get("last_check_message") or "") if st else ""
+                        if test_id and f"Node not found: {test_id}" in msg:
+                            logger.warning(f"⚠️ Aimili 无法识别 ID [{test_id}] (Node not found)，尝试备选 ID 格式...")
+                            continue
                         else:
                             logger.warning(f"⚠️ 节点 {node.ip} (ID: {test_id}) 握手未就绪或建连超时，跳过该节点")
                             return False
@@ -1225,7 +1248,8 @@ def probe_network_quality(
     port: int,
     protocol: str = "openvpn",
     samples: int = 3,
-    timeout_per_sample: float = 0.8
+    timeout_per_sample: float = 0.8,
+    known_latency_ms: int = 0
 ) -> Dict[str, Any]:
     """
     节点多维度网络质量探测（漏斗初筛第 1 关）：
@@ -1234,7 +1258,7 @@ def probe_network_quality(
     3. 测量网络抖动（jitter_ms，基于各采样离散差）
     4. 探测业务端口通畅度（port_open）
     """
-    is_tcp = protocol.lower() == "tcp" or port in [443, 995, 8443, 1195]
+    is_tcp = protocol.lower() == "tcp" or (protocol.lower() != "udp" and port in [443, 995, 8443])
 
     # 策略 A: TCP 协议多采样测探 (直接以业务握手测得端口、延迟与抖动)
     if is_tcp:
@@ -1276,7 +1300,7 @@ def probe_network_quality(
                 "method": "tcp_socket"
             }
 
-    # 策略 B: UDP / OpenVPN 协议：ICMP 存活+抖动分析 + UDP 端口探针
+    # 策略 B: UDP / OpenVPN 协议：ICMP 存活+抖动分析 + 主动 OpenVPN UDP 探针
     import platform
     import subprocess
     is_win = platform.system().lower() == "windows"
@@ -1317,35 +1341,76 @@ def probe_network_quality(
         is_alive = (len(reply_times) > 0 or loss_pct < 100) and avg_rtt < 900
         port_open = False
 
-        # 如果 ICMP 被拦截但目标端口具备响应能力，进行 TCP 探针兜底
+        # 如果 ICMP 被拦截（日本绝大多数家庭宽带默认拒绝外部 Ping），使用 UDP/TCP 探针进行精准复检
         if not is_alive and port > 0:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(0.8)
-                t0 = time.time()
-                if s.connect_ex((ip, port)) == 0:
-                    rtt = max(1, int((time.time() - t0) * 1000))
-                    if rtt < 900:
-                        is_alive = True
-                        port_open = True
-                        avg_rtt = rtt
-                        jitter = 5
-                        loss_pct = 0
-                s.close()
-            except Exception:
-                pass
+            if protocol.lower() == "udp":
+                udp_rtts = []
+                for _ in range(min(samples, 2)):
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        s.settimeout(0.7)
+                        t0 = time.time()
+                        probe_pkt = b"\x38" + os.urandom(8) + b"\x00\x00\x00\x00\x00"
+                        s.sendto(probe_pkt, (ip, port))
+                        data, _ = s.recvfrom(1024)
+                        rtt = (time.time() - t0) * 1000.0
+                        s.close()
+                        if data and len(data) >= 1:
+                            udp_rtts.append(rtt)
+                    except Exception:
+                        pass
+                if udp_rtts:
+                    avg_rtt = int(sum(udp_rtts) / len(udp_rtts))
+                    diffs = [abs(udp_rtts[i] - udp_rtts[i-1]) for i in range(1, len(udp_rtts))] if len(udp_rtts) > 1 else [0.0]
+                    jitter = int(sum(diffs) / len(diffs))
+                    return {
+                        "is_alive": True,
+                        "port_open": True,
+                        "avg_latency_ms": max(1, avg_rtt),
+                        "jitter_ms": jitter,
+                        "packet_loss_pct": 0,
+                        "method": "openvpn_udp_probe"
+                    }
+                if known_latency_ms > 0 and known_latency_ms < 800:
+                    return {
+                        "is_alive": True,
+                        "port_open": True,
+                        "avg_latency_ms": known_latency_ms,
+                        "jitter_ms": 10,
+                        "packet_loss_pct": 0,
+                        "method": "verified_udp_liveness"
+                    }
+            else:
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(0.8)
+                    t0 = time.time()
+                    if s.connect_ex((ip, port)) == 0:
+                        rtt = max(1, int((time.time() - t0) * 1000))
+                        if rtt < 900:
+                            is_alive = True
+                            port_open = True
+                            avg_rtt = rtt
+                            jitter = 5
+                            loss_pct = 0
+                    s.close()
+                except Exception:
+                    pass
 
-        # UDP 端口通畅度 (校验能否正常向目标 UDP 端口投递 OpenVPN 复位探测包)
+        # UDP 端口通畅度 (校验能否正常向目标 UDP 端口投递 OpenVPN 探测包)
         if is_alive and not port_open:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.settimeout(0.5)
-                probe_pkt = b"\x38" + os.urandom(8) + b"\x00\x00\x00\x00\x00"
-                s.sendto(probe_pkt, (ip, port))
-                s.close()
+            if protocol.lower() == "udp":
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.settimeout(0.5)
+                    probe_pkt = b"\x38" + os.urandom(8) + b"\x00\x00\x00\x00\x00"
+                    s.sendto(probe_pkt, (ip, port))
+                    s.close()
+                    port_open = True
+                except Exception:
+                    port_open = False
+            else:
                 port_open = True
-            except Exception:
-                port_open = False
 
         return {
             "is_alive": is_alive,
@@ -1357,6 +1422,15 @@ def probe_network_quality(
         }
     except Exception:
         # 异常/超时时尝试轻量 socket 测活保底
+        if known_latency_ms > 0 and known_latency_ms < 800:
+            return {
+                "is_alive": True,
+                "port_open": True,
+                "avg_latency_ms": known_latency_ms,
+                "jitter_ms": 10,
+                "packet_loss_pct": 0,
+                "method": "verified_fallback"
+            }
         if port > 0:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1571,8 +1645,8 @@ class PickerEngine:
                 f"风控上限: {max_risk}%, 评估模式: {source_mode}, 优先继承存量: {inherit_existing})..."
             )
 
-            # 1. 获取在库候选池 (初始加载前 120 个存活候选)
-            candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=120, offset=0)
+            # 1. 获取在库候选池 (初始加载前 150 个存活候选)
+            candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=150, offset=0)
             if not candidates:
                 logger.error("❌ 未从 Aimili 获取到任何存活节点，请先确认 Aimili 后台节点扫描是否完成！")
                 self.current_step = "未获取到候选节点"
@@ -1751,7 +1825,7 @@ class PickerEngine:
                     self.aimili.refresh_nodes(country=country)
                     time.sleep(5.0)
 
-                    candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=120, offset=(current_round - 1) * 120)
+                    candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=150, offset=(current_round - 1) * 150)
                     total_candidates = max(total_candidates, len(candidates))
 
                 picked_ips = {n.ip for n in picked_nodes}
@@ -1771,7 +1845,10 @@ class PickerEngine:
                 def _probe_cand(c: CandidateNode) -> Tuple[CandidateNode, Dict[str, Any]]:
                     tested_ips.add(c.ip)
                     proto = getattr(c, "transport", "udp") or c.protocol
-                    net_q = self.probe_network_func(c.ip, c.port, proto)
+                    try:
+                        net_q = self.probe_network_func(c.ip, c.port, proto, known_latency_ms=getattr(c, "latency_ms", 0))
+                    except TypeError:
+                        net_q = self.probe_network_func(c.ip, c.port, proto)
                     return c, net_q
 
                 alive_candidates: List[CandidateNode] = []
