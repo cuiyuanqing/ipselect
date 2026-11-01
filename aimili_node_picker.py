@@ -451,8 +451,99 @@ class AimiliClient:
         logger.error(f"❌ 所有登录路径尝试完毕，均未能成功连接到 Aimili 后端 (请确认端口 {self.port} 及安全路径 {self.secret_path} 是否正确)")
         return False
 
+    def fetch_nodes_from_sqlite(self, country: str = "JP", status: str = "available", limit: int = 150, offset: int = 0) -> List[CandidateNode]:
+        """直接从 Aimili 本地 SQLite node_pool 读取可用 OpenVPN 节点"""
+        db_path = "/opt/aimilivpn/vpngate_data/node_pool.sqlite3"
+        if not os.path.exists(db_path):
+            return []
+        try:
+            import sqlite3
+            country_clean = country.upper()
+            country_names = ["日本", "JP", "Japan"] if country_clean == "JP" else ([country] + (["美国", "US", "USA"] if country_clean == "US" else [country]))
+            placeholders = ",".join(["?"] * len(country_names))
+
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            cur = conn.cursor()
+            status_clause = "AND UPPER(e.status) = 'AVAILABLE'" if status.lower() == "available" else ""
+            sql = f"""
+                SELECT e.endpoint_id, s.current_ip, e.port, e.protocol, e.transport, e.status, s.country, e.ui_latency_ms, s.metadata_json, e.metadata_json
+                FROM endpoints e 
+                JOIN servers s ON e.server_key=s.server_key 
+                WHERE s.country IN ({placeholders})
+                  {status_clause}
+                  AND LOWER(e.protocol)='openvpn'
+                ORDER BY e.fail_streak ASC, e.success_streak DESC, e.ui_latency_ms ASC
+                LIMIT ? OFFSET ?
+            """
+            params = list(country_names) + [limit, offset]
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            conn.close()
+
+            candidates = []
+            seen_ips = set()
+            for r in rows:
+                eid, ip, port, proto, transport, st, ctry, ui_lat, s_meta_str, e_meta_str = r
+                if not ip or not eid or ip in seen_ips:
+                    continue
+                seen_ips.add(ip)
+                port = int(port or 1194)
+                transport = str(transport or "udp").lower()
+
+                speed_bps = 0
+                try:
+                    s_meta = json.loads(s_meta_str) if s_meta_str else {}
+                    speed_bps = int(s_meta.get("speed") or 0)
+                except Exception:
+                    pass
+                speed_mbps = round(speed_bps / 1e6, 1)
+
+                pool_id = str(eid)
+                nid = f"pool:{pool_id}"
+                aliases = [
+                    nid,
+                    pool_id,
+                    f"{ip}_{port}_{transport}",
+                    f"JP_{ip}_{port}_{transport}",
+                    f"{ip}_{port}_openvpn",
+                    f"{ip}_{port}_udp",
+                    f"{ip}_{port}_tcp"
+                ]
+                try:
+                    e_meta = json.loads(e_meta_str) if e_meta_str else {}
+                    if e_meta.get("node_id"):
+                        aliases.append(e_meta.get("node_id"))
+                except Exception:
+                    pass
+
+                candidates.append(CandidateNode(
+                    id=nid,
+                    ip=ip,
+                    port=port,
+                    country=ctry if ctry else country,
+                    protocol="openvpn",
+                    latency_ms=int(ui_lat or 999),
+                    speed_bps=speed_bps,
+                    speed_mbps=speed_mbps,
+                    pool_endpoint_id=pool_id,
+                    aliases=list(set(aliases)),
+                    transport=transport
+                ))
+            if candidates:
+                logger.info(f"💾 成功从 Aimili 本地 SQLite 读取到 [{country}] 地区存活 OpenVPN 候选节点共 {len(candidates)} 个 (offset={offset})")
+            return candidates
+        except Exception as e:
+            logger.warning(f"⚠️ 从本地 SQLite 读取候选节点异常: {e}")
+            return []
+
     def fetch_scoped_nodes(self, country: str = "JP", status: str = "available", limit: int = 150, offset: int = 0) -> List[CandidateNode]:
         """从 Aimili 获取指定国家和状态的候选节点（真实数据，支持分页拉取，锁定 OpenVPN 协议）"""
+        # 1. 优先从本地 SQLite 数据库直接读取（毫秒级响应，避免 Aimili API 阻塞超时）
+        sqlite_nodes = self.fetch_nodes_from_sqlite(country=country, status=status, limit=limit, offset=offset)
+        if sqlite_nodes:
+            return sqlite_nodes
+
+        # 2. 本地 SQLite 不存在或为空时降级调用 Aimili HTTP API
         if not self.logged_in and not self.login():
             return []
 
@@ -466,7 +557,7 @@ class AimiliClient:
             url = f"{self.base_url}/api/ui/nodes?country={country}&status={status}&protocol=OpenVPN&offset={curr_offset}&limit={batch_size}"
             req = urllib.request.Request(url, headers={"User-Agent": "AimiliPurePicker/1.0"})
             try:
-                with self.opener.open(req, timeout=10) as resp:
+                with self.opener.open(req, timeout=25) as resp:
                     res = json.loads(resp.read().decode("utf-8"))
                     raw_nodes = res.get("nodes", [])
                     if not raw_nodes:
@@ -500,6 +591,7 @@ class AimiliClient:
                         proto_transport = str(n.get("proto") or ("tcp" if "_tcp" in nid else "udp")).lower()
                         if port:
                             aliases.append(f"{ip}_{port}_{proto_transport}")
+                            aliases.append(f"JP_{ip}_{port}_{proto_transport}")
                             aliases.append(f"{ip}_{port}_openvpn")
                         aliases = list(set([a for a in aliases if a]))
 
@@ -620,6 +712,8 @@ class AimiliClient:
             # 隧道就绪判断 (基于 Aimili state.json 真实运行状态字段)
             is_tunnel_ok = bool(
                 st.get("active_tunnel_ok")
+                or st.get("client_proxy_ok")
+                or st.get("proxy_ok")
                 or st.get("tunnel_forward_ok")
                 or (st.get("connection_status") == "connected" and st.get("client_proxy_ok"))
                 or st.get("tunnel_ready")
@@ -639,7 +733,7 @@ class AimiliClient:
 
             msg = str(st.get("last_check_message") or "")
             # 2. 状态感知：若 Aimili 处于初始化、切换验证中、或正在建连，动态延长等待上限至 30 秒容纳 OpenVPN TLS 握手
-            is_connecting = bool(st.get("is_connecting")) or any(k in msg for k in ["初始化", "切换中", "后台验证", "验证中"])
+            is_connecting = bool(st.get("is_connecting")) or any(k in msg for k in ["初始化", "切换中", "后台验证", "验证中", "仍在建立"])
             if is_connecting:
                 if max_wait < 30.0:
                     max_wait = 30.0
@@ -668,6 +762,8 @@ class AimiliClient:
         if node.ip and node.port:
             transport = getattr(node, "transport", "").lower() or ("tcp" if "_tcp" in node.id else "udp")
             cand_ids.append(f"{node.ip}_{node.port}_{transport}")
+            cand_ids.append(f"JP_{node.ip}_{node.port}_{transport}")
+            cand_ids.append(f"{node.country}_{node.ip}_{node.port}_{transport}")
             cand_ids.append(f"{node.ip}_{node.port}_openvpn")
             cand_ids.append(f"{node.ip}_{node.port}_udp")
             cand_ids.append(f"{node.ip}_{node.port}_tcp")
@@ -679,6 +775,8 @@ class AimiliClient:
             cand_ids.append(f"pool:{node.pool_endpoint_id}")
             cand_ids.append(node.pool_endpoint_id)
         cand_ids.append(clean_id)
+        if hasattr(node, "aliases") and node.aliases:
+            cand_ids.extend(node.aliases)
         seen = set()
         unique_ids = [x for x in cand_ids if x and not (x in seen or seen.add(x))]
 
@@ -1667,7 +1765,8 @@ class PickerEngine:
 
                 def _probe_cand(c: CandidateNode) -> Tuple[CandidateNode, Dict[str, Any]]:
                     tested_ips.add(c.ip)
-                    net_q = self.probe_network_func(c.ip, c.port, c.protocol)
+                    proto = getattr(c, "transport", "udp") or c.protocol
+                    net_q = self.probe_network_func(c.ip, c.port, proto)
                     return c, net_q
 
                 alive_candidates: List[CandidateNode] = []
@@ -2735,6 +2834,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     else:
                         self._send_json_response({"error": f"DB not found: {db_path}"})
                         return
+                sub_path = query_params.get("path", [None])[0]
                 if sub_path:
                     raw_url = f"{self.engine.aimili.base_url}{sub_path}"
                 else:
