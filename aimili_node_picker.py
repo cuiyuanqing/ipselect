@@ -2299,16 +2299,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 VPS_GIT_REPO_DIR = "/home/chuiyuanwo/ipselect"
 
-def run_git_force_update(repo_dir: Optional[str] = None) -> dict:
+def run_git_force_update(repo_dir: Optional[str] = None, use_sudo: Optional[bool] = None) -> dict:
     """
     在指定仓库目录执行 git 强制更新:
-    git fetch --all
-    git reset --hard origin/main
+    sudo git fetch --all
+    sudo git reset --hard origin/main
     """
     target_dir = repo_dir or VPS_GIT_REPO_DIR
     if not os.path.exists(target_dir):
         # 回退至脚本所在目录
         target_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 非 Windows 系统 (Linux VPS) 下默认启用 sudo，确保具备仓库写入与修改权限
+    if use_sudo is None:
+        use_sudo = (os.name != "nt")
+
+    base_cmd = ["sudo", "git", "-c", "safe.directory=*", "-C", target_dir] if use_sudo else ["git", "-C", target_dir]
 
     try:
         if not os.path.isdir(os.path.join(target_dir, ".git")):
@@ -2318,9 +2324,9 @@ def run_git_force_update(repo_dir: Optional[str] = None) -> dict:
                 "error": f"目录 {target_dir} 不是有效的 Git 仓库 (.git 不存在)"
             }
 
-        # 1. git fetch --all
+        # 1. git fetch --all (使用 sudo)
         fetch_res = subprocess.run(
-            ["git", "-C", target_dir, "fetch", "--all"],
+            base_cmd + ["fetch", "--all"],
             capture_output=True, text=True, timeout=30
         )
         if fetch_res.returncode != 0:
@@ -2334,12 +2340,12 @@ def run_git_force_update(repo_dir: Optional[str] = None) -> dict:
 
         # 2. git reset --hard origin/main (优先 origin/main，若无则尝试 origin/HEAD)
         reset_res = subprocess.run(
-            ["git", "-C", target_dir, "reset", "--hard", "origin/main"],
+            base_cmd + ["reset", "--hard", "origin/main"],
             capture_output=True, text=True, timeout=30
         )
         if reset_res.returncode != 0:
             reset_res = subprocess.run(
-                ["git", "-C", target_dir, "reset", "--hard", "origin/HEAD"],
+                base_cmd + ["reset", "--hard", "origin/HEAD"],
                 capture_output=True, text=True, timeout=30
             )
 
@@ -2354,7 +2360,7 @@ def run_git_force_update(repo_dir: Optional[str] = None) -> dict:
 
         # 3. 获取最新提交信息
         log_res = subprocess.run(
-            ["git", "-C", target_dir, "log", "-1", "--format=%h - %s (%ci)"],
+            base_cmd + ["log", "-1", "--format=%h - %s (%ci)"],
             capture_output=True, text=True, timeout=10
         )
         commit_info = log_res.stdout.strip() if log_res.returncode == 0 else "unknown"

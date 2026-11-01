@@ -628,13 +628,16 @@ class TestRemoteDeployEndpoints(unittest.TestCase):
 
         mock_subproc.side_effect = fake_run
 
-        res = run_git_force_update("/home/chuiyuanwo/ipselect")
+        # 1. 显式指定 use_sudo=True (模拟 Linux VPS 运行环境)
+        res = run_git_force_update("/home/chuiyuanwo/ipselect", use_sudo=True)
         self.assertTrue(res["ok"])
         self.assertEqual(res["repo_dir"], "/home/chuiyuanwo/ipselect")
         self.assertIn("d918950", res["commit"])
 
-        # 验证调用的 git 命令包含 -C /home/chuiyuanwo/ipselect
+        # 验证调用的 git 命令包含 sudo、safe.directory 与 -C /home/chuiyuanwo/ipselect
         calls = [c[0][0] for c in mock_subproc.call_args_list]
+        self.assertEqual(calls[0][:2], ["sudo", "git"])
+        self.assertIn("safe.directory=*", calls[0])
         self.assertTrue(any("fetch" in cmd and "--all" in cmd for cmd in calls))
         self.assertTrue(any("reset" in cmd and "--hard" in cmd for cmd in calls))
 

@@ -63,7 +63,7 @@ def main():
         print(f"⚠️ VPS 接口返回 HTTP {e.code}: {body}")
         if e.code == 404:
             print("💡 提示: VPS 当前运行的版本尚未加载该新接口，请先在 VPS 上手动执行一次拉取并重启:")
-            print("   cd /home/chuiyuanwo/ipselect && git fetch --all && git reset --hard origin/main && sudo systemctl restart aimili-picker")
+            print("   cd /home/chuiyuanwo/ipselect && sudo git fetch --all && sudo git reset --hard origin/main && sudo systemctl restart aimili-picker")
             return
     except Exception as e:
         print(f"⚠️ 无法直连 VPS 接口 ({e})，若服务刚重启属正常现象。")
