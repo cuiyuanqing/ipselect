@@ -2433,38 +2433,9 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             logs = ring_handler.get_logs()
             self._send_json_response(logs)
         elif url.path == "/api/debug":
-            debug_info = {}
-            if self.engine and self.engine.aimili:
-                aimili = self.engine.aimili
-                if not aimili.logged_in:
-                    aimili.login()
-                test_url = f"{aimili.base_url}/api/ui/nodes?country=JP&status=available&offset=0&limit=5"
-                try:
-                    req = urllib.request.Request(test_url, headers={"User-Agent": "AimiliPurePicker/1.0"})
-                    with aimili.opener.open(req, timeout=5) as resp:
-                        res = json.loads(resp.read().decode("utf-8"))
-                        nodes = res.get("nodes", [])
-                        debug_info["nodes_tested"] = []
-                        for n in nodes[:5]:
-                            ip = n.get("ip") or n.get("host")
-                            port = int(n.get("port") or n.get("remote_port") or 1194)
-                            proto = n.get("protocol") or "openvpn"
-                            # 1. 当前 probe_network_quality
-                            res_current = probe_network_quality(ip, port, proto)
-                            # 2. 修正后的 Linux ping: -c 2 -W 1 -w 2
-                            cmd = ["ping", "-c", "2", "-W", "1", "-w", "2", ip]
-                            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3.0)
-                            debug_info["nodes_tested"].append({
-                                "ip": ip,
-                                "port": port,
-                                "proto": proto,
-                                "res_current": res_current,
-                                "ping_out": p.stdout.strip()[:200],
-                                "ping_rc": p.returncode
-                            })
-                except Exception as e:
-                    debug_info["error"] = str(e)
-            self._send_json_response(debug_info)
+            import subprocess
+            p = subprocess.run(["ping", "-c", "2", "219.100.37.181"], capture_output=True, text=True)
+            self._send_json_response({"stdout": p.stdout, "stderr": p.stderr, "rc": p.returncode})
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
             res = run_git_force_update()
             self._send_json_response(res, status_code=200 if res.get("ok") else 500)
