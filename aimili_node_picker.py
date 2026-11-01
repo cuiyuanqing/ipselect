@@ -1032,6 +1032,44 @@ class AimiliClient:
         except Exception as e:
             logger.warning(f"⚠️ 同步底层 {self.auth_file} 异常: {e}")
 
+    def get_aimili_active_info(self) -> Dict[str, Any]:
+        """获取 Aimili 当前正在连接/生效的活动节点与隧道详细信息"""
+        st = self.get_ui_state()
+        if not st:
+            st = self.get_state()
+        if not st and os.path.isfile(self.auth_file):
+            try:
+                with open(self.auth_file, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+            except Exception:
+                st = {}
+
+        active_node = st.get("active_openvpn_node") or {}
+        active_id = st.get("active_openvpn_node_id") or ""
+        active_ip = active_node.get("ip") or st.get("proxy_ip") or ""
+        latency = st.get("active_node_latency") or (f"{st.get('proxy_latency_ms')} ms" if st.get("proxy_latency_ms") else "")
+        is_connected = bool(st.get("connection_status") == "connected" or st.get("active_tunnel_ok", False))
+        is_connecting = bool(st.get("is_connecting", False))
+
+        return {
+            "status": "connected" if is_connected else ("connecting" if is_connecting else "disconnected"),
+            "status_label": "已连接 (就绪)" if is_connected else ("正在连接..." if is_connecting else "未连接"),
+            "active_ip": active_ip,
+            "active_id": active_id,
+            "protocol": st.get("active_tunnel_protocol") or active_node.get("protocol") or "openvpn",
+            "port": active_node.get("remote_port") or "",
+            "latency": latency or "正常",
+            "country": active_node.get("country") or "日本",
+            "isp": active_node.get("owner") or "",
+            "tunnel_interface": st.get("active_tunnel_interface") or "",
+            "proxy_ip": st.get("proxy_ip") or "",
+            "proxy_port": int(st.get("proxy_port") or self.proxy_port or 8500),
+            "proxy_ok": bool(st.get("proxy_ok", is_connected)),
+            "routing_mode": st.get("routing_mode", "favorites"),
+            "message": st.get("last_check_message") or st.get("manual_switch_message") or ("运行正常" if is_connected else ""),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+
     def get_ui_state(self) -> Dict[str, Any]:
         """获取 Aimili Web UI 完整的系统偏好与路由状态字典"""
         if not self.logged_in and not self.login():
@@ -2706,6 +2744,43 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- 顶层 Aimili VPN 真实连接出口看板 -->
+  <div class="card" style="margin-bottom: 20px; border-left: 4px solid var(--accent); background: linear-gradient(180deg, rgba(30, 41, 59, 0.85) 0%, rgba(15, 23, 42, 0.95) 100%);">
+    <div class="card-title" style="justify-content: space-between; margin-bottom: 12px;">
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <span style="font-size: 18px;">📡</span>
+        <span style="font-weight: 700; font-size: 16px;">Aimili VPN 真实连接出口看板</span>
+        <span id="aimiliStatusBadge"><!-- __AIMILI_STATUS_BADGE__ --></span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <span id="aimiliLastUpdate" style="font-size: 11px; color: var(--text-muted);"><!-- __AIMILI_LAST_UPDATE__ --></span>
+        <button type="button" class="btn-sub" style="padding: 4px 10px; font-size: 12px; background: #1e293b; color: #38bdf8; border: 1px solid #38bdf8; border-radius: 6px; cursor: pointer;" onclick="fetchAimiliStatus()">🔄 刷新状态</button>
+      </div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px;">
+      <div style="background: rgba(15, 23, 42, 0.7); padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
+        <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">当前活动出口 IP (Egress IP)</div>
+        <div id="aimiliActiveIp" style="font-size: 20px; font-weight: 800; color: #38bdf8; font-family: monospace;"><!-- __AIMILI_ACTIVE_IP__ --></div>
+        <div id="aimiliActiveIsp" style="font-size: 11px; color: var(--text-muted); margin-top: 2px;"><!-- __AIMILI_ACTIVE_ISP__ --></div>
+      </div>
+      <div style="background: rgba(15, 23, 42, 0.7); padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
+        <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">物理隧道与节点 ID</div>
+        <div id="aimiliActiveId" style="font-size: 13px; font-weight: 600; color: #f8fafc; font-family: monospace; word-break: break-all;"><!-- __AIMILI_ACTIVE_ID__ --></div>
+        <div id="aimiliTunnelIface" style="font-size: 11px; color: #94a3b8; margin-top: 2px;"><!-- __AIMILI_TUNNEL_IFACE__ --></div>
+      </div>
+      <div style="background: rgba(15, 23, 42, 0.7); padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
+        <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">实测延迟 & 代理通道</div>
+        <div id="aimiliLatency" style="font-size: 16px; font-weight: 700; color: #34d399;"><!-- __AIMILI_LATENCY__ --></div>
+        <div id="aimiliProxyPort" style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">SOCKS5 127.0.0.1:8500</div>
+      </div>
+      <div style="background: rgba(15, 23, 42, 0.7); padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
+        <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">路由模式与健康讯息</div>
+        <div id="aimiliRoutingMode" style="font-size: 13px; font-weight: 600; color: #fde047;"><!-- __AIMILI_ROUTING_MODE__ --></div>
+        <div id="aimiliHealthMsg" style="font-size: 11px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title=""><!-- __AIMILI_HEALTH_MSG__ --></div>
+      </div>
+    </div>
+  </div>
+
   <div class="grid">
     <!-- 左侧控制面板 -->
     <div class="card">
@@ -2808,10 +2883,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <th>共享人数</th>
             <th>原生 IP</th>
             <th>实测延迟 (抖动)</th>
+            <th style="text-align: center;">操作</th>
           </tr>
         </thead>
         <tbody id="tblPickedNodes">
-          <tr><td colspan="11" style="text-align: center; color: var(--text-muted); padding: 30px;">点击左侧【开始筛选家宽节点】按钮启动全自动优选与收藏池自进化</td></tr>
+          <tr><td colspan="12" style="text-align: center; color: var(--text-muted); padding: 30px;">点击左侧【开始筛选家宽节点】按钮启动全自动优选与收藏池自进化</td></tr>
         </tbody>
       </table>
     </div>
@@ -2820,10 +2896,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <script>
   let isScanning = false;
+  let currentActiveIp = '';
 
   async function fetchStatus() {
     try {
-      const res = await fetch('./api/status');
+      const res = await fetch('/api/status');
       const data = await res.json();
       isScanning = data.running;
 
@@ -2831,24 +2908,78 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('btnStartScan').disabled = isScanning;
       document.getElementById('btnText').textContent = isScanning ? '优选中...' : '开始筛选家宽节点';
       document.getElementById('btnIcon').textContent = isScanning ? '⏳' : '🚀';
-      document.getElementById('progBar').style.width = isScanning ? '75%' : (data.last_result?.nodes ? '100%' : '0%');
+      const hasNodes = data.last_result && data.last_result.nodes && data.last_result.nodes.length > 0;
+      document.getElementById('progBar').style.width = isScanning ? '75%' : (hasNodes ? '100%' : '0%');
 
-      if (data.last_result && data.last_result.scan_time) {
+      if (data.aimili_active) {
+        renderAimiliActive(data.aimili_active);
+        currentActiveIp = data.aimili_active.active_ip || '';
+      }
+
+      if (data.last_result && data.last_result.nodes) {
         const r = data.last_result;
-        const activeIp = r.active_node_ip || (r.nodes && r.nodes[0] ? r.nodes[0].ip : '未切换');
+        const activeIp = currentActiveIp || r.active_node_ip || (r.nodes[0] ? r.nodes[0].ip : '未切换');
         document.getElementById('lblLastScanTime').textContent = 
-          `时间: ${r.scan_time} · 🔥 当前活动出口: ${activeIp} · 耗时 ${r.elapsed_seconds || 0}s · 门槛: ≥${r.min_speed_threshold_mbps || 0}Mbps · 传承保留: ${r.retained_count || 0} · 新选补位: ${r.newly_added_count || 0} · 淘汰清退: ${r.evicted_count || 0} · 收藏总计: ${r.picked_count || 0}`;
-        renderTable(r.nodes || []);
+          `时间: ${r.scan_time || ''} · 🔥 当前活动出口: ${activeIp} · 耗时 ${r.elapsed_seconds || 0}s · 门槛: ≥${r.min_speed_threshold_mbps || 0}Mbps · 传承保留: ${r.retained_count || 0} · 新选补位: ${r.newly_added_count || 0} · 淘汰清退: ${r.evicted_count || 0} · 收藏总计: ${r.picked_count || 0}`;
+        renderTable(r.nodes, activeIp);
       }
     } catch (e) {
       console.error(e);
     }
   }
 
-  async function fetchLogs() {
-    if (document.getElementById('chkPauseLog')?.checked) return;
+  async function fetchAimiliStatus() {
     try {
-      const res = await fetch('./api/logs');
+      const res = await fetch('/api/aimili_status');
+      const data = await res.json();
+      renderAimiliActive(data);
+      if (data.active_ip) {
+        currentActiveIp = data.active_ip;
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  function renderAimiliActive(info) {
+    if (!info) return;
+    const badge = document.getElementById('aimiliStatusBadge');
+    if (badge) {
+      if (info.status === 'connected') {
+        badge.style.background = 'rgba(16, 185, 129, 0.2)';
+        badge.style.color = '#34d399';
+        badge.style.borderColor = 'rgba(16, 185, 129, 0.4)';
+        badge.textContent = '🟢 ' + (info.status_label || '已连接');
+      } else if (info.status === 'connecting') {
+        badge.style.background = 'rgba(234, 179, 8, 0.2)';
+        badge.style.color = '#fde047';
+        badge.style.borderColor = 'rgba(234, 179, 8, 0.4)';
+        badge.textContent = '🟡 ' + (info.status_label || '正在连接...');
+      } else {
+        badge.style.background = 'rgba(239, 68, 68, 0.2)';
+        badge.style.color = '#f87171';
+        badge.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+        badge.textContent = '🔴 ' + (info.status_label || '未连接');
+      }
+    }
+    const setTxt = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+    setTxt('aimiliActiveIp', info.active_ip || '-');
+    setTxt('aimiliActiveIsp', (info.country || '日本') + ' · ' + (info.isp || '家庭宽带'));
+    setTxt('aimiliActiveId', info.active_id || '-');
+    setTxt('aimiliTunnelIface', '隧道接口: ' + (info.tunnel_interface || 'tun0'));
+    setTxt('aimiliLatency', info.latency || '就绪');
+    setTxt('aimiliRoutingMode', '模式: ' + (info.routing_mode || 'favorites'));
+    setTxt('aimiliHealthMsg', info.message || '运行正常');
+    const msgEl = document.getElementById('aimiliHealthMsg');
+    if (msgEl) msgEl.title = info.message || '';
+    setTxt('aimiliLastUpdate', '更新时间: ' + (info.updated_at || ''));
+  }
+
+  async function fetchLogs() {
+    const chk = document.getElementById('chkPauseLog');
+    if (chk && chk.checked) return;
+    try {
+      const res = await fetch('/api/logs');
       const logs = await res.json();
       const term = document.getElementById('termLogs');
       term.innerHTML = logs.map(l => `<div class="log-line">${escapeHtml(l)}</div>`).join('');
@@ -2856,27 +2987,57 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     } catch (e) {}
   }
 
-  function renderTable(nodes) {
+  function renderTable(nodes, activeIp) {
     const tbody = document.getElementById('tblPickedNodes');
+    if (!tbody) return;
     if (!nodes || nodes.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="11" style="text-align: center; color: var(--text-muted); padding: 30px;">未找到符合阈值的节点</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="12" style="text-align: center; color: var(--text-muted); padding: 30px;">未找到符合阈值的节点</td></tr>';
       return;
     }
-    tbody.innerHTML = nodes.map(n => `
-      <tr>
-        <td>${n.is_active ? '<span class="tag-active">🔥 当前出口</span> ' : ''}${n.is_inherited ? '<span class="tag-fav">⭐ 传承老兵</span>' : '<span class="tag-fresh">🌟 新选补位</span>'}</td>
-        <td style="font-weight: 600; font-family: monospace;">${n.ip}</td>
-        <td><span class="tag-speed">⚡ ${n.speed_mbps > 0 ? n.speed_mbps + ' Mbps' : '未测速'}</span></td>
-        <td><span class="tag-level">${escapeHtml(n.experience_level || 'Lv.1 新秀')} (${n.consecutive_passes || 1}轮)</span></td>
-        <td style="font-weight: 600; color: #38bdf8;">${n.reputation_score || 80.0}</td>
-        <td>${n.country} · ${escapeHtml(n.isp || '家庭宽带ISP')}</td>
-        <td><span class="tag-home">${escapeHtml(n.ip_type)}</span></td>
-        <td><span class="tag-pure">${n.risk_score}% (${n.risk_label || '极度纯净'})</span></td>
-        <td>${escapeHtml(n.shared_users || '未知')}</td>
-        <td>${n.is_native ? '✅ 原生' : '广播'}</td>
-        <td>${n.latency_ms} ms ${n.jitter_ms ? `(±${n.jitter_ms}ms)` : ''}</td>
-      </tr>
-    `).join('');
+    tbody.innerHTML = nodes.map(n => {
+      const isCurActive = (n.ip === activeIp) || n.is_active;
+      const actBtn = isCurActive
+        ? '<span class="tag-active" style="padding: 4px 10px; font-size: 12px;">🟢 当前连接中</span>'
+        : `<button type="button" class="btn-sub" style="padding: 4px 10px; font-size: 12px; background: #2563eb; color: #ffffff; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;" onclick="switchAimiliNode('${escapeHtml(n.ip)}', '${escapeHtml(n.id)}')">🚀 设为出口</button>`;
+
+      return `
+        <tr>
+          <td>${isCurActive ? '<span class="tag-active">🔥 当前出口</span> ' : ''}${n.is_inherited ? '<span class="tag-fav">⭐ 传承老兵</span>' : '<span class="tag-fresh">🌟 新选补位</span>'}</td>
+          <td style="font-weight: 600; font-family: monospace;">${escapeHtml(n.ip)}</td>
+          <td><span class="tag-speed">⚡ ${n.speed_mbps > 0 ? n.speed_mbps + ' Mbps' : '未测速'}</span></td>
+          <td><span class="tag-level">${escapeHtml(n.experience_level || 'Lv.1 新秀')} (${n.consecutive_passes || 1}轮)</span></td>
+          <td style="font-weight: 600; color: #38bdf8;">${n.reputation_score || 80.0}</td>
+          <td>${escapeHtml(n.country)} · ${escapeHtml(n.isp || '家庭宽带ISP')}</td>
+          <td><span class="tag-home">${escapeHtml(n.ip_type)}</span></td>
+          <td><span class="tag-pure">${n.risk_score}% (${escapeHtml(n.risk_label || '极度纯净')})</span></td>
+          <td>${escapeHtml(n.shared_users || '未知')}</td>
+          <td>${n.is_native ? '✅ 原生' : '广播'}</td>
+          <td>${n.latency_ms} ms ${n.jitter_ms ? `(±${n.jitter_ms}ms)` : ''}</td>
+          <td style="text-align: center;">${actBtn}</td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  async function switchAimiliNode(ip, id) {
+    if (!confirm('确定要将 Aimili VPN 活动出口即时切换为 ' + ip + ' 吗？')) return;
+    try {
+      const res = await fetch('/api/switch_node', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip, id })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        alert('✅ ' + data.message);
+        fetchAimiliStatus();
+        fetchStatus();
+      } else {
+        alert('❌ 切换失败: ' + (data.message || JSON.stringify(data)));
+      }
+    } catch (e) {
+      alert('请求异常: ' + e);
+    }
   }
 
   async function triggerScan() {
@@ -2888,7 +3049,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     const inheritExisting = document.getElementById('chkInherit').checked;
 
     try {
-      await fetch('./api/scan', {
+      await fetch('/api/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2951,11 +3112,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
 
   function escapeHtml(str) {
-    return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(str == null ? '' : str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
   setInterval(fetchStatus, 2000);
   setInterval(fetchLogs, 1500);
+  setInterval(fetchAimiliStatus, 3000);
+  fetchAimiliStatus();
   fetchStatus();
   fetchLogs();
 </script>
@@ -3072,6 +3235,94 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
 
     engine: Optional[PickerEngine] = None
 
+    def render_html_page(self) -> str:
+        """渲染带初始服务器端数据的 HTML 页面，杜绝前端 JS 报错或白屏导致的空白列表"""
+        html = HTML_TEMPLATE
+        if not self.engine:
+            return html
+
+        nodes = self.engine.last_result.get("nodes", [])
+        active_ip = self.engine.last_result.get("active_node_ip", "")
+
+        # 尝试获取 Aimili 真实状态
+        aimili_info = {}
+        if self.engine.aimili:
+            try:
+                aimili_info = self.engine.aimili.get_aimili_active_info()
+                if aimili_info.get("active_ip"):
+                    active_ip = aimili_info.get("active_ip")
+            except Exception:
+                pass
+
+        def _esc(val):
+            return (str(val or "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        if nodes:
+            rows = []
+            for n in nodes:
+                is_active = (n.get("ip") == active_ip) or n.get("is_active", False)
+                active_tag = '<span class="tag-active">🔥 当前出口</span> ' if is_active else ''
+                origin_tag = '<span class="tag-fav">⭐ 传承老兵</span>' if n.get("is_inherited") else '<span class="tag-fresh">🌟 新选补位</span>'
+                speed_str = f"⚡ {n.get('speed_mbps')} Mbps" if n.get('speed_mbps', 0) > 0 else '未测速'
+                level_str = _esc(n.get("experience_level") or "Lv.1 新秀")
+                passes_str = f"({n.get('consecutive_passes', 1)}轮)"
+                rep_str = str(n.get("reputation_score", 80.0))
+                geo_str = f"{_esc(n.get('country', 'JP'))} · {_esc(n.get('isp') or '家庭宽带ISP')}"
+                home_str = _esc(n.get("ip_type") or "家庭宽带")
+                pure_str = f"{n.get('risk_score', 0)}% ({_esc(n.get('risk_label') or '极度纯净')})"
+                shared_str = _esc(n.get("shared_users") or "未知")
+                native_str = "✅ 原生" if n.get("is_native") else "广播"
+                rtt_str = f"{n.get('latency_ms', 0)} ms"
+                if n.get("jitter_ms"):
+                    rtt_str += f" (±{n.get('jitter_ms')}ms)"
+
+                if is_active:
+                    action_html = '<span class="tag-active" style="padding: 4px 10px; font-size: 12px;">🟢 当前连接中</span>'
+                else:
+                    node_ip = _esc(n.get('ip') or '')
+                    node_id = _esc(n.get('id') or '')
+                    action_html = f'<button type="button" class="btn-sub" style="padding: 4px 10px; font-size: 12px; background: #2563eb; color: #ffffff; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;" onclick="switchAimiliNode(\x27{node_ip}\x27, \x27{node_id}\x27)">🚀 设为出口</button>'
+
+                rows.append(f'''
+                <tr>
+                  <td>{active_tag}{origin_tag}</td>
+                  <td style="font-weight: 600; font-family: monospace;">{_esc(n.get('ip'))}</td>
+                  <td><span class="tag-speed">{speed_str}</span></td>
+                  <td><span class="tag-level">{level_str} {passes_str}</span></td>
+                  <td style="font-weight: 600; color: #38bdf8;">{rep_str}</td>
+                  <td>{geo_str}</td>
+                  <td><span class="tag-home">{home_str}</span></td>
+                  <td><span class="tag-pure">{pure_str}</span></td>
+                  <td>{shared_str}</td>
+                  <td>{native_str}</td>
+                  <td>{rtt_str}</td>
+                  <td style="text-align: center;">{action_html}</td>
+                </tr>
+                ''')
+            rendered_tbody = "\n".join(rows)
+            placeholder_tbody = '<tr><td colspan="12" style="text-align: center; color: var(--text-muted); padding: 30px;">点击左侧【开始筛选家宽节点】按钮启动全自动优选与收藏池自进化</td></tr>'
+            if placeholder_tbody in html:
+                html = html.replace(placeholder_tbody, rendered_tbody)
+
+            scan_info_str = f"时间: {self.engine.last_result.get('scan_time', '')} · 🔥 当前活动出口: {active_ip} · 耗时 {self.engine.last_result.get('elapsed_seconds', 0)}s · 门槛: ≥{self.engine.last_result.get('min_speed_threshold_mbps', 0)}Mbps · 传承保留: {self.engine.last_result.get('retained_count', 0)} · 新选补位: {self.engine.last_result.get('newly_added_count', 0)} · 淘汰清退: {self.engine.last_result.get('evicted_count', 0)} · 收藏总计: {self.engine.last_result.get('picked_count', len(nodes))}"
+            html = html.replace('暂无扫描记录', scan_info_str)
+
+        # 替换 Aimili 真实活动连接看板占位
+        if aimili_info:
+            status_cls = "badge"
+            badge_html = f'<span class="{status_cls}" style="background: rgba(16, 185, 129, 0.2); color: #34d399; border-color: rgba(16, 185, 129, 0.4);">🟢 {aimili_info.get("status_label", "已连接")}</span>'
+            html = html.replace('<!-- __AIMILI_STATUS_BADGE__ -->', badge_html)
+            html = html.replace('<!-- __AIMILI_ACTIVE_IP__ -->', aimili_info.get("active_ip") or "-")
+            html = html.replace('<!-- __AIMILI_ACTIVE_ISP__ -->', f"{aimili_info.get('country', '')} · {aimili_info.get('isp', '')}")
+            html = html.replace('<!-- __AIMILI_ACTIVE_ID__ -->', aimili_info.get("active_id") or "-")
+            html = html.replace('<!-- __AIMILI_TUNNEL_IFACE__ -->', f"隧道接口: {aimili_info.get('tunnel_interface') or 'tun0'}")
+            html = html.replace('<!-- __AIMILI_LATENCY__ -->', aimili_info.get("latency") or "正常")
+            html = html.replace('<!-- __AIMILI_ROUTING_MODE__ -->', f"模式: {aimili_info.get('routing_mode', 'favorites')}")
+            html = html.replace('<!-- __AIMILI_HEALTH_MSG__ -->', aimili_info.get("message") or "运行正常")
+            html = html.replace('<!-- __AIMILI_LAST_UPDATE__ -->', f"更新时间: {aimili_info.get('updated_at', '')}")
+
+        return html
+
     def log_message(self, format, *args):
         pass
 
@@ -3084,15 +3335,21 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         if url.path == "/" or url.path == "/index.html":
+            html_content = self.render_html_page()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+            self.wfile.write(html_content.encode("utf-8"))
+        elif url.path in ("/api/aimili_status", "/api/aimili/status"):
+            info = self.engine.aimili.get_aimili_active_info() if (self.engine and self.engine.aimili) else {}
+            self._send_json_response(info)
         elif url.path == "/api/status":
+            aimili_info = self.engine.aimili.get_aimili_active_info() if (self.engine and self.engine.aimili) else {}
             status_data = {
                 "running": self.engine.is_running if self.engine else False,
                 "current_step": self.engine.current_step if self.engine else "未就绪",
-                "last_result": self.engine.last_result if self.engine else {}
+                "last_result": self.engine.last_result if self.engine else {},
+                "aimili_active": aimili_info
             }
             self._send_json_response(status_data)
         elif url.path == "/api/logs":
@@ -3280,6 +3537,64 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 resp = {"ok": False, "message": "任务正在执行中，请勿重复触发"}
 
             self._send_json_response(resp)
+        elif url.path in ("/api/switch_node", "/api/aimili/switch_node"):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+            params = json.loads(body) if body else {}
+            target_ip = params.get("ip")
+            target_id = params.get("id")
+
+            if not target_ip:
+                self._send_json_response({"ok": False, "message": "缺少目标 IP 参数"}, status_code=400)
+                return
+            if not self.engine or not self.engine.aimili:
+                self._send_json_response({"ok": False, "message": "优选引擎或 Aimili 客户端未就绪"}, status_code=500)
+                return
+
+            matched_node = None
+            for n in self.engine.last_result.get("nodes", []):
+                if n.get("ip") == target_ip:
+                    matched_node = n
+                    break
+
+            if matched_node:
+                node_obj = CandidateNode(
+                    id=matched_node.get("id") or target_id or f"{target_ip}_1194_udp",
+                    ip=target_ip,
+                    port=int(matched_node.get("port") or 1194),
+                    country=matched_node.get("country") or "JP",
+                    protocol=matched_node.get("protocol") or "openvpn",
+                    latency_ms=int(matched_node.get("latency_ms") or 0),
+                    speed_mbps=float(matched_node.get("speed_mbps") or 0.0),
+                    transport="udp" if "_udp" in str(matched_node.get("id", "")) else "tcp",
+                    exact_node_id=matched_node.get("id")
+                )
+            else:
+                node_obj = CandidateNode(
+                    id=target_id or f"{target_ip}_1194_udp",
+                    ip=target_ip,
+                    port=1194,
+                    country="JP",
+                    protocol="openvpn",
+                    latency_ms=0,
+                    speed_mbps=0.0,
+                    transport="udp" if target_id and "_udp" in target_id else "tcp",
+                    exact_node_id=target_id
+                )
+
+            switched = self.engine.aimili.set_active_node(node_obj, timeout=25)
+            if switched:
+                self.engine.last_result["active_node_ip"] = target_ip
+                for n in self.engine.last_result.get("nodes", []):
+                    n["is_active"] = (n.get("ip") == target_ip)
+                try:
+                    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                        json.dump(self.engine.last_result, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    logger.warning(f"更新历史活动出口异常: {e}")
+                self._send_json_response({"ok": True, "message": f"成功将 Aimili 活动出口切换为 {target_ip}！", "active_ip": target_ip})
+            else:
+                self._send_json_response({"ok": False, "message": f"切换活动出口指令下发失败或节点握手超时，Aimili 正在恢复中，请稍后刷新查看"}, status_code=500)
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
             res = run_git_force_update()
             self._send_json_response(res, status_code=200 if res.get("ok") else 500)

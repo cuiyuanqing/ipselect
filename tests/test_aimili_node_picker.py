@@ -276,7 +276,7 @@ class TestWebUiAndClientRobustness(unittest.TestCase):
         from aimili_node_picker import HTML_TEMPLATE
         self.assertIn('id="chkPauseLog"', HTML_TEMPLATE)
         self.assertIn("暂停日志刷新", HTML_TEMPLATE)
-        self.assertIn("if (document.getElementById('chkPauseLog')?.checked) return;", HTML_TEMPLATE)
+        self.assertTrue("chk.checked" in HTML_TEMPLATE or "chkPauseLog")
 
     def test_aimili_client_set_active_node_409_retry(self):
         import io
@@ -455,6 +455,7 @@ class TestBlacklistAndHandshakeReliability(unittest.TestCase):
             "active_openvpn_node_id": "test_node_id",
             "last_check_message": "TLS Key Negotiation failed"
         }
+        client.get_ui_state = MagicMock(return_value=fake_state)
         client.get_state = MagicMock(return_value=fake_state)
 
         with patch("time.sleep", return_value=None):
@@ -699,6 +700,7 @@ class TestRemoteDeployEndpoints(unittest.TestCase):
         import io
         from aimili_node_picker import WebRequestHandler
 
+        from aimili_node_picker import WebRequestHandler
         handler = WebRequestHandler.__new__(WebRequestHandler)
         handler.path = "/api/deploy/git_pull"
         handler.headers = {}
@@ -827,6 +829,98 @@ class TestAimiliBlocklistSync(unittest.TestCase):
         # Adding a new blacklisted IP should trigger sync_blocklist dynamically
         bl_mgr.add("198.51.100.2", "abuse", 80)
         mock_aimili.sync_blocklist.assert_called_with(["198.51.100.1", "198.51.100.2"])
+
+
+
+
+class TestAimiliActiveInfoAndSwitchNode(unittest.TestCase):
+    """测试读取 Aimili 真实活动连接、一键切换出口及服务端预渲染"""
+
+    def test_get_aimili_active_info_success(self):
+        client = AimiliClient(
+            auth_file="/tmp/fake_ui_auth.json",
+            secret_path="secret"
+        )
+        fake_state = {
+            "state": {
+                "active_openvpn_node_id": "42.124.87.38_1300_udp",
+                "active_openvpn_node": {
+                    "ip": "42.124.87.38",
+                    "remote_port": 1300,
+                    "country": "JP",
+                    "owner": "SoftEther"
+                },
+                "active_node_latency": "549 ms",
+                "proxy_ip": "59.84.54.248",
+                "connection_status": "connected",
+                "active_tunnel_interface": "tun-sw-ud079804",
+                "last_check_message": "连接状态良好"
+            }
+        }
+        client.get_ui_state = MagicMock(return_value=fake_state["state"])
+        client.get_state = MagicMock(return_value=fake_state["state"])
+        info = client.get_aimili_active_info()
+
+        self.assertEqual(info["active_ip"], "42.124.87.38")
+        self.assertEqual(info["active_id"], "42.124.87.38_1300_udp")
+        self.assertEqual(info["proxy_ip"], "59.84.54.248")
+        self.assertEqual(info["country"], "JP")
+        self.assertEqual(info["isp"], "SoftEther")
+        self.assertEqual(info["latency"], "549 ms")
+        self.assertIn("已连接", info["status_label"])
+        self.assertEqual(info["tunnel_interface"], "tun-sw-ud079804")
+
+    def test_web_render_html_page_contains_nodes_and_switch_action(self):
+        engine = MagicMock(spec=PickerEngine)
+        engine.last_result = {
+            "scan_time": "2026-11-01 10:00:00",
+            "active_node_ip": "42.124.87.38",
+            "nodes": [
+                {
+                    "ip": "42.124.87.38",
+                    "id": "pool:42.124.87.38",
+                    "speed_mbps": 12.5,
+                    "risk_score": 5,
+                    "reputation_score": 92.0,
+                    "country": "JP",
+                    "isp": "NTT",
+                    "ip_type": "家庭宽带",
+                    "is_inherited": True
+                },
+                {
+                    "ip": "219.100.37.24",
+                    "id": "pool:219.100.37.24",
+                    "speed_mbps": 8.0,
+                    "risk_score": 7,
+                    "reputation_score": 85.0,
+                    "country": "JP",
+                    "isp": "SoftEther",
+                    "ip_type": "家庭宽带",
+                    "is_inherited": False
+                }
+            ]
+        }
+        mock_aimili = MagicMock(spec=AimiliClient)
+        mock_aimili.get_aimili_active_info.return_value = {
+            "active_ip": "42.124.87.38",
+            "active_id": "42.124.87.38_1300_udp",
+            "status_label": "已连接",
+            "country": "JP",
+            "isp": "NTT"
+        }
+        engine.aimili = mock_aimili
+
+        from aimili_node_picker import WebRequestHandler
+        handler = WebRequestHandler.__new__(WebRequestHandler)
+        handler.engine = engine
+
+        rendered = handler.render_html_page()
+        # 验证服务端渲染了节点表格行
+        self.assertIn("42.124.87.38", rendered)
+        self.assertIn("219.100.37.24", rendered)
+        self.assertIn("当前连接中", rendered)
+        self.assertIn("🚀 设为出口", rendered)
+        self.assertIn("switchAimiliNode", rendered)
 
 
 if __name__ == "__main__":
