@@ -47,7 +47,7 @@ def monitor():
             if not running and last_log_count > 5:
                 print("\n================== SCAN COMPLETE ==================")
                 last_result = status.get("last_result", {})
-                picked = last_result.get("picked_nodes", [])
+                picked = last_result.get("nodes", []) or last_result.get("picked_nodes", [])
                 print(f"Total picked nodes: {len(picked)}")
                 for idx, n in enumerate(picked, 1):
                     print(f"[{idx}] IP: {n.get('ip')} | Speed: {n.get('speed_mbps')} Mbps | Risk: {n.get('risk_score')}% ({n.get('risk_label')}) | Latency: {n.get('latency_ms')} ms (±{n.get('jitter_ms')}ms) | Type: {n.get('ip_type')}")
