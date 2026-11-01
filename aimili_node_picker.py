@@ -2445,10 +2445,25 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     with aimili.opener.open(req, timeout=8) as resp:
                         res = json.loads(resp.read().decode("utf-8"))
                         nodes = res.get("nodes", [])
+                        jp_nodes = [
+                            n for n in nodes
+                            if n.get("country") in ("日本", "JP", "Japan")
+                            or str(n.get("country_short", "")).upper() == "JP"
+                            or "jp" in str(n.get("host_name", "")).lower()
+                            or "japan" in str(n.get("location", "")).lower()
+                        ]
                         debug_info["total_nodes_in_db"] = len(nodes)
-                        if nodes:
-                            debug_info["sample_node_keys"] = list(nodes[0].keys())
-                            debug_info["sample_node_0"] = nodes[0]
+                        debug_info["jp_nodes_in_db"] = len(jp_nodes)
+                        if jp_nodes:
+                            debug_info["sample_jp_node"] = {
+                                "id": jp_nodes[0].get("id"),
+                                "ip": jp_nodes[0].get("ip"),
+                                "port": jp_nodes[0].get("port") or jp_nodes[0].get("remote_port"),
+                                "proto": jp_nodes[0].get("proto") or jp_nodes[0].get("protocol"),
+                                "country": jp_nodes[0].get("country"),
+                                "speed": jp_nodes[0].get("speed"),
+                                "pool_endpoint_id": jp_nodes[0].get("pool_endpoint_id")
+                            }
                         if jp_nodes:
                             debug_info["sample_jp_node"] = jp_nodes[0]
                             debug_info["sample_jp_nodes_first_5"] = [
