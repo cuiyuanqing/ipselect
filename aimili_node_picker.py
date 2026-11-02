@@ -3217,14 +3217,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
 
   async function triggerDeployPull() {
-    if (!confirm('确定要从 Git 远端强制覆盖拉取最新代码吗？\n(目标: /home/chuiyuanwo/ipselect)')) return;
+    if (!confirm('确定要从 Git 远端强制覆盖拉取最新代码吗？\\n(目标: /home/chuiyuanwo/ipselect)')) return;
     try {
       const res = await fetch('/api/git_pull', { method: 'POST' });
       const data = await res.json();
       if (data.ok) {
-        alert('✅ Git 强制覆盖成功:\n' + (data.commit || data.message));
+        alert('✅ Git 强制覆盖成功:\\n' + (data.commit || data.message));
       } else {
-        alert('❌ Git 覆盖失败:\n' + (data.error || JSON.stringify(data)));
+        alert('❌ Git 覆盖失败:\\n' + (data.error || JSON.stringify(data)));
       }
     } catch (e) {
       alert('请求异常: ' + e);
@@ -3232,7 +3232,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
 
   async function triggerDeployRestart() {
-    if (!confirm('确定要重启 VPS 上的 aimili-picker 服务吗？\n(命令: sudo systemctl restart aimili-picker)')) return;
+    if (!confirm('确定要重启 VPS 上的 aimili-picker 服务吗？\\n(命令: sudo systemctl restart aimili-picker)')) return;
     try {
       const res = await fetch('/api/restart', { method: 'POST' });
       const data = await res.json();
@@ -3249,7 +3249,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const res = await fetch('/api/sync_and_restart', { method: 'POST' });
       const data = await res.json();
       if (data.ok) {
-        alert('🚀 ' + data.message + '\n页面将在 3 秒后自动刷新...');
+        alert('🚀 ' + data.message + '\\n页面将在 3 秒后自动刷新...');
         setTimeout(() => location.reload(), 3000);
       } else {
         alert('❌ 部署失败: ' + (data.message || JSON.stringify(data)));
@@ -3258,6 +3258,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       alert('请求异常: ' + e);
     }
   }
+
+  window.triggerDeployPull = triggerDeployPull;
+  window.triggerDeployRestart = triggerDeployRestart;
+  window.triggerDeploySyncAndRestart = triggerDeploySyncAndRestart;
+  window.switchAimiliNode = switchAimiliNode;
+  window.triggerScan = triggerScan;
+  window.fetchAimiliStatus = fetchAimiliStatus;
 
   function escapeHtml(str) {
     return String(str == null ? '' : str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

@@ -696,6 +696,32 @@ class TestRemoteDeployEndpoints(unittest.TestCase):
         self.assertIn("triggerDeployRestart()", HTML_TEMPLATE)
         self.assertIn("triggerDeploySyncAndRestart()", HTML_TEMPLATE)
 
+    def test_web_ui_javascript_syntax_valid(self):
+        import re, shutil, subprocess, tempfile
+        from aimili_node_picker import HTML_TEMPLATE
+
+        # 验证前端 script 块语法合规，绝无单引号/双引号字符串未转义换行导致的 SyntaxError
+        m = re.search(r"<script>(.*?)</script>", HTML_TEMPLATE, re.DOTALL)
+        self.assertIsNotNone(m, "HTML_TEMPLATE 中必须包含 <script> 标签")
+        script_code = m.group(1)
+
+        # 验证关键部署方法已挂载至 window 全局命名空间
+        self.assertIn("window.triggerDeployPull = triggerDeployPull", script_code)
+        self.assertIn("window.triggerDeployRestart = triggerDeployRestart", script_code)
+        self.assertIn("window.triggerDeploySyncAndRestart = triggerDeploySyncAndRestart", script_code)
+
+        # 若本地安装有 Node.js，执行原生语法验证
+        if shutil.which("node"):
+            with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=False) as tf:
+                tf.write(script_code)
+                tf_path = tf.name
+            try:
+                proc = subprocess.run(["node", "--check", tf_path], capture_output=True, text=True)
+                self.assertEqual(proc.returncode, 0, f"前端 JS 语法检查失败: {proc.stderr}")
+            finally:
+                if os.path.exists(tf_path):
+                    os.remove(tf_path)
+
 
     @patch("aimili_node_picker.run_git_force_update", return_value={"ok": True, "commit": "abc1234"})
     @patch("aimili_node_picker.schedule_service_restart")
