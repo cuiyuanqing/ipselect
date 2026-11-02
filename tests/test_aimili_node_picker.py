@@ -1171,8 +1171,8 @@ class TestAimiliEgressLockAndFallback(unittest.TestCase):
         self.engine.probe_speed_func = lambda **kwargs: 10.0
 
         def fake_set_active(node, **kwargs):
-            lock = kwargs.get("lock", True)
-            if lock and node.ip == "1.1.1.1":
+            timeout = kwargs.get("timeout", 35)
+            if timeout == 18 and node.ip == "1.1.1.1":
                 return False
             return True
         self.mock_aimili.set_active_node.side_effect = fake_set_active

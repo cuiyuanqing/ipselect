@@ -461,6 +461,16 @@ class AimiliClient:
                         self.logged_in = True
                         self._working_base_url = url.replace("/api/login", "")
                         logger.info(f"✅ 成功登录 AimiliVPN 本地管理服务 (已锁定基础路径: {self._working_base_url})")
+                        try:
+                            auth_file = self.auth_file or "/opt/aimilivpn/vpngate_data/ui_auth.json"
+                            if os.path.isfile(auth_file):
+                                with open(auth_file, "r", encoding="utf-8") as f:
+                                    ad = json.load(f)
+                                if ad.get("routing_mode") == "fixed_ip" or ad.get("fixed_node_id"):
+                                    logger.info("🔄 检测到残留单一固定节点锁定，正在自动恢复为收藏池自动轮换模式 (favorites)...")
+                                    self.unlock_fixed_node()
+                        except Exception:
+                            pass
                         return True
                     else:
                         logger.error(f"❌ 登录 AimiliVPN 失败 (账号或密码错误): {res_data.get('error', '未知错误')}")
@@ -879,8 +889,8 @@ class AimiliClient:
             time.sleep(1.0)
         return False
 
-    def set_active_node(self, node: CandidateNode, timeout: int = 35, max_retries: int = 3, lock: bool = True) -> bool:
-        """调用 Aimili 将指定优选节点切换为当前活动出口节点，带 409 互斥锁感知、就绪验证与自动出口锁定"""
+    def set_active_node(self, node: CandidateNode, timeout: int = 35, max_retries: int = 3, lock: bool = False) -> bool:
+        """调用 Aimili 将指定优选节点切换为当前活动出口节点，带 409 互斥锁感知、就绪验证（默认保持收藏池自动轮换模式）"""
         if not self.logged_in and not self.login():
             return False
 
@@ -2875,16 +2885,16 @@ class PickerEngine:
                 except Exception as e:
                     logger.warning(f"⚠️ 优选落盘同步 Aimili 屏蔽列表异常: {e}")
 
-            # 5. 阶段四：自动切换并锁定 Aimili 活动出口（前序顺延降级保障）
+            # 5. 阶段四：自动将 Aimili 当前出口设为优选第 1 名（前序顺延降级保障，保持纯净收藏库自动轮换）
             active_node_ip = ""
             if picked_nodes:
-                self.current_step = "正在验证并锁定 Aimili 活动出口..."
+                self.current_step = "正在验证 Aimili 活动出口 (保持收藏池自动轮换)..."
                 for rank_idx, cand in enumerate(picked_nodes[:5]):
-                    logger.info(f"🎯 尝试将优选第 {rank_idx+1} 名黄金节点设为活动出口并锁定: {cand.ip} (延迟: {cand.latency_ms}ms, 速率: {cand.speed_mbps}Mbps)")
-                    switched = self.aimili.set_active_node(cand, timeout=18, lock=True)
+                    logger.info(f"🎯 尝试将优选第 {rank_idx+1} 名黄金节点设为 Aimili 当前初始出口 (收藏池自动轮换): {cand.ip} (延迟: {cand.latency_ms}ms, 速率: {cand.speed_mbps}Mbps)")
+                    switched = self.aimili.set_active_node(cand, timeout=18, lock=False)
                     if switched:
                         active_node_ip = cand.ip
-                        logger.info(f"✨ [出口接管成功] Aimili 活动出口已成功锁定至第 {rank_idx+1} 名节点: {cand.ip}！")
+                        logger.info(f"✨ [出口切换成功] Aimili 活动出口已切换至第 {rank_idx+1} 名节点: {cand.ip} (保持收藏池自动轮换模式)！")
                         break
                     else:
                         logger.warning(f"⚠️ 第 {rank_idx+1} 名节点 {cand.ip} 握手未就绪，自动顺延尝试下一候选...")
@@ -2893,6 +2903,12 @@ class PickerEngine:
                     aimili_cur = self.aimili.get_aimili_active_info()
                     active_node_ip = aimili_cur.get("active_ip") or ""
                     logger.warning(f"⚠️ 优选前列节点均未就绪，Aimili 保持当前实际出口: {active_node_ip or '未连接'}")
+
+                # 确保解除任何遗留的 fixed_node_id 锁，保证 Aimili 在优质收藏池内自主轮换容灾
+                try:
+                    self.aimili.unlock_fixed_node()
+                except Exception as e:
+                    logger.warning(f"⚠️ 维持收藏池轮换模式设置异常: {e}")
 
             final_favs = self.aimili.get_current_favorites()
             logger.info(
@@ -2990,9 +3006,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
       min-height: 100vh;
-      padding: 24px;
+      padding: 16px 24px;
     }
-    .container { max-width: 1200px; margin: 0 auto; }
+    .container { max-width: 98%; width: 98%; margin: 0 auto; }
     .header {
       display: flex;
       justify-content: space-between;
@@ -3084,8 +3100,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
     .log-line { word-break: break-all; white-space: pre-wrap; margin-bottom: 2px; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
-    th { padding: 12px 14px; background: rgba(15, 23, 42, 0.8); color: var(--text-muted); font-weight: 600; border-bottom: 1px solid var(--border); }
-    td { padding: 12px 14px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
+    th { padding: 12px 14px; background: rgba(15, 23, 42, 0.8); color: var(--text-muted); font-weight: 600; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    td { padding: 12px 14px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); white-space: nowrap; }
     tr:hover td { background: rgba(255, 255, 255, 0.02); }
     .tag-pure { background: rgba(16, 185, 129, 0.2); color: #34d399; padding: 2px 8px; border-radius: 9999px; font-weight: 600; font-size: 11px; }
     .tag-active { background: rgba(239, 68, 68, 0.2); color: #f87171; padding: 2px 8px; border-radius: 9999px; font-weight: 600; font-size: 11px; border: 1px solid rgba(239, 68, 68, 0.4); }
@@ -3139,10 +3155,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
       <div style="background: rgba(15, 23, 42, 0.7); padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
         <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px; display: flex; justify-content: space-between; align-items: center;">
-          <span>调度模式与出口锁定</span>
+          <span>Aimili 调度与容灾模式</span>
           <div style="display: flex; gap: 4px;">
-            <button type="button" onclick="toggleEgressLock(true)" style="padding: 2px 7px; font-size: 11px; background: #0284c7; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600;" title="锁定当前出口为固定节点 (fixed_ip)，禁止内部轮换漂移">🔒 锁定</button>
-            <button type="button" onclick="toggleEgressLock(false)" style="padding: 2px 7px; font-size: 11px; background: #475569; color: white; border: none; border-radius: 4px; cursor: pointer;" title="恢复仅用收藏自动轮换">🔓 解锁</button>
+            <button type="button" onclick="toggleEgressLock(false)" style="padding: 2px 7px; font-size: 11px; background: #059669; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600;" title="确保处于纯净收藏池自动轮换模式">🔄 收藏池轮换</button>
+            <button type="button" onclick="toggleEgressLock(true)" style="padding: 2px 7px; font-size: 11px; background: #475569; color: white; border: none; border-radius: 4px; cursor: pointer;" title="临时锁定当前单节点">🔒 单点锁定</button>
           </div>
         </div>
         <div id="aimiliRoutingMode" style="font-size: 13px; font-weight: 600; color: #fde047;"><!-- __AIMILI_ROUTING_MODE__ --></div>
@@ -3391,7 +3407,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
 
   async function switchAimiliNode(ip, id, btnEl) {
-    if (!confirm('确定要将 Aimili VPN 活动出口即时切换并锁定为 ' + ip + ' 吗？')) return;
+    if (!confirm('确定要将 Aimili VPN 活动出口即时切换为 ' + ip + ' 吗？（Aimili 保持纯净收藏池自动轮换模式）')) return;
     let oldText = '';
     if (btnEl) {
       oldText = btnEl.innerHTML;
@@ -3423,7 +3439,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
 
   async function toggleEgressLock(lock) {
-    const actionName = lock ? '锁定当前出口' : '解锁漫游';
+    const actionName = lock ? '临时锁定当前单节点' : '恢复收藏池自动轮换';
     if (!confirm(`确定要${actionName}吗？`)) return;
     try {
       const res = await fetch(lock ? '/api/aimili/lock_node' : '/api/aimili/unlock_node', {
@@ -3996,8 +4012,12 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     exact_node_id=target_id
                 )
 
-            switched = self.engine.aimili.set_active_node(node_obj, timeout=25, lock=True)
+            switched = self.engine.aimili.set_active_node(node_obj, timeout=25, lock=False)
             if switched:
+                try:
+                    self.engine.aimili.unlock_fixed_node()
+                except Exception:
+                    pass
                 self.engine.last_result["active_node_ip"] = target_ip
                 for n in self.engine.last_result.get("nodes", []):
                     n["is_active"] = (n.get("ip") == target_ip)
@@ -4006,10 +4026,10 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                         json.dump(self.engine.last_result, f, ensure_ascii=False, indent=2)
                 except Exception as e:
                     logger.warning(f"更新历史活动出口异常: {e}")
-                logger.info(f"✅ 已成功将 Aimili 活动出口切换并锁定至 {target_ip}")
+                logger.info(f"✅ 已成功将 Aimili 活动出口切换至 {target_ip} (保持纯净收藏池自动轮换)")
                 self._send_json_response({
                     "ok": True,
-                    "message": f"成功建立 OpenVPN 隧道并已将 Aimili 出口绝对锁定为: {target_ip}！",
+                    "message": f"成功建立 OpenVPN 隧道并切换至节点 {target_ip} (Aimili 处于纯净收藏池自动轮换模式)！",
                     "active_ip": target_ip
                 })
             else:
