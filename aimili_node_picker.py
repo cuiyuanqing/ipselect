@@ -301,7 +301,11 @@ class BlacklistManager:
                     for ip, rec in raw_records.items():
                         score = rec.get("risk_score", 0)
                         reason = rec.get("reason", "")
-                        if score == 12 or "12%" in reason:
+                        # 自动清理历史误拉黑节点：
+                        # 1. 历史因 100% (未测/超时默认分) 误拉黑的家宽 IP
+                        # 2. 历史因 12% 或 (12% >= 10%) 单次轻度举报误拉黑的家宽 IP
+                        # 3. 历史因 "100% >= 10%" 误拉黑的家宽 IP
+                        if score in (12, 100) or "12%" in reason or "100%" in reason or score == 100:
                             continue
                         clean_records[ip] = rec
                     self.records = clean_records
@@ -472,7 +476,7 @@ class AimiliClient:
         logger.error(f"❌ 所有登录路径尝试完毕，均未能成功连接到 Aimili 后端 (请确认端口 {self.port} 及安全路径 {self.secret_path} 是否正确)")
         return False
 
-    def fetch_nodes_from_sqlite(self, country: str = "JP", status: str = "available", limit: int = 150, offset: int = 0) -> List[CandidateNode]:
+    def fetch_nodes_from_sqlite(self, country: str = "JP", status: str = "available", limit: int = 600, offset: int = 0) -> List[CandidateNode]:
         """直接从 Aimili 本地 SQLite node_pool 读取可用 OpenVPN 节点"""
         db_path = "/opt/aimilivpn/vpngate_data/node_pool.sqlite3"
         if not os.path.exists(db_path):
@@ -614,10 +618,10 @@ class AimiliClient:
             logger.warning(f"⚠️ 从本地 SQLite 读取候选节点异常: {e}")
             return []
 
-    def fetch_scoped_nodes(self, country: str = "JP", status: str = "available", limit: int = 150, offset: int = 0) -> List[CandidateNode]:
+    def fetch_scoped_nodes(self, country: str = "JP", status: str = "available", limit: int = 600, offset: int = 0) -> List[CandidateNode]:
         """从 Aimili 获取指定国家和状态的候选节点（真实数据，支持分页拉取，锁定 OpenVPN 协议）"""
         # 1. 优先从本地 SQLite 数据库直接读取（毫秒级响应，避免 Aimili API 阻塞超时）
-        sqlite_nodes = self.fetch_nodes_from_sqlite(country=country, status=status, limit=limit, offset=offset)
+        sqlite_nodes = self.fetch_nodes_from_sqlite(country=country, status=status, limit=max(limit, 600), offset=offset)
         if sqlite_nodes:
             return sqlite_nodes
 
@@ -1394,14 +1398,18 @@ class IpIntelligenceManager:
             with urllib.request.urlopen(req, timeout=6) as resp:
                 val_str = resp.read().decode("utf-8", errors="ignore").strip()
                 prob = float(val_str)
+                # 负数是 GetIPIntel 的错误码（如 -5 超额，-6 邮箱错误），忽略并不作为风控判断
+                if prob < 0:
+                    logger.debug(f"⚠️ [GetIPIntel] 返回状态码 {prob}，跳过此源判断")
+                    return quality, False
                 if prob >= 0.80:
                     quality.is_proxy = True
                     calc_risk = max(quality.risk_score, int(prob * 100))
                     quality.risk_score = calc_risk
                     quality.risk_label = f"高危公共代理(GetIPIntel:{prob})"
                     quality.shared_users = "100 - 1000 (高危代理)"
-                elif prob >= 0.20:
-                    calc_risk = max(quality.risk_score, int(prob * 30))
+                elif prob >= 0.35:
+                    calc_risk = max(quality.risk_score, int(prob * 20))
                     quality.risk_score = calc_risk
                 return quality, True
         except Exception as e:
@@ -1427,14 +1435,15 @@ class IpIntelligenceManager:
                 quality.abuse_score = conf_score
                 quality.abuse_reports = reports
 
-                if conf_score >= 10 or reports >= 2:
+                if conf_score >= 20 or reports >= 3:
                     calc_risk = max(quality.risk_score, conf_score, 60)
                     quality.risk_score = calc_risk
                     quality.risk_label = f"历史恶意滥用(AbuseIPDB:{conf_score}%,举报:{reports}次)"
                     quality.shared_users = "100+ (被举报共享)"
-                elif reports == 1:
-                    quality.risk_score = max(quality.risk_score, 12)
-                    quality.risk_label = "历史举报节点(AbuseIPDB:1次)"
+                elif reports in (1, 2) and conf_score < 20:
+                    # 单次轻度孤立举报且置信度低，属于公用VPN正常偶发扫描，评定为 5% 轻微风控分，不强行升至 12%
+                    quality.risk_score = max(quality.risk_score, 5)
+                    quality.risk_label = f"轻微孤立记录(AbuseIPDB:{reports}次)"
                 return quality, True
         except Exception as e:
             logger.warning(f"⚠️ [AbuseIPDB] 查询 IP {ip} 失败: {e}")
@@ -2099,7 +2108,7 @@ class PickerEngine:
             )
 
             # 1. 获取在库候选池 (大容量加载全部有效候选)
-            candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=300, offset=0)
+            candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=600, offset=0)
 
             if not candidates:
                 logger.error("❌ 未从 Aimili 获取到任何存活节点，请先确认 Aimili 后台节点扫描是否完成！")
@@ -2282,9 +2291,10 @@ class PickerEngine:
                     self.aimili.refresh_nodes(country=country)
                     time.sleep(5.0)
 
-                    # 多轮补位时，扩大抓取范围，获取最新刷新后的候选节点
-                    candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=300, offset=0)
-                    total_candidates = max(total_candidates, len(candidates))
+                    # 多轮补位时，扩大抓取范围并支持分页偏移检索全新未测节点
+                    curr_offset = (current_round - 1) * 300
+                    candidates = self.aimili.fetch_scoped_nodes(country=country, status="available", limit=600, offset=curr_offset)
+                    total_candidates = max(total_candidates, len(candidates) + curr_offset)
 
                 picked_ips = {n.ip for n in picked_nodes}
                 picked_ids = {n.canonical_fav_id for n in picked_nodes}
@@ -2372,7 +2382,10 @@ class PickerEngine:
                     except Exception:
                         risk_val = 100
 
-                    if risk_val >= 10:
+                    # 只有检测成功（非反爬拦截/超时）且明确超标 (>= 10%)，才判定为拉黑
+                    # 杜绝因 Ping0 反爬拦截、临时超时导致误判拉黑正常节点
+                    is_real_inspect_fail = q and q.risk_label not in ["检测超时", "反爬拦截"]
+                    if is_real_inspect_fail and risk_val >= 10:
                         score_val = risk_val
                         isp_val = getattr(q, "isp", "") if q else ""
                         self.blacklist.add(node.ip, reason=f"纯净度/风控超标 ({score_val}% >= 10%)", risk_score=score_val, isp=isp_val)
@@ -3671,7 +3684,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             top_n = int(params.get("top_n", 10))
             source_mode = str(params.get("source_mode", "auto"))
             inherit_existing = bool(params.get("inherit_existing", True))
-            max_rounds = int(params.get("max_rounds", 3))
+            max_rounds = int(params.get("max_rounds", 5))
 
             if self.engine and not self.engine.is_running:
                 threading.Thread(
