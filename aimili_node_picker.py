@@ -504,8 +504,8 @@ class AimiliClient:
                   AND LOWER(e.protocol)='openvpn'
                   AND e.port > 0
                   AND (e.fail_streak <= 5 OR e.fail_streak IS NULL)
-                ORDER BY (CASE WHEN LOWER(e.transport) = 'udp' THEN 1 ELSE 0 END) DESC,
-                         (CASE WHEN e.success_count > 0 THEN 1 ELSE 0 END) DESC,
+                ORDER BY (CASE WHEN e.success_count > 0 THEN 1 ELSE 0 END) DESC,
+                         (CASE WHEN LOWER(e.transport) = 'udp' THEN 1 ELSE 0 END) DESC,
                          COALESCE(json_extract(e.metadata_json, '$.switch_speed_bps'), 0) DESC,
                          e.success_streak DESC,
                          e.ui_latency_ms ASC
@@ -520,6 +520,7 @@ class AimiliClient:
             configs_dir = "/opt/aimilivpn/vpngate_data/configs"
             existing_configs = set(os.listdir(configs_dir)) if os.path.exists(configs_dir) else None
             ip_port_to_config = {}
+            ip_to_config = {}
             if existing_configs:
                 for fn in existing_configs:
                     if fn.endswith(".ovpn"):
@@ -528,7 +529,10 @@ class AimiliClient:
                         if len(parts) >= 3:
                             cip = parts[-3] if len(parts) >= 4 and parts[0] in ["JP", "US", "KR", "RU", "TW", "HK"] else parts[0]
                             cport = parts[-2]
+                            ctrans = parts[-1].lower()
                             ip_port_to_config[(cip, cport)] = stem
+                            if cip not in ip_to_config or "udp" in ctrans:
+                                ip_to_config[cip] = (int(cport) if cport.isdigit() else 1194, ctrans, stem)
 
             candidates = []
             seen_ips = set()
@@ -578,6 +582,11 @@ class AimiliClient:
                             break
                     if not matched_config_id and (ip, str(port)) in ip_port_to_config:
                         matched_config_id = ip_port_to_config[(ip, str(port))]
+                    if not matched_config_id and ip in ip_to_config:
+                        c_port, c_trans, c_stem = ip_to_config[ip]
+                        port = c_port
+                        transport = c_trans
+                        matched_config_id = c_stem
                     if not matched_config_id and exact_node_id and f"{exact_node_id}.ovpn" in existing_configs:
                         matched_config_id = exact_node_id
 
@@ -755,7 +764,17 @@ class AimiliClient:
             return False
 
     def get_state(self) -> Dict[str, Any]:
-        """获取 Aimili 当前网关与连接运行状态"""
+        """获取 Aimili 当前网关与连接运行状态 (优先直读本地 state.json 毫秒响应，杜绝 HTTP 阻塞超时)"""
+        state_file = "/opt/aimilivpn/vpngate_data/state.json"
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data:
+                    return data
+            except Exception:
+                pass
+
         if not self.logged_in and not self.login():
             return {}
         url = f"{self.base_url}/api/nodes?limit=1"
@@ -871,42 +890,48 @@ class AimiliClient:
         url = f"{self.base_url}/api/connect"
         cand_ids = []
 
-        # 1. 极高优先级：若有底层实体配置文件 ID (例如 JP_110.131.199.23_1404_tcp)
-        exact_id = getattr(node, "exact_node_id", None)
-        if exact_id and not exact_id.startswith("pool:") and len(exact_id) != 32:
-            cand_ids.append(exact_id)
+        # 1. 尝试从 configs 目录查找与该 IP 匹配的真实配置文件 stem (最高优先级)
+        configs_dir = "/opt/aimilivpn/vpngate_data/configs"
+        matched_from_configs = []
+        if os.path.exists(configs_dir) and node.ip:
+            try:
+                all_files = os.listdir(configs_dir)
+                for fn in all_files:
+                    if fn.endswith(".ovpn") and (f"_{node.ip}_" in fn or fn.startswith(f"{node.ip}_")):
+                        stem = fn[:-5]
+                        matched_from_configs.append(stem)
+            except Exception:
+                pass
 
-        # 2. 如果 node.id 不是 pool: 且不是 32 字节 hex，加入
-        if node.id and not str(node.id).startswith("pool:") and len(str(node.id)) != 32:
+        # 优先放入与当前端口和传输协议最吻合的 config stem
+        matched_from_configs.sort(key=lambda s: (
+            0 if str(node.port) in s and (getattr(node, "transport", "udp") or "udp") in s else 1
+        ))
+        cand_ids.extend(matched_from_configs)
+
+        # 2. 底层实体 ID
+        exact_id = getattr(node, "exact_node_id", None)
+        if exact_id:
+            cand_ids.append(exact_id)
+        if node.id:
             cand_ids.append(str(node.id))
 
-        # 3. 标准格式 ID (规范前缀别名)
+        # 3. 标准格式 ID
         if node.ip and node.port:
             transport = getattr(node, "transport", "").lower() or ("tcp" if "_tcp" in str(node.id) else "udp")
             cand_ids.append(f"JP_{node.ip}_{node.port}_{transport}")
             cand_ids.append(f"{node.ip}_{node.port}_{transport}")
             cand_ids.append(f"{node.country}_{node.ip}_{node.port}_{transport}")
 
-        # 4. 严格过滤：绝不将 pool: 前缀或 32 字节 hex 的 endpoint_id 发送给 Aimili /api/connect
-        cand_ids = [cid for cid in cand_ids if cid and not cid.startswith("pool:") and len(cid) != 32]
-
-        # 5. 若本地 configs 目录存在，只保留在 configs 目录下拥有实体 .ovpn 文件的有效 ID
-        configs_dir = "/opt/aimilivpn/vpngate_data/configs"
-        if os.path.exists(configs_dir):
-            try:
-                all_files = os.listdir(configs_dir)
-                exist_set = set(all_files)
-                cand_ids = [cid for cid in cand_ids if f"{cid}.ovpn" in exist_set]
-                # 若未精确匹配到，但 configs 目录下存在该 IP 的 .ovpn 配置文件，自动提取真实文件名
-                if not cand_ids and node.ip:
-                    for fn in all_files:
-                        if fn.endswith(".ovpn") and (f"_{node.ip}_" in fn or fn.startswith(f"{node.ip}_")):
-                            cand_ids.append(fn[:-5])
-            except Exception:
-                pass
+        # 4. Aimili 收藏库与节点池 endpoint_id (pool: 前缀及纯 hex)
+        if getattr(node, "canonical_fav_id", None):
+            cand_ids.append(node.canonical_fav_id)
+        if getattr(node, "pool_endpoint_id", None):
+            p_id = str(node.pool_endpoint_id).replace("pool:", "")
+            cand_ids.append(f"pool:{p_id}")
+            cand_ids.append(p_id)
 
         if not cand_ids:
-            # 保底回退：标准格式
             transport = getattr(node, "transport", "").lower() or "udp"
             cand_ids = [f"JP_{node.ip}_{node.port}_{transport}", f"{node.ip}_{node.port}_{transport}"]
 
@@ -1003,32 +1028,26 @@ class AimiliClient:
             return False
 
     def get_current_favorites(self) -> List[str]:
-        """获取 Aimili 当前已收藏的节点 ID 列表"""
+        """获取 Aimili 当前已收藏的节点 ID 列表 (优先从本地 ui_auth.json 毫秒直读)"""
+        auth_file = self.auth_file or "/opt/aimilivpn/vpngate_data/ui_auth.json"
+        if os.path.isfile(auth_file):
+            try:
+                with open(auth_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return list(data.get("favorite_node_ids", []))
+            except Exception:
+                pass
         if not self.logged_in and not self.login():
-            if os.path.isfile(self.auth_file):
-                try:
-                    with open(self.auth_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    return list(data.get("favorite_node_ids", []))
-                except Exception:
-                    pass
             return []
         url = f"{self.base_url}/api/ui/state"
         req = urllib.request.Request(url, headers={"User-Agent": "AimiliPurePicker/1.0"})
         try:
-            with self.opener.open(req, timeout=8) as resp:
+            with self.opener.open(req, timeout=5) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 state = res.get("state", {})
                 return list(state.get("favorite_node_ids", []))
         except Exception as e:
-            logger.warning(f"⚠️ 获取当前收藏列表异常: {e}")
-            if os.path.isfile(self.auth_file):
-                try:
-                    with open(self.auth_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    return list(data.get("favorite_node_ids", []))
-                except Exception:
-                    pass
+            logger.debug(f"⚠️ 获取当前收藏列表异常: {e}")
             return []
 
     def sync_auth_file_favorites(self, fav_ids: List[str]):
