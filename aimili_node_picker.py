@@ -2378,7 +2378,8 @@ class PickerEngine:
 
                     q = node.quality
                     try:
-                        risk_val = int(getattr(q, "risk_score", 100) or 100) if q else 100
+                        raw_score = getattr(q, "risk_score", None) if q else None
+                        risk_val = int(raw_score) if raw_score is not None else 100
                     except Exception:
                         risk_val = 100
 
