@@ -1066,6 +1066,128 @@ class TestMultiSourceIpRiskIntelligence(unittest.TestCase):
         self.assertLessEqual(q.risk_score, 7)
         self.assertIn("纯净家宽", q.risk_label)
 
+class TestAimiliEgressLockAndFallback(unittest.TestCase):
+    """测试出口绝对锁定、建连失败顺延降级与存量测速防穿透"""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.auth_file = os.path.join(self.tmp_dir, "ui_auth.json")
+        with open(self.auth_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "username": "admin",
+                "fixed_node_id": "",
+                "routing_mode": "favorites"
+            }, f)
+
+        self.mock_aimili = MagicMock(spec=AimiliClient)
+        self.mock_aimili.auth_file = self.auth_file
+        self.mock_aimili.host = "127.0.0.1"
+        self.mock_aimili.port = 8501
+        self.mock_aimili.proxy_port = 8500
+        self.mock_aimili.proxy_user = "socks5"
+        self.mock_aimili.proxy_pass = "ilovestudy"
+        self.mock_aimili.logged_in = True
+        self.mock_aimili.set_active_node.return_value = True
+        self.mock_aimili.toggle_favorite.return_value = True
+        self.mock_aimili.refresh_nodes.return_value = True
+        self.mock_aimili.get_current_favorites.return_value = []
+        self.mock_aimili.get_current_blocklist.return_value = []
+        self.mock_aimili.get_aimili_active_info.return_value = {
+            "status": "connected", "active_ip": "1.1.1.1", "active_id": "n1"
+        }
+
+        self.mock_inspector = MagicMock(spec=IpIntelligenceManager)
+        self.mock_inspector.cache = {}
+        self.mock_inspector._ping0_circuit_broken = False
+        self.mock_inspector.reset_circuit_breaker.return_value = None
+        self.mock_exp = MagicMock(spec=NodeExperienceManager)
+        self.blacklist = BlacklistManager(blacklist_file=os.path.join(self.tmp_dir, "blacklist.json"))
+
+        self.engine = PickerEngine(
+            aimili=self.mock_aimili,
+            inspector=self.mock_inspector,
+            exp_mgr=self.mock_exp,
+            probe_speed_func=lambda **kwargs: 10.0,
+            blacklist=self.blacklist
+        )
+        self.engine.probe_network_func = lambda ip, port, proto, **kwargs: {
+            "is_alive": True, "avg_latency_ms": 50, "jitter_ms": 10, "packet_loss_pct": 0, "port_open": True
+        }
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_lock_and_unlock_fixed_node(self):
+        client = AimiliClient(auth_file=self.auth_file)
+        client.logged_in = True
+        client.opener = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({"ok": True}).encode("utf-8")
+        client.opener.open.return_value.__enter__.return_value = mock_resp
+
+        node = CandidateNode(id="JP_1.1.1.1_1194_udp", ip="1.1.1.1", port=1194, country="JP", protocol="openvpn", latency_ms=50)
+        ok = client.lock_fixed_node(node, mode="fixed_ip")
+        self.assertTrue(ok)
+
+        with open(self.auth_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data.get("fixed_node_id"), "JP_1.1.1.1_1194_udp")
+        self.assertEqual(data.get("routing_mode"), "fixed_ip")
+
+        client.unlock_fixed_node()
+        with open(self.auth_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data.get("fixed_node_id"), "")
+        self.assertEqual(data.get("routing_mode"), "favorites")
+
+    def test_stock_node_handshake_failed_does_not_probe_speed(self):
+        node = CandidateNode(id="JP_58.87.159.114_1276_tcp", ip="58.87.159.114", port=1276, country="JP", protocol="openvpn", latency_ms=100)
+        self.mock_aimili.get_current_favorites.return_value = [node.canonical_fav_id]
+        self.mock_aimili.fetch_scoped_nodes.return_value = [node]
+        self.mock_inspector.inspect_ip.return_value = IpQuality(
+            ip=node.ip, is_residential=True, risk_score=0, ip_type="家庭宽带 IP", isp="Sony"
+        )
+        self.mock_aimili.set_active_node.return_value = False
+        probe_called = []
+        def fake_probe(**kwargs):
+            probe_called.append(True)
+            return 10.0
+        self.engine.probe_speed_func = fake_probe
+
+        with patch("time.sleep", return_value=None):
+            picked = self.engine.run_screening(country="JP", top_n=5, min_speed_mbps=1.0, max_rounds=1, inherit_existing=True)
+
+        self.assertEqual(len(probe_called), 0)
+        self.assertNotIn(node.ip, [p.ip for p in picked])
+
+    def test_phase4_fallback_to_second_node_when_first_fails(self):
+        node1 = CandidateNode(id="JP_1.1.1.1_1194_udp", ip="1.1.1.1", port=1194, country="JP", protocol="openvpn", latency_ms=50, jitter_ms=0, speed_mbps=10.0)
+        node2 = CandidateNode(id="JP_2.2.2.2_1194_udp", ip="2.2.2.2", port=1194, country="JP", protocol="openvpn", latency_ms=60, jitter_ms=0, speed_mbps=8.0)
+        self.mock_aimili.get_current_favorites.return_value = []
+        self.mock_aimili.fetch_scoped_nodes.return_value = [node1, node2]
+        self.mock_inspector.inspect_ip.side_effect = lambda ip, **kwargs: IpQuality(
+            ip=ip, is_residential=True, risk_score=0, ip_type="家庭宽带 IP", isp="ISP"
+        )
+        self.engine.probe_speed_func = lambda **kwargs: 10.0
+
+        def fake_set_active(node, **kwargs):
+            lock = kwargs.get("lock", True)
+            if lock and node.ip == "1.1.1.1":
+                return False
+            return True
+        self.mock_aimili.set_active_node.side_effect = fake_set_active
+
+        with patch("time.sleep", return_value=None):
+            picked = self.engine.run_screening(country="JP", top_n=2, min_speed_mbps=1.0, max_rounds=1, inherit_existing=False)
+
+        self.assertGreaterEqual(len(picked), 2)
+        self.assertEqual(self.engine.last_result.get("active_node_ip"), "2.2.2.2")
+        nodes_res = self.engine.last_result.get("nodes", [])
+        active_flags = {n["ip"]: n["is_active"] for n in nodes_res}
+        self.assertFalse(active_flags.get("1.1.1.1"))
+        self.assertTrue(active_flags.get("2.2.2.2"))
+
+
 
 if __name__ == "__main__":
     unittest.main()

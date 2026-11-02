@@ -879,8 +879,8 @@ class AimiliClient:
             time.sleep(1.0)
         return False
 
-    def set_active_node(self, node: CandidateNode, timeout: int = 35, max_retries: int = 3) -> bool:
-        """调用 Aimili 将指定优选节点切换为当前活动出口节点，带 409 互斥锁感知与重试"""
+    def set_active_node(self, node: CandidateNode, timeout: int = 35, max_retries: int = 3, lock: bool = True) -> bool:
+        """调用 Aimili 将指定优选节点切换为当前活动出口节点，带 409 互斥锁感知、就绪验证与自动出口锁定"""
         if not self.logged_in and not self.login():
             return False
 
@@ -955,6 +955,8 @@ class AimiliClient:
                         logger.info(f"🚀 成功向 Aimili 下发节点切换指令 -> 活动出口: {node.ip} (ID: {test_id})")
                         ready = self.wait_for_tunnel_ready(node, timeout=timeout)
                         if ready:
+                            if lock:
+                                self.lock_fixed_node(node, mode="fixed_ip")
                             return True
                         
                         st = self.get_state()
@@ -1066,6 +1068,159 @@ class AimiliClient:
         except Exception as e:
             logger.warning(f"⚠️ 同步底层 {self.auth_file} 异常: {e}")
 
+    def lock_fixed_node(self, target: Any, mode: str = "fixed_ip") -> bool:
+        """
+        将指定优选节点设为 Aimili 底层锁定出口 (fixed_node_id)，切换至 fixed_ip 模式并下发 manual 锁定，
+        彻底抑制 Aimili 内部自动探测与漫游漂移。
+        """
+        node_id = ""
+        node_ip = ""
+        if isinstance(target, CandidateNode):
+            node_id = target.exact_node_id or target.id or (getattr(target, "canonical_fav_id", "") or "")
+            node_ip = target.ip
+        elif isinstance(target, dict):
+            node_id = target.get("id") or target.get("exact_node_id") or ""
+            node_ip = target.get("ip") or ""
+        elif isinstance(target, str):
+            node_id = target
+            parts = target.replace("pool:", "").split("_")
+            if parts and "." in parts[0]:
+                node_ip = parts[0]
+
+        # 1. 持久化落盘 ui_auth.json
+        auth_file = self.auth_file or "/opt/aimilivpn/vpngate_data/ui_auth.json"
+        if os.path.isfile(auth_file):
+            try:
+                with open(auth_file, "r", encoding="utf-8") as f:
+                    auth_data = json.load(f)
+                auth_data["fixed_node_id"] = node_id
+                auth_data["routing_mode"] = mode
+                auth_data["connection_enabled"] = True
+                tmp_file = auth_file + ".tmp"
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump(auth_data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_file, auth_file)
+                logger.info(f"🔒 已将底层文件 {auth_file} 的 fixed_node_id 锁定为: {node_id} (模式: {mode})")
+            except Exception as e:
+                logger.warning(f"⚠️ 更新底层 {auth_file} 锁定配置异常: {e}")
+
+        # 2. 调用 Aimili API /api/update_settings 与 /api/route_mode
+        try:
+            if not self.logged_in:
+                self.login()
+            if self.logged_in:
+                st = self.get_ui_state() or {}
+                payload = {
+                    "proxy_port": int(st.get("proxy_port") or self.proxy_port or 8500),
+                    "proxy_user": str(st.get("proxy_user") or self.proxy_user or "socks5"),
+                    "proxy_pass": str(st.get("proxy_pass") or self.proxy_pass or "ilovestudy"),
+                    "proxy_allow": st.get("proxy_allow") if isinstance(st.get("proxy_allow"), list) else ["127.0.0.1", "::1"],
+                    "routing_mode": mode,
+                    "fixed_node_id": node_id,
+                    "force_country": str(st.get("force_country") or "日本"),
+                    "routing_ip_type": str(st.get("routing_ip_type") or "residential"),
+                    "routing_protocol": str(st.get("routing_protocol") or ""),
+                    "routing_min_speed_bps": int(st.get("routing_min_speed_bps") or 5000000),
+                    "routing_latency": str(st.get("routing_latency") or ""),
+                    "routing_blocklist": str(st.get("routing_blocklist") or ""),
+                    "keep_manual": True
+                }
+                url = f"{self.base_url}/api/update_settings"
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "User-Agent": "AimiliPurePicker/1.0"}
+                )
+                try:
+                    with self.opener.open(req, timeout=6) as resp:
+                        pass
+                except Exception as e:
+                    logger.debug(f"调用 update_settings 细节: {e}")
+
+                # 下发手动模式锁定
+                mode_url = f"{self.base_url}/api/route_mode"
+                mode_req = urllib.request.Request(
+                    mode_url,
+                    data=json.dumps({"mode": "manual"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "User-Agent": "AimiliPurePicker/1.0"}
+                )
+                try:
+                    with self.opener.open(mode_req, timeout=6) as resp:
+                        pass
+                except Exception:
+                    pass
+                logger.info(f"🔒 成功通过 API 将 Aimili 路由模式锁定为 {mode} (手动模式开启)")
+                return True
+        except Exception as e:
+            logger.warning(f"⚠️ 调用 API 锁定 Aimili 出口异常: {e}，底层文件已保障锁定")
+            return True
+        return True
+
+    def unlock_fixed_node(self) -> bool:
+        """解除 Aimili 固定节点锁定，恢复为收藏池自动模式"""
+        auth_file = self.auth_file or "/opt/aimilivpn/vpngate_data/ui_auth.json"
+        if os.path.isfile(auth_file):
+            try:
+                with open(auth_file, "r", encoding="utf-8") as f:
+                    auth_data = json.load(f)
+                auth_data["fixed_node_id"] = ""
+                auth_data["routing_mode"] = "favorites"
+                tmp_file = auth_file + ".tmp"
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump(auth_data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_file, auth_file)
+                logger.info(f"🔓 已解除底层 {auth_file} 的 fixed_node_id 锁定")
+            except Exception as e:
+                logger.warning(f"⚠️ 解锁底层 {auth_file} 配置异常: {e}")
+
+        try:
+            if not self.logged_in:
+                self.login()
+            if self.logged_in:
+                st = self.get_ui_state() or {}
+                payload = {
+                    "proxy_port": int(st.get("proxy_port") or self.proxy_port or 8500),
+                    "proxy_user": str(st.get("proxy_user") or self.proxy_user or "socks5"),
+                    "proxy_pass": str(st.get("proxy_pass") or self.proxy_pass or "ilovestudy"),
+                    "proxy_allow": st.get("proxy_allow") if isinstance(st.get("proxy_allow"), list) else ["127.0.0.1", "::1"],
+                    "routing_mode": "favorites",
+                    "fixed_node_id": "",
+                    "force_country": str(st.get("force_country") or "日本"),
+                    "routing_ip_type": str(st.get("routing_ip_type") or "residential"),
+                    "routing_protocol": str(st.get("routing_protocol") or ""),
+                    "routing_min_speed_bps": int(st.get("routing_min_speed_bps") or 5000000),
+                    "routing_latency": str(st.get("routing_latency") or ""),
+                    "routing_blocklist": str(st.get("routing_blocklist") or ""),
+                    "keep_manual": False
+                }
+                url = f"{self.base_url}/api/update_settings"
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "User-Agent": "AimiliPurePicker/1.0"}
+                )
+                try:
+                    with self.opener.open(req, timeout=6) as resp:
+                        pass
+                except Exception:
+                    pass
+                mode_url = f"{self.base_url}/api/route_mode"
+                mode_req = urllib.request.Request(
+                    mode_url,
+                    data=json.dumps({"mode": "auto"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "User-Agent": "AimiliPurePicker/1.0"}
+                )
+                try:
+                    with self.opener.open(mode_req, timeout=6) as resp:
+                        pass
+                except Exception:
+                    pass
+                logger.info(f"🔓 成功通过 API 将 Aimili 恢复为仅用收藏(自动)模式")
+                return True
+        except Exception as e:
+            logger.warning(f"⚠️ 调用 API 解锁 Aimili 异常: {e}")
+        return True
+
     def get_aimili_active_info(self) -> Dict[str, Any]:
         """获取 Aimili 当前正在连接/生效的活动节点与隧道详细信息"""
         st = self.get_ui_state()
@@ -1085,6 +1240,19 @@ class AimiliClient:
         is_connected = bool(st.get("connection_status") == "connected" or st.get("active_tunnel_ok", False))
         is_connecting = bool(st.get("is_connecting", False))
 
+        fixed_node_id = str(st.get("fixed_node_id") or "")
+        routing_mode = str(st.get("routing_mode") or "favorites")
+        if not fixed_node_id and os.path.isfile(self.auth_file):
+            try:
+                with open(self.auth_file, "r", encoding="utf-8") as f:
+                    _af = json.load(f)
+                    fixed_node_id = str(_af.get("fixed_node_id") or "")
+                    if "routing_mode" in _af:
+                        routing_mode = str(_af.get("routing_mode"))
+            except Exception:
+                pass
+        is_locked = bool(fixed_node_id or routing_mode == "fixed_ip")
+
         return {
             "status": "connected" if is_connected else ("connecting" if is_connecting else "disconnected"),
             "status_label": "已连接 (就绪)" if is_connected else ("正在连接..." if is_connecting else "未连接"),
@@ -1099,7 +1267,9 @@ class AimiliClient:
             "proxy_ip": st.get("proxy_ip") or "",
             "proxy_port": int(st.get("proxy_port") or self.proxy_port or 8500),
             "proxy_ok": bool(st.get("proxy_ok", is_connected)),
-            "routing_mode": st.get("routing_mode", "favorites"),
+            "routing_mode": routing_mode,
+            "fixed_node_id": fixed_node_id,
+            "is_locked": is_locked,
             "message": st.get("last_check_message") or st.get("manual_switch_message") or ("运行正常" if is_connected else ""),
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
         }
@@ -2196,7 +2366,14 @@ class PickerEngine:
                         if min_speed_mbps > 0:
                             self.current_step = f"正在实测存量节点带宽: {node.ip}..."
                             logger.info(f"⚡ [实测存量] 正在通过 Aimili 测试存量节点 {node.ip} 真实带宽...")
-                            self.aimili.set_active_node(node, timeout=12)
+                            switched = self.aimili.set_active_node(node, timeout=15, lock=False)
+                            if not switched:
+                                reason = "存量节点建连握手失败/未就绪"
+                                logger.warning(f"🚫 [存量淘汰] 收藏节点 {node.ip:<15} {reason}，标记移出收藏")
+                                self.exp_mgr.record_fail(node.ip, reason)
+                                live_evicted_fav_ids.append(fav_id)
+                                continue
+
                             time.sleep(1.2)
                             try:
                                 real_speed = self.probe_speed_func(
@@ -2432,7 +2609,7 @@ class PickerEngine:
                         # Aimili 处于 routing_mode='favorites' (仅限收藏) 模式，切换前必须先加入收藏库 Aimili 方可建立 OpenVPN 隧道
                         self.aimili.toggle_favorite(node, favorite=True)
 
-                        connected = self.aimili.set_active_node(node, timeout=35)
+                        connected = self.aimili.set_active_node(node, timeout=35, lock=False)
                         if not connected:
                             logger.warning(f"❌ [握手失败] 无法切换到活动节点 {node.ip} (OpenVPN握手失败或Aimili正忙)，标记握手未通")
                             self.aimili.toggle_favorite(node, favorite=False)
@@ -2698,18 +2875,24 @@ class PickerEngine:
                 except Exception as e:
                     logger.warning(f"⚠️ 优选落盘同步 Aimili 屏蔽列表异常: {e}")
 
-            # 5. 阶段四：自动切换 Aimili 活动出口为第 1 名最佳节点
+            # 5. 阶段四：自动切换并锁定 Aimili 活动出口（前序顺延降级保障）
             active_node_ip = ""
             if picked_nodes:
-                best_node = picked_nodes[0]
-                active_node_ip = best_node.ip
-                self.current_step = f"正在将第 1 名最佳节点设为 Aimili 当前活动出口: {best_node.ip}..."
-                logger.info(f"🎯 开始将优选评分第一的黄金节点自动切换为 Aimili 当前活动出口 -> IP: {best_node.ip} (延迟: {best_node.latency_ms}ms, 速率: {best_node.speed_mbps}Mbps)")
-                switched = self.aimili.set_active_node(best_node, timeout=15)
-                if switched:
-                    logger.info(f"✨ [活动出口已切换] Aimili 当前活动出口已成功锁定为: {best_node.ip}！")
-                else:
-                    logger.warning(f"⚠️ 自动切换活动出口返回异常，已在收藏夹首位保留，可从 Aimili 网页手动点击连接")
+                self.current_step = "正在验证并锁定 Aimili 活动出口..."
+                for rank_idx, cand in enumerate(picked_nodes[:5]):
+                    logger.info(f"🎯 尝试将优选第 {rank_idx+1} 名黄金节点设为活动出口并锁定: {cand.ip} (延迟: {cand.latency_ms}ms, 速率: {cand.speed_mbps}Mbps)")
+                    switched = self.aimili.set_active_node(cand, timeout=18, lock=True)
+                    if switched:
+                        active_node_ip = cand.ip
+                        logger.info(f"✨ [出口接管成功] Aimili 活动出口已成功锁定至第 {rank_idx+1} 名节点: {cand.ip}！")
+                        break
+                    else:
+                        logger.warning(f"⚠️ 第 {rank_idx+1} 名节点 {cand.ip} 握手未就绪，自动顺延尝试下一候选...")
+
+                if not active_node_ip:
+                    aimili_cur = self.aimili.get_aimili_active_info()
+                    active_node_ip = aimili_cur.get("active_ip") or ""
+                    logger.warning(f"⚠️ 优选前列节点均未就绪，Aimili 保持当前实际出口: {active_node_ip or '未连接'}")
 
             final_favs = self.aimili.get_current_favorites()
             logger.info(
@@ -2745,7 +2928,7 @@ class PickerEngine:
                         "speed_bps": n.speed_bps,
                         "rank_score": n.rank_score,
                         "is_inherited": n.is_inherited,
-                        "is_active": (idx == 0),
+                        "is_active": bool(active_node_ip and n.ip == active_node_ip),
                         "experience_level": n.experience.level_label if n.experience else "Lv.1 新秀",
                         "consecutive_passes": n.experience.consecutive_passes if n.experience else 1,
                         "reputation_score": n.experience.reputation_score if n.experience else 80.0,
@@ -2955,7 +3138,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div id="aimiliProxyPort" style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">SOCKS5 127.0.0.1:8500</div>
       </div>
       <div style="background: rgba(15, 23, 42, 0.7); padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
-        <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">路由模式与健康讯息</div>
+        <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px; display: flex; justify-content: space-between; align-items: center;">
+          <span>调度模式与出口锁定</span>
+          <div style="display: flex; gap: 4px;">
+            <button type="button" onclick="toggleEgressLock(true)" style="padding: 2px 7px; font-size: 11px; background: #0284c7; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600;" title="锁定当前出口为固定节点 (fixed_ip)，禁止内部轮换漂移">🔒 锁定</button>
+            <button type="button" onclick="toggleEgressLock(false)" style="padding: 2px 7px; font-size: 11px; background: #475569; color: white; border: none; border-radius: 4px; cursor: pointer;" title="恢复仅用收藏自动轮换">🔓 解锁</button>
+          </div>
+        </div>
         <div id="aimiliRoutingMode" style="font-size: 13px; font-weight: 600; color: #fde047;"><!-- __AIMILI_ROUTING_MODE__ --></div>
         <div id="aimiliHealthMsg" style="font-size: 11px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title=""><!-- __AIMILI_HEALTH_MSG__ --></div>
       </div>
@@ -3149,7 +3338,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     setTxt('aimiliActiveId', info.active_id || '-');
     setTxt('aimiliTunnelIface', '隧道接口: ' + (info.tunnel_interface || 'tun0'));
     setTxt('aimiliLatency', info.latency || '就绪');
-    setTxt('aimiliRoutingMode', '模式: ' + (info.routing_mode || 'favorites'));
+    const modeDesc = info.is_locked ? '🔒 固定节点锁定 (fixed_ip)' : (info.routing_mode === 'favorites' ? '仅用收藏 (自动轮换)' : (info.routing_mode || '自动'));
+    setTxt('aimiliRoutingMode', '模式: ' + modeDesc);
     setTxt('aimiliHealthMsg', info.message || '运行正常');
     const msgEl = document.getElementById('aimiliHealthMsg');
     if (msgEl) msgEl.title = info.message || '';
@@ -3176,10 +3366,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       return;
     }
     tbody.innerHTML = nodes.map(n => {
-      const isCurActive = (n.ip === activeIp) || n.is_active;
+      const isCurActive = Boolean(activeIp && n.ip === activeIp);
       const actBtn = isCurActive
         ? '<span class="tag-active" style="padding: 4px 10px; font-size: 12px;">🟢 当前连接中</span>'
-        : `<button type="button" class="btn-sub" style="padding: 4px 10px; font-size: 12px; background: #2563eb; color: #ffffff; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;" onclick="switchAimiliNode('${escapeHtml(n.ip)}', '${escapeHtml(n.id)}')">🚀 设为出口</button>`;
+        : `<button type="button" class="btn-sub" style="padding: 4px 10px; font-size: 12px; background: #2563eb; color: #ffffff; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;" onclick="switchAimiliNode('${escapeHtml(n.ip)}', '${escapeHtml(n.id)}', this)">🚀 设为出口</button>`;
 
       return `
         <tr>
@@ -3200,8 +3390,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }).join('');
   }
 
-  async function switchAimiliNode(ip, id) {
-    if (!confirm('确定要将 Aimili VPN 活动出口即时切换为 ' + ip + ' 吗？')) return;
+  async function switchAimiliNode(ip, id, btnEl) {
+    if (!confirm('确定要将 Aimili VPN 活动出口即时切换并锁定为 ' + ip + ' 吗？')) return;
+    let oldText = '';
+    if (btnEl) {
+      oldText = btnEl.innerHTML;
+      btnEl.innerHTML = '⏳ 握手建连中...';
+      btnEl.disabled = true;
+    }
     try {
       const res = await fetch('/api/switch_node', {
         method: 'POST',
@@ -3211,13 +3407,36 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const data = await res.json();
       if (data.ok) {
         alert('✅ ' + data.message);
-        fetchAimiliStatus();
-        fetchStatus();
       } else {
         alert('❌ 切换失败: ' + (data.message || JSON.stringify(data)));
       }
+      await fetchAimiliStatus();
+      await fetchStatus();
     } catch (e) {
       alert('请求异常: ' + e);
+    } finally {
+      if (btnEl) {
+        btnEl.innerHTML = oldText;
+        btnEl.disabled = false;
+      }
+    }
+  }
+
+  async function toggleEgressLock(lock) {
+    const actionName = lock ? '锁定当前出口' : '解锁漫游';
+    if (!confirm(`确定要${actionName}吗？`)) return;
+    try {
+      const res = await fetch(lock ? '/api/aimili/lock_node' : '/api/aimili/unlock_node', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      alert((data.ok ? '✅ ' : '❌ ') + (data.message || JSON.stringify(data)));
+      await fetchAimiliStatus();
+      await fetchStatus();
+    } catch (e) {
+      alert('请求失败: ' + e);
     }
   }
 
@@ -3296,6 +3515,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   window.triggerDeployRestart = triggerDeployRestart;
   window.triggerDeploySyncAndRestart = triggerDeploySyncAndRestart;
   window.switchAimiliNode = switchAimiliNode;
+  window.toggleEgressLock = toggleEgressLock;
   window.triggerScan = triggerScan;
   window.fetchAimiliStatus = fetchAimiliStatus;
 
@@ -3448,7 +3668,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         if nodes:
             rows = []
             for n in nodes:
-                is_active = (n.get("ip") == active_ip) or n.get("is_active", False)
+                is_active = bool(active_ip and n.get("ip") == active_ip)
                 active_tag = '<span class="tag-active">🔥 当前出口</span> ' if is_active else ''
                 origin_tag = '<span class="tag-fav">⭐ 传承老兵</span>' if n.get("is_inherited") else '<span class="tag-fresh">🌟 新选补位</span>'
                 speed_str = f"⚡ {n.get('speed_mbps')} Mbps" if n.get('speed_mbps', 0) > 0 else '未测速'
@@ -3469,7 +3689,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     node_ip = _esc(n.get('ip') or '')
                     node_id = _esc(n.get('id') or '')
-                    action_html = f'<button type="button" class="btn-sub" style="padding: 4px 10px; font-size: 12px; background: #2563eb; color: #ffffff; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;" onclick="switchAimiliNode(\x27{node_ip}\x27, \x27{node_id}\x27)">🚀 设为出口</button>'
+                    action_html = f'<button type="button" class="btn-sub" style="padding: 4px 10px; font-size: 12px; background: #2563eb; color: #ffffff; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;" onclick="switchAimiliNode(\x27{node_ip}\x27, \x27{node_id}\x27, this)">🚀 设为出口</button>'
 
                 rows.append(f'''
                 <tr>
@@ -3505,7 +3725,8 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             html = html.replace('<!-- __AIMILI_ACTIVE_ID__ -->', aimili_info.get("active_id") or "-")
             html = html.replace('<!-- __AIMILI_TUNNEL_IFACE__ -->', f"隧道接口: {aimili_info.get('tunnel_interface') or 'tun0'}")
             html = html.replace('<!-- __AIMILI_LATENCY__ -->', aimili_info.get("latency") or "正常")
-            html = html.replace('<!-- __AIMILI_ROUTING_MODE__ -->', f"模式: {aimili_info.get('routing_mode', 'favorites')}")
+            mode_desc = '🔒 固定节点锁定 (fixed_ip)' if aimili_info.get('is_locked') else ('仅用收藏' if aimili_info.get('routing_mode') == 'favorites' else aimili_info.get('routing_mode', '自动'))
+            html = html.replace('<!-- __AIMILI_ROUTING_MODE__ -->', f"模式: {mode_desc}")
             html = html.replace('<!-- __AIMILI_HEALTH_MSG__ -->', aimili_info.get("message") or "运行正常")
             html = html.replace('<!-- __AIMILI_LAST_UPDATE__ -->', f"更新时间: {aimili_info.get('updated_at', '')}")
 
@@ -3726,9 +3947,14 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
 
             self._send_json_response(resp)
         elif url.path in ("/api/switch_node", "/api/aimili/switch_node"):
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
-            params = json.loads(body) if body else {}
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+                params = json.loads(body) if body else {}
+            except Exception as e:
+                self._send_json_response({"ok": False, "message": f"参数解析错误: {e}"}, status_code=400)
+                return
+
             target_ip = params.get("ip")
             target_id = params.get("id")
 
@@ -3770,26 +3996,54 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     exact_node_id=target_id
                 )
 
-            def _async_switch():
-                switched = self.engine.aimili.set_active_node(node_obj, timeout=35)
-                if switched:
-                    self.engine.last_result["active_node_ip"] = target_ip
-                    for n in self.engine.last_result.get("nodes", []):
-                        n["is_active"] = (n.get("ip") == target_ip)
-                    try:
-                        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                            json.dump(self.engine.last_result, f, ensure_ascii=False, indent=2)
-                    except Exception as e:
-                        logger.warning(f"更新历史活动出口异常: {e}")
-                    logger.info(f"✅ 后台成功将 Aimili 活动出口切换为 {target_ip}")
-                else:
-                    logger.warning(f"⚠️ 后台切换节点 {target_ip} 握手超时或失败")
-
-            threading.Thread(target=_async_switch, daemon=True).start()
+            switched = self.engine.aimili.set_active_node(node_obj, timeout=25, lock=True)
+            if switched:
+                self.engine.last_result["active_node_ip"] = target_ip
+                for n in self.engine.last_result.get("nodes", []):
+                    n["is_active"] = (n.get("ip") == target_ip)
+                try:
+                    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                        json.dump(self.engine.last_result, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    logger.warning(f"更新历史活动出口异常: {e}")
+                logger.info(f"✅ 已成功将 Aimili 活动出口切换并锁定至 {target_ip}")
+                self._send_json_response({
+                    "ok": True,
+                    "message": f"成功建立 OpenVPN 隧道并已将 Aimili 出口绝对锁定为: {target_ip}！",
+                    "active_ip": target_ip
+                })
+            else:
+                st = self.engine.aimili.get_aimili_active_info()
+                cur_ip = st.get("active_ip") or ""
+                self._send_json_response({
+                    "ok": False,
+                    "message": f"目标节点 {target_ip} 握手超时或鉴权未通过，Aimili 保持当前活动出口 ({cur_ip or '未变更'})",
+                    "active_ip": cur_ip
+                })
+        elif url.path in ("/api/aimili/lock_node", "/api/lock_node"):
+            if not self.engine or not self.engine.aimili:
+                self._send_json_response({"ok": False, "message": "优选引擎未就绪"}, status_code=500)
+                return
+            st = self.engine.aimili.get_aimili_active_info()
+            cur_ip = st.get("active_ip")
+            cur_id = st.get("active_id")
+            if not cur_ip:
+                self._send_json_response({"ok": False, "message": "当前 Aimili 没有有效连接的出口，无法锁定"}, status_code=400)
+                return
+            ok = self.engine.aimili.lock_fixed_node(cur_id or cur_ip, mode="fixed_ip")
             self._send_json_response({
-                "ok": True,
-                "message": f"已成功向 Aimili 下发切换指令，正在建立 OpenVPN 隧道并接管出口 ({target_ip})，请留意顶部看板状态！",
-                "active_ip": target_ip
+                "ok": ok,
+                "message": f"已将 Aimili 出口绝对锁定为当前节点: {cur_ip}",
+                "active_ip": cur_ip
+            })
+        elif url.path in ("/api/aimili/unlock_node", "/api/unlock_node"):
+            if not self.engine or not self.engine.aimili:
+                self._send_json_response({"ok": False, "message": "优选引擎未就绪"}, status_code=500)
+                return
+            ok = self.engine.aimili.unlock_fixed_node()
+            self._send_json_response({
+                "ok": ok,
+                "message": "已解除 Aimili 出口锁定，恢复仅用收藏(自动轮换)模式"
             })
         elif url.path in ("/api/git_pull", "/api/deploy/git_pull"):
             res = run_git_force_update()
